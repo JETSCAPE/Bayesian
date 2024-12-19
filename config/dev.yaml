@@ -1,0 +1,319 @@
+# Configuration for STAT analysis
+#-------------------------------------------
+# General parameters
+
+output_dir: "output/20240805"
+
+initialize_observables: False
+preprocess_input_data: False
+fit_emulators: False
+run_mcmc: True
+run_closure_tests: False
+
+plot:
+  input_data: False
+  emulators: False
+  mcmc: false
+  qhat: False
+  closure_tests: False
+  across_analyses: False
+  my_new_plots: True
+
+debug_level: 0
+
+#-------------------------------------------
+# The design points, predictions, and experimental data are located in tables produced by the aggregation machinery
+observable_table_dir: 'data/20230116/tables'
+
+# We make use of some info in the JETSCAPE-analysis config that was used to aggregate/plot observables
+observable_config_dir: '../jetscape-analysis/config'
+
+# Filename of the observables file that we will use. This could be the standard one, or it could
+# have some predictions preprocessing applied to it.
+# Change to 'observables_preprocessed.h5' to use preprocessed data
+#observables_filename: "observables.h5"
+observables_filename: "observables_preprocessed.h5"
+
+#-------------------------------------------
+# Default parameter settings
+parameters:
+  #-------------------------------------------
+  # Preprocessing parameters
+  preprocessing_parameters: &default_preprocessing_parameters
+    smoothing:
+      outlier_n_RMS: 2.
+      # NOTE: As of 28 August 2023, there seems to be something wrong with the cubic spline, such that it will
+      #       interpolate down to negative values. For now, better to just use the linear approach.
+      interpolation_method: "linear" # "linear" or "cubic_spline
+      #max_n_feature_outliers_to_interpolate: 1
+      max_n_feature_outliers_to_interpolate: 2
+
+  #-------------------------------------------
+  # Emulator parameters
+  emulator_parameters: &default_emulator_parameters
+    force_retrain: False
+
+    # Specify which kernels to include in the 'active' list -- can include multiple
+    # Must have exactly one of: matern, rbf
+    kernels:
+      active: ['matern', 'noise']
+
+      matern:
+        nu: 1.5
+        length_scale_bounds_factor: [0.01, 100]
+
+      rbf:
+        length_scale_bounds_factor: [0.01, 100]
+
+      constant:
+        constant_value: 1.
+        constant_value_bounds: [0.001, 10]
+
+      noise:
+        type: "white"
+        args:
+          # NOTE: Can't raise to power in yaml, so you have to evaluate them by hand
+          noise_level: 0.25  # 0.5**2
+          noise_level_bounds: [0.0001, 1]  # [0.01**2, 1**2]
+
+    # Gaussian Process Regressor
+    GPR:
+      n_restarts: 50
+      alpha: 1.e-10
+
+    # Validation
+    # We want to support the following:
+    #  - k-fold cross-validation
+    #  - validation dataset
+
+    # TODO: Cross-validation
+    cross_validation: False
+    cross_validation_k: 5
+
+    # Independent validation dataset
+    independent_validation: True
+
+  #-------------------------------------------
+  # MCMC parameters
+  mcmc_parameters: &default_mcmc_parameters
+    n_walkers: 100
+    n_burn_steps: 1000
+    n_sampling_steps: 5000
+    n_logging_steps: 10
+
+  #-------------------------------------------
+  # Closure test parameters
+  closure: &default_closure_parameters
+    confidence: 0.9
+
+#-------------------------------------------
+# Specify observables
+# We want to allow to configure the analysis to only use various subsets of observables
+#   (e.g. jet/hadron/substructure observables, sqrts, centrality, ...)
+# We will do this by looping over the specified models below:
+#   - We will loop through the parameterizations and run a separate analysis for each
+#   - We will start by using all observables in the table directory for that parameterization
+#   - We will then filter by the sqrts, centrality specified
+#   - Finally, we select any observables whose filename contains a string from observable_list
+
+# Set general share parameters
+analysis_base: &model_base
+  model_name: 'MATTER+LBT'
+  parameterizations: ['exponential']
+  sqrts_list: [200, 2760, 5020]
+  centrality_range: [0,10]
+  # Can also be a list of centrality ranges. eg:
+  #centrality_range: [[0, 10], [30, 50]]
+  recoil_scheme: 'negative_recominber'
+  parameterization:
+    exponential:
+      names: ['$\alpha_S^{\rm{fix}}$', '$Q_0$', '$c_1$', '$c_2$', '$\tau_0$', '$c_3$']
+      min: [0.1, 1, 0.006737946999085467, 0.006737946999085467, 0, 0.049787068367863944]
+      max: [0.5, 10, 10, 10, 1.5, 100]
+    binomial:
+      names: ['$\alpha_S^{\rm{fix}}$', '$Q_0$', '$c_1$', '$c_2$', '$a$', '$b$', '$\tau_0$']
+      min: [0.1, 1, 0.006737946999085467, 0.006737946999085467, -10, -10, 0]
+      max: [0.5, 10, 10, 10, 100, 100, 1.5]
+  alpha: 0.2
+  validation_indices: [200, 230] # For exp parameterization, these are the same for all sqrts (i.e. all points 200-229 inclusive)
+  design_points_to_exclude: [
+    ###########
+    # 1st draft
+    ###########
+    # Found using n_RMS = 2.
+    ## Round 1
+    #18, 36, 37, 44, 48, 51, 69, 73, 77, 89, 100, 104, 111, 147, 165, 173, 188, 189,
+    ## Validation from round 1
+    #214, 224, 229,
+    ## Round 2 (none from validation)
+    #22, 43, 45, 97, 117, 126, 176,
+    ## Round 3 (none from validation)
+    #9, 13, 25, 134,
+    ## Round 4 (none from validation)
+    #8, 60, 108,
+    ## Round 5 (none from validation)
+    #59,
+    ###########
+    # 2nd draft
+    ###########
+    # Found using n_RMS = 2, n_max = 2 (with bug fixes compared to the first time)
+    # Round 1
+    ## Large statistical errors
+    ## Std
+    #18, 36, 37, 43, 44, 48, 51, 69, 73, 89, 97, 104, 111, 147, 168,
+    ## Validation
+    #214, 217, 224,
+    ## Large central value differences
+    #18, 21, 22, 28, 36, 48, 51, 59, 73, 74, 79, 89, 118, 121, 140, 142, 143, 147, 151, 168, 180, 187,
+    ## Validation
+    #200, 214,
+    # Combined:
+    18, 21, 22, 28, 36, 37, 43, 44, 48, 51, 59, 69, 73, 74, 79, 89, 97, 104, 111, 118, 121, 140, 142, 143, 147, 151, 168, 180, 187, 200, 214, 217, 224,
+    # Round 2
+    ## Large statistical errors
+    ## Std
+    #8, 9, 13, 45, 173,
+    ## Validation
+    #229,
+    ## Large central value differences
+    #8, 30, 98, 188,
+    # Combined:
+    8, 9, 13, 30, 45, 98, 173, 188, 229,
+    # Spot points based on observable correlations
+    # 125: theta_g and z_g have two very low point, that's far away from everything else
+    125, 203,
+    # Only shows up for 200__AuAu__inclusive_chjet__pt_star__R0.4__0-10 after restricting the input pt range
+    5, 131, 182,
+    # 2760__PbPb__inclusive_jet__pt_cms__R0.3__5-10 (somehow was missed earlier - I suppose removing other points reduced the variance)
+    65,
+  ]
+  # Optionally: apply cuts to x-variable ranges (e.g. hadron pt > 10 GeV)
+  # This will remove any bins outside of the cut range for observable names containing the listed key
+  #cuts:
+  #  'hadron__pt_': [10, 1000]
+
+# Define base config for hadron analysis, since we will re-run with different pt cuts
+analysis_hadron_base: &analysis_hadron
+  parameters:
+    preprocessing:
+      <<: *default_preprocessing_parameters
+    emulators:
+      default_group:
+        <<: *default_emulator_parameters
+
+        observable_list:
+          - 'hadron__pt_'
+    mcmc:
+      <<: *default_mcmc_parameters
+    closure:
+      <<: *default_closure_parameters
+  <<: *model_base
+  plot_panel_shapes: [[3,3], [3,3]]
+
+analyses:
+
+  analysis_jet:
+    parameters:
+      preprocessing:
+        <<: *default_preprocessing_parameters
+      emulators:
+        default_group:
+          <<: *default_emulator_parameters
+          n_pc: 5
+          observable_list:
+            - 'jet__pt_'
+          observable_exclude_list:
+            - "pt_y_atlas"
+            - "2760__PbPb__inclusive_chjet__pt_alice"
+      mcmc:
+        <<: *default_mcmc_parameters
+        n_walkers: 200
+        n_burn_steps: 1000
+        n_sampling_steps: 25000
+      closure:
+        <<: *default_closure_parameters
+    <<: *model_base
+    cuts:
+      'chjet__pt_star__R0.2': [14, 100]
+      'chjet__pt_star__R0.4': [16, 100]
+    plot_panel_shapes: [[3,3], [3,3], [3,3]]
+
+  #analysis_jet_substructure_emcee:
+  #  parameters:
+  #    preprocessing:
+  #      <<: *default_preprocessing_parameters
+  #    emulators:
+  #      jet_group:
+  #        <<: *default_emulator_parameters
+  #        n_pc: 5
+  #        observable_list:
+  #          - 'jet__pt_'
+  #        observable_exclude_list:
+  #          - "pt_y_atlas"
+  #          - "2760__PbPb__inclusive_chjet__pt_alice"
+  #      substructure_groomed_group:
+  #        <<: *default_emulator_parameters
+  #        n_pc: 11
+  #        observable_list:
+  #          - 'chjet__zg_'
+  #          - 'chjet__tg_'
+  #      substructure_Dz_group:
+  #        <<: *default_emulator_parameters
+  #        n_pc: 25
+  #        observable_list:
+  #          - 'jet__Dz_'
+  #    mcmc:
+  #      <<: *default_mcmc_parameters
+  #      mcmc_package: "emcee"
+  #      n_walkers: 100
+  #      n_burn_steps: 1000
+  #      n_sampling_steps: 50000
+  #    closure:
+  #      <<: *default_closure_parameters
+  #  <<: *model_base
+  #  cuts:
+  #    'chjet__pt_star__R0.2': [14, 100]
+  #    'chjet__pt_star__R0.4': [16, 100]
+  #  plot_panel_shapes: [[3,3], [3,3], [3,3], [3,3], [3,3]]
+
+  analysis_jet_substructure_pocoMC:
+    parameters:
+      preprocessing:
+        <<: *default_preprocessing_parameters
+      emulators:
+        jet_group:
+          <<: *default_emulator_parameters
+          n_pc: 5
+          observable_list:
+            - 'jet__pt_'
+          observable_exclude_list:
+            - "pt_y_atlas"
+            - "2760__PbPb__inclusive_chjet__pt_alice"
+        substructure_groomed_group:
+          <<: *default_emulator_parameters
+          n_pc: 11
+          observable_list:
+            - 'chjet__zg_'
+            - 'chjet__tg_'
+        substructure_Dz_group:
+          <<: *default_emulator_parameters
+          n_pc: 25
+          observable_list:
+            - 'jet__Dz_'
+      mcmc:
+        <<: *default_mcmc_parameters
+        mcmc_package: "pocoMC"
+        pocoMC: {}
+
+      closure:
+        <<: *default_closure_parameters
+    <<: *model_base
+    cuts:
+      'chjet__pt_star__R0.2': [14, 100]
+      'chjet__pt_star__R0.4': [16, 100]
+    plot_panel_shapes: [[3,3], [3,3], [3,3], [3,3], [3,3]]
+
+  #analysis_hadron10_1000:
+  #  <<: *analysis_hadron
+  #  cuts:
+  #    'hadron__pt_': [10, 1000]

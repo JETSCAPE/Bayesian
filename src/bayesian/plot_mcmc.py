@@ -356,7 +356,7 @@ def _plot_posterior_observables(chain, plot_dir, config, n_samples=200):
     # Get emulator predictions at these points
     observables = data_IO.read_dict_from_h5(config.output_dir, config.observables_filename, verbose=False)
     # To get the results, we need to setup the emulation config
-    emulation_config = base.EmulationConfig.from_config_file(
+    emulation_config = base.EmulatorOrganizationConfig.from_config_file(
         analysis_name=config.analysis_name,
         parameterization=config.parameterization,
         analysis_config=config.analysis_config,

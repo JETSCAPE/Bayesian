@@ -282,8 +282,10 @@ analyses:
         <<: *default_preprocessing_parameters
       emulators:
         jet_group:
-          <<: *default_emulator_parameters
-          n_pc: 5
+          options:
+            <<: *default_emulator_parameters
+            name: "sk_learn"
+            n_pc: 5
           observable_list:
             - 'jet__pt_'
           observable_exclude_list:

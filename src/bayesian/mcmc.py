@@ -46,7 +46,7 @@ def run_mcmc(config: MCMCConfig, closure_index: int =-1) -> None:
     ndim = len(names)
 
     # Load emulators
-    emulation_config = base.EmulationConfig.from_config_file(
+    emulation_config = base.EmulatorOrganizationConfig.from_config_file(
         analysis_name=config.analysis_name,
         parameterization=config.parameterization,
         analysis_config=config.analysis_config,
@@ -144,7 +144,7 @@ def map_parameters(posterior, method='quantile'):
 
 def _run_using_emcee(
     config: MCMCConfig,
-    emulation_config: base.EmulationConfig,
+    emulation_config: base.EmulatorOrganizationConfig,
     emulation_results: dict[str, dict[str, npt.NDArray[np.float64]]],
     emulator_cov_unexplained: dict,
     experimental_results: dict,
@@ -268,7 +268,7 @@ class LoggingEnsembleSampler(emcee.EnsembleSampler):
 
 def _run_using_pocoMC(
     config: MCMCConfig,
-    emulation_config: base.EmulationConfig,
+    emulation_config: base.EmulatorOrganizationConfig,
     emulation_results: dict[str, dict[str, npt.NDArray[np.float64]]],
     emulator_cov_unexplained: dict,
     experimental_results: dict,

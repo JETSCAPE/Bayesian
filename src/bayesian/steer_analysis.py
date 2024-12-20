@@ -139,7 +139,7 @@ class SteerAnalysis(common_base.CommonBase):
                         progress.start_task(emulation_task)
                         logger.info('------------------------------------------------------------------------')
                         logger.info(f'Fitting emulators for {analysis_name}_{parameterization}...')
-                        emulation_config = base.EmulationConfig.from_config_file(
+                        emulation_config = base.EmulatorOrganizationConfig.from_config_file(
                             analysis_name=analysis_name,
                             parameterization=parameterization,
                             analysis_config=analysis_config,
@@ -201,7 +201,7 @@ class SteerAnalysis(common_base.CommonBase):
                 if self.plot["input_data"]:
                     logger.info('------------------------------------------------------------------------')
                     logger.info(f'Plotting input data for {analysis_name}_{parameterization}...')
-                    emulation_config = base.EmulationConfig.from_config_file(
+                    emulation_config = base.EmulatorOrganizationConfig.from_config_file(
                         analysis_name=analysis_name,
                         parameterization=parameterization,
                         analysis_config=analysis_config,
@@ -215,7 +215,7 @@ class SteerAnalysis(common_base.CommonBase):
 
                     logger.info('------------------------------------------------------------------------')
                     logger.info(f'Plotting emulators for {analysis_name}_{parameterization}...')
-                    emulation_config = base.EmulationConfig.from_config_file(
+                    emulation_config = base.EmulatorOrganizationConfig.from_config_file(
                         analysis_name=analysis_name,
                         parameterization=parameterization,
                         analysis_config=analysis_config,

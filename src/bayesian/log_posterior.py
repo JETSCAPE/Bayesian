@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 g_min: npt.NDArray[np.float64] = None
 g_max: npt.NDArray[np.float64] = None
-g_emulation_config: base.EmulationConfig = None
+g_emulation_config: base.EmulatorOrganizationConfig = None
 g_emulation_results: dict[str, dict[str, npt.NDArray[np.float64]]] = None
 g_experimental_results: dict = None
 g_emulator_cov_unexplained: dict = None

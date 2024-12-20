@@ -14,14 +14,16 @@ Based in part on JETSCAPE/STAT code.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import sklearn.decomposition as sklearn_decomposition
 import sklearn.gaussian_process as sklearn_gaussian_process
 import sklearn.preprocessing as sklearn_preprocessing
+import yaml
 
-from bayesian import data_IO
+from bayesian import common_base, data_IO
 from bayesian.emulation import base as emulation_base
 
 logger = logging.getLogger(__name__)
@@ -29,7 +31,7 @@ logger = logging.getLogger(__name__)
 _emulator_name = "sk_learn"
 
 ####################################################################################################################
-def fit_emulator(config: emulation_base.EmulationGroupConfig) -> dict[str, Any]:
+def fit_emulator(config: emulation_base.EmulatorOrganizationConfig) -> dict[str, Any]:
     '''
     Do PCA, fit emulators, and write to file for an individual emulation group.
 
@@ -38,6 +40,8 @@ def fit_emulator(config: emulation_base.EmulationGroupConfig) -> dict[str, Any]:
 
     :param EmulationConfig config: we take an instance of EmulationConfig as an argument to keep track of config info.
     '''
+    # Initialize the specific emulator config
+    emulator_config = EmulatorConfig.from_config(config=config)
 
     # Check if emulator already exists
     if config.emulation_outputfile.exists():
@@ -171,3 +175,79 @@ def fit_emulator(config: emulation_base.EmulationGroupConfig) -> dict[str, Any]:
     output_dict['emulators'] = emulators
 
     return output_dict
+
+
+####################################################################################################################
+class EmulatorConfig(common_base.CommonBase):
+
+    #---------------------------------------------------------------
+    # Constructor
+    #---------------------------------------------------------------
+    def __init__(self, analysis_name='', parameterization='', analysis_config='', config_file='', emulation_group_name: str | None = None):
+
+        self.analysis_name = analysis_name
+        self.parameterization = parameterization
+        self.analysis_config = analysis_config
+        self.config_file = config_file
+
+        with Path(self.config_file).open() as stream:
+            config = yaml.safe_load(stream)
+
+        # Observable inputs
+        self.observable_table_dir = config['observable_table_dir']
+        self.observable_config_dir = config['observable_config_dir']
+        self.observables_filename = config["observables_filename"]
+
+        ########################
+        # Emulator configuration
+        ########################
+        if emulation_group_name is None:
+            emulator_configuration = self.analysis_config["parameters"]["emulators"]
+        else:
+            emulator_configuration = self.analysis_config["parameters"]["emulators"][emulation_group_name]
+        self.force_retrain = emulator_configuration['force_retrain']
+        self.n_pc = emulator_configuration['n_pc']
+        self.max_n_components_to_calculate = emulator_configuration.get("max_n_components_to_calculate", None)
+
+        # Kernels
+        self.active_kernels = {}
+        for kernel_type in emulator_configuration['kernels']['active']:
+            self.active_kernels[kernel_type] = emulator_configuration['kernels'][kernel_type]
+
+        # Validate that we have exactly one of matern, rbf
+        reference_strings = ["matern", "rbf"]
+        assert sum([s in self.active_kernels for s in reference_strings]) == 1, "Must provide exactly one of 'matern', 'rbf' kernel"
+
+        # Validation for noise configuration
+        if 'noise' in self.active_kernels:
+            # Check we have the appropriate keys
+            assert [k in self.active_kernels['noise'] for k in ["type", "args"]], "Noise configuration must have keys 'type' and 'args'"
+            if self.active_kernels['noise']["type"] == "white":
+                # Validate arguments
+                # We don't want to do too much since we'll just be reinventing the wheel, but a bit can be helpful.
+                assert set(self.active_kernels['noise']["args"]) == set(["noise_level", "noise_level_bounds"]), "Must provide arguments 'noise_level' and 'noise_level_bounds' for white noise kernel"  # noqa: C405
+            else:
+                msg = "Unsupported noise kernel"
+                raise ValueError(msg)
+
+        # GPR
+        self.n_restarts = emulator_configuration["GPR"]['n_restarts']
+        self.alpha = emulator_configuration["GPR"]["alpha"]
+
+        # Observable list
+        # None implies a convention of accepting all available data
+        self.observable_filter = None
+        observable_list = emulator_configuration.get("observable_list", [])
+        observable_exclude_list = emulator_configuration.get("observable_exclude_list", [])
+        if observable_list or observable_exclude_list:
+            self.observable_filter = data_IO.ObservableFilter(
+                include_list=observable_list,
+                exclude_list=observable_exclude_list,
+            )
+
+        # Output options
+        self.output_dir = Path(config['output_dir']) / f'{analysis_name}_{parameterization}'
+        emulation_outputfile_name = 'emulation.pkl'
+        if emulation_group_name is not None:
+            emulation_outputfile_name = f'emulation_group_{emulation_group_name}.pkl'
+        self.emulation_outputfile = Path(self.output_dir) /  emulation_outputfile_name

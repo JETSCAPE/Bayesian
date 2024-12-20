@@ -224,7 +224,7 @@ def _plot_single_parameter_observable_sensitivity(map_parameters, i_parameter, p
     x_prime = np.expand_dims(x_prime, axis=0)
 
     # Get emulator predictions at the two points
-    emulation_config = base.EmulationConfig.from_config_file(
+    emulation_config = base.EmulatorOrganizationConfig.from_config_file(
         analysis_name=config.analysis_name,
         parameterization=config.parameterization,
         analysis_config=config.analysis_config,

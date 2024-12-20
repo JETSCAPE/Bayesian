@@ -18,7 +18,7 @@ import logging
 import pickle
 import pkgutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import attrs
 import numpy as np
@@ -29,10 +29,10 @@ from bayesian import common_base, data_IO
 
 logger = logging.getLogger(__name__)
 
-_emulators = {}
+_emulators: dict[str, Any] = {}
 
 
-def _discover_emulators():
+def _discover_emulators() -> None:
     """
     Automatically discover and register emulators in the current package directory.
     Looks for modules with an '_emulator_name' attribute.
@@ -72,7 +72,7 @@ def _validate_emulator(name: str, module: Any) -> None:
     #     raise ValueError(msg)
 
 
-def fit_emulators(emulation_config: EmulationConfig) -> None:
+def fit_emulators(emulation_config: EmulatorOrganizationConfig) -> None:
     """ Do PCA, fit emulators, and write to file.
 
     :param EmulationConfig config: Configuration for the emulators, including all groups.
@@ -95,10 +95,20 @@ def fit_emulators(emulation_config: EmulationConfig) -> None:
     #       it doesn't appear to be at the moment (August 2023), so we leave as is.
 
 
+def predict_from_emulator(
+    parameters: npt.NDArray[np.float64],
+    emulation_config: EmulatorOrganizationConfig,
+    merge_predictions_over_groups: bool = True,
+    emulation_group_results: dict[str, dict[str, Any]] | None = None,
+    emulator_cov_unexplained: dict | None = None
+) -> dict[str, npt.NDArray[np.float64]]:
+    # Call from MCMC
+    ...
+
+
 def predict(parameters: npt.NDArray[np.float64],
-            emulation_config: EmulationConfig,
+            emulation_config: EmulatorOrganizationConfig,
             merge_predictions_over_groups: bool = True,
-            emulation_group_results: dict[str, dict[str, Any]] | None = None,
             emulator_cov_unexplained: dict | None = None) -> dict[str, npt.NDArray[np.float64]]:
     """
     Construct dictionary of emulator predictions for each observable
@@ -236,7 +246,7 @@ def predict_emulation_group(parameters, results, emulation_group_config, emulato
     return emulator_predictions
 
 
-def read_emulators(config: EmulationGroupConfig) -> dict[str, Any]:
+def read_emulators(config: EmulatorConfig) -> dict[str, Any]:
     """
     Read emulators from file.
     """
@@ -244,11 +254,11 @@ def read_emulators(config: EmulationGroupConfig) -> dict[str, Any]:
     filename = Path(config.emulation_outputfile)
 
     with filename.open("rb") as f:
-        results = pickle.load(f)
-    return results  # noqa: RET504
+        results: dict[str, Any] = pickle.load(f)
+    return results
 
 
-def write_emulators(config: EmulationGroupConfig, output_dict: dict[str, Any]) -> None:
+def write_emulators(config: EmulatorConfig, output_dict: dict[str, Any]) -> None:
     """
     Write emulators stored in a result from `fit_emulator_group` to file.
     """
@@ -258,85 +268,61 @@ def write_emulators(config: EmulationGroupConfig, output_dict: dict[str, Any]) -
     with filename.open('wb') as f:
         pickle.dump(output_dict, f)
 
+class EmulatorConfig(Protocol):
+    """
+    Protocol for an emulator configuration.
+    """
+    emulator_name: str
+    base_config: EmulatorBaseConfig
+    settings: dict[str, Any]
 
-####################################################################################################################
-class EmulationGroupConfig(common_base.CommonBase):
 
-    #---------------------------------------------------------------
-    # Constructor
-    #---------------------------------------------------------------
-    def __init__(self, analysis_name='', parameterization='', analysis_config='', config_file='', emulation_group_name: str | None = None):
+@attrs.define
+class EmulatorBaseConfig:
+    """
+    Base configuration for an emulator.
 
-        self.analysis_name = analysis_name
-        self.parameterization = parameterization
-        self.analysis_config = analysis_config
-        self.config_file = config_file
+    Store this class in your specialized emulator config class.
+    Composition is preferred to inheritance.
+    """
+    emulator_name: str
+    analysis_name: str
+    parameterization: str
+    config_file: Path = attrs.field(converter=Path)
+    analysis_config: dict[str, Any] = attrs.field(factory=dict)
+    config: dict[str, Any] = attrs.field(init=False)
+    observables_table_dir: Path | str = attrs.field(init=False)
+    observables_config_dir: Path | str = attrs.field(init=False)
+    observables_filename: str = attrs.field(init=False)
 
+    def __attrs_post_init__(self):
+        """
+        Post-creation customization of the emulator configuration.
+        """
         with Path(self.config_file).open() as stream:
             config = yaml.safe_load(stream)
 
         # Observable inputs
-        self.observable_table_dir = config['observable_table_dir']
-        self.observable_config_dir = config['observable_config_dir']
+        self.observables_table_dir = config['observable_table_dir']
+        self.observables_config_dir = config['observable_config_dir']
         self.observables_filename = config["observables_filename"]
 
-        ########################
-        # Emulator configuration
-        ########################
-        if emulation_group_name is None:
-            emulator_configuration = self.analysis_config["parameters"]["emulators"]
-        else:
-            emulator_configuration = self.analysis_config["parameters"]["emulators"][emulation_group_name]
-        self.force_retrain = emulator_configuration['force_retrain']
-        self.n_pc = emulator_configuration['n_pc']
-        self.max_n_components_to_calculate = emulator_configuration.get("max_n_components_to_calculate", None)
-
-        # Kernels
-        self.active_kernels = {}
-        for kernel_type in emulator_configuration['kernels']['active']:
-            self.active_kernels[kernel_type] = emulator_configuration['kernels'][kernel_type]
-
-        # Validate that we have exactly one of matern, rbf
-        reference_strings = ["matern", "rbf"]
-        assert sum([s in self.active_kernels for s in reference_strings]) == 1, "Must provide exactly one of 'matern', 'rbf' kernel"
-
-        # Validation for noise configuration
-        if 'noise' in self.active_kernels:
-            # Check we have the appropriate keys
-            assert [k in self.active_kernels['noise'] for k in ["type", "args"]], "Noise configuration must have keys 'type' and 'args'"
-            if self.active_kernels['noise']["type"] == "white":
-                # Validate arguments
-                # We don't want to do too much since we'll just be reinventing the wheel, but a bit can be helpful.
-                assert set(self.active_kernels['noise']["args"]) == set(["noise_level", "noise_level_bounds"]), "Must provide arguments 'noise_level' and 'noise_level_bounds' for white noise kernel"  # noqa: C405
-            else:
-                msg = "Unsupported noise kernel"
-                raise ValueError(msg)
-
-        # GPR
-        self.n_restarts = emulator_configuration["GPR"]['n_restarts']
-        self.alpha = emulator_configuration["GPR"]["alpha"]
-
-        # Observable list
-        # None implies a convention of accepting all available data
-        self.observable_filter = None
-        observable_list = emulator_configuration.get("observable_list", [])
-        observable_exclude_list = emulator_configuration.get("observable_exclude_list", [])
-        if observable_list or observable_exclude_list:
-            self.observable_filter = data_IO.ObservableFilter(
-                include_list=observable_list,
-                exclude_list=observable_exclude_list,
-            )
-
-        # Output options
-        self.output_dir = Path(config['output_dir']) / f'{analysis_name}_{parameterization}'
-        emulation_outputfile_name = 'emulation.pkl'
-        if emulation_group_name is not None:
-            emulation_outputfile_name = f'emulation_group_{emulation_group_name}.pkl'
-        self.emulation_outputfile = Path(self.output_dir) /  emulation_outputfile_name
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> EmulatorBaseConfig:
+        """
+        Initialize the emulator configuration from a config file.
+        """
+        c = cls(
+            emulator_name=config['emulator_name'],
+            analysis_name=config['analysis_name'],
+            parameterization=config['parameterization'],
+            config_file=config['config_file'],
+        )
+        return c
 
 
 @attrs.define
-class EmulationConfig(common_base.CommonBase):
+class EmulatorOrganizationConfig(common_base.CommonBase):
     """
     Configuration for an emulator.
     """
@@ -344,7 +330,7 @@ class EmulationConfig(common_base.CommonBase):
     parameterization: str
     config_file: Path = attrs.field(converter=Path)
     analysis_config: dict[str, Any] = attrs.field(factory=dict)
-    emulation_groups_config: dict[str, EmulationGroupConfig] = attrs.field(factory=dict)
+    emulation_groups_config: dict[str, EmulatorConfig] = attrs.field(factory=dict)
     config: dict[str, Any] = attrs.field(init=False)
     observable_table_dir: Path | str = attrs.field(init=False)
     observable_config_dir: Path | str = attrs.field(init=False)
@@ -369,7 +355,6 @@ class EmulationConfig(common_base.CommonBase):
         # I/O
         self.output_dir = Path(self.config['output_dir']) / f'{self.analysis_name}_{self.parameterization}'
 
-
     @classmethod
     def from_config_file(cls, analysis_name: str, parameterization: str, config_file: Path, analysis_config: dict[str, Any]):
         """
@@ -383,7 +368,7 @@ class EmulationConfig(common_base.CommonBase):
         )
         # Initialize the config for each emulation group
         c.emulation_groups_config = {
-            k: EmulationGroupConfig(
+            k: EmulatorConfig(
                 analysis_name=c.analysis_name,
                 parameterization=c.parameterization,
                 analysis_config=c.analysis_config,
@@ -450,7 +435,7 @@ class SortEmulationGroupObservables:
     _available_value_types: set[str] | None = attrs.field(init=False, default=None)
 
     @classmethod
-    def learn_mapping(cls, emulation_config: EmulationConfig) -> SortEmulationGroupObservables:
+    def learn_mapping(cls, emulation_config: EmulatorOrganizationConfig) -> SortEmulationGroupObservables:
         """ Construct this object by learning the mapping from the emulation group prediction matrices to the sorted and merged matrices.
 
         :param EmulationConfig emulation_config: Configuration for the emulator(s).

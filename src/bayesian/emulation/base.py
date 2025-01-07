@@ -77,7 +77,7 @@ def predict_from_emulator(
     emulation_group_results: dict[str, dict[str, Any]] | None = None,
     emulator_cov_unexplained: dict | None = None
 ) -> dict[str, npt.NDArray[np.float64]]:
-    # Call from MCMC
+    # Called from MCMC
     ...
 
 def predict(

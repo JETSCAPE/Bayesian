@@ -7,7 +7,8 @@ The main functionalities are:
 
 A configuration class EmulationConfig provides simple access to emulation settings
 
-authors: J.Mulligan, R.Ehlers
+.. codeauthor: James Mulligan, LBL/UCB
+.. codeauthor: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
 Based in part on JETSCAPE/STAT code.
 '''
 

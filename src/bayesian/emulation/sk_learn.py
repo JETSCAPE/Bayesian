@@ -28,7 +28,7 @@ from bayesian.emulation import base as emulation_base
 
 logger = logging.getLogger(__name__)
 
-_emulator_name = "sk_learn"
+_register_name = "sk_learn"
 
 ####################################################################################################################
 def fit_emulator(config: emulation_base.EmulatorOrganizationConfig) -> dict[str, Any]:

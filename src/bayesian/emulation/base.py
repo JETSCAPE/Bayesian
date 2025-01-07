@@ -13,11 +13,10 @@ Based in part on JETSCAPE/STAT code.
 
 from __future__ import annotations
 
-import importlib
 import logging
 import pickle
-import pkgutil
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Protocol
 
 import attrs
@@ -25,38 +24,11 @@ import numpy as np
 import numpy.typing as npt
 import yaml
 
-from bayesian import common_base, data_IO
+from bayesian import common_base, data_IO, register_modules
 
 logger = logging.getLogger(__name__)
 
-_emulators: dict[str, Any] = {}
-
-
-def _discover_emulators() -> None:
-    """
-    Automatically discover and register emulators in the current package directory.
-    Looks for modules with an '_emulator_name' attribute.
-    """
-    # Get the current directory
-    package_dir = Path(__file__).parent
-
-    # Scan for all modules in the current directory
-    for module_info in pkgutil.iter_modules([str(package_dir)]):
-        # Import the module
-        module = importlib.import_module(f".{module_info.name}", __package__)
-
-        # Check if it has an _emulator_name attribute
-        if hasattr(module, '_emulator_name'):
-            _register_emulator_module(module._emulator_name, module)
-
-
-def _register_emulator_module(name: str, module: Any) -> None:
-    """
-    Register an emulator module with a given name.
-    """
-    _validate_emulator(name=name, module=module)
-    logger.info(f"Registering emulator module {name}")
-    _emulators[name] = module
+_emulators: dict[str, ModuleType] = {}
 
 
 def _validate_emulator(name: str, module: Any) -> None:
@@ -618,4 +590,10 @@ def compute_emulator_group_cov_unexplained(emulation_group_config, emulation_gro
 
 # Actually perform the discovery and registration of the emulators
 if not _emulators:
-    _discover_emulators()
+    _emulators.update(
+        register_modules.discover_and_register_modules(
+            calling_module_name=__name__,
+            required_attributes=[],
+            validation_function=_validate_emulator,
+        )
+    )

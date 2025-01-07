@@ -27,9 +27,23 @@ def discover_and_register_modules(
     validation_function: ValidationFunction | None = None,
     fail_on_failed_validation: bool = True,
 ) -> dict[str, ModuleType]:
-    """
-    Automatically discover and register modules in the provided package directory.
-    Looks for modules with an '_register_name' attribute.
+    """Automatically discovery and registeration of modules in the directory of the calling module.
+
+    Modules in the directory indicate they should be registred by defining a '_register_name' attribute.
+    Such modules are then validated and passed to the calling modules.
+
+    Args:
+        calling_module_name: `__name__` attribute of the module where this is being called.
+        required_attributes: List of attributes which are required to exist in the modules
+            that will be registered.
+        validation_function: Function that allows for generic validation of a module to be
+            registered. Any issues are indicated by raising exceptions.
+        fail_on_failed_validation: If True, this discovery and registration will fail if
+            the validation of the any of the modules fails. Default: True.
+
+    Returns:
+        A dictionary where the keys are names the modules are supposed to be registered under,
+            and the values are the modules themselves.
     """
     # Setup
     registered_modules: dict[str, Any] = {}

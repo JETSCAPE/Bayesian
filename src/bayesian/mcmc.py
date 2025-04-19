@@ -17,6 +17,8 @@ import multiprocessing
 import pickle
 from pathlib import Path
 
+import os
+
 import emcee
 import numpy as np
 import numpy.typing as npt
@@ -179,8 +181,12 @@ def _run_using_emcee(
     #       (eg. used in learning the emulator group mapping doesn't work)
     # NOTE: We use `get_context` here to avoid having to globally specify the context. Plus, it then should be fine
     #       to repeated call this function. (`set_context` can only be called once - otherwise, it's a runtime error).
+    n_processes = os.environ.get("SLURM_CPUS_PER_TASK", 4)  # fallback default
+    n_processes = int(n_processes)
+
     ctx = multiprocessing.get_context('spawn')
     with ctx.Pool(
+        processes=n_processes,
         initializer=log_posterior.initialize_pool_variables,
         initargs=[
             parameter_min, parameter_max, emulation_config, emulation_results, experimental_results, emulator_cov_unexplained

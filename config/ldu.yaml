@@ -2,36 +2,36 @@
 #-------------------------------------------
 # General parameters
 
-output_dir: 'output/20230829-QM'
+output_dir: '/rds/project/rds-hCZCEbPdvZ8/output/20230829-QM'
 
-initialize_observables: False
-preprocess_input_data: False
-fit_emulators: False
-run_mcmc: False
-run_closure_tests: False
+initialize_observables: True
+preprocess_input_data: True
+fit_emulators: True
+run_mcmc: True
+run_closure_tests: True
 
 plot:
-  input_data: False
-  emulators: False
-  mcmc: False
-  qhat: False
-  closure_tests: False
+  input_data: True
+  emulators: True
+  mcmc: True
+  qhat: True
+  closure_tests: True
   across_analyses: True
 
 debug_level: 0
 
 #-------------------------------------------
 # The design points, predictions, and experimental data are located in tables produced by the aggregation machinery
-observable_table_dir: 'data/20230116/tables'
+observable_table_dir: '20230116/tables'
 
 # We make use of some info in the JETSCAPE-analysis config that was used to aggregate/plot observables
-observable_config_dir: '../jetscape-analysis/config'
+observable_config_dir: '../JETSCAPE-analysis/config'
 
 # Filename of the observables file that we will use. This could be the standard one, or it could
 # have some predictions preprocessing applied to it.
 # Change to 'observables_preprocessed.h5' to use preprocessed data
-#observables_filename: "observables.h5"
-observables_filename: "observables_preprocessed.h5"
+observables_filename: "observables.h5"
+# observables_filename: "observables_preprocessed.h5"
 
 #-------------------------------------------
 # Default parameter settings
@@ -134,7 +134,7 @@ analysis_base: &model_base
       min: [0.1, 1, 0.006737946999085467, 0.006737946999085467, -10, -10, 0]
       max: [0.5, 10, 10, 10, 100, 100, 1.5]
   alpha: 0.2
-  validation_indices: [200, 230] # For exp parameterization, these are the same for all sqrts (i.e. all points 200-229 inclusive)
+  validation_indices: [200, 201] # For exp parameterization, these are the same for all sqrts (i.e. all points 200-229 inclusive)
   design_points_to_exclude: [
     ###########
     # 1st draft
@@ -221,6 +221,7 @@ analyses:
       emulators:
         default_group:
           <<: *default_emulator_parameters
+          emulator_name: sk_learn
           n_pc: 5
           observable_list:
             - 'jet__pt_'
@@ -229,9 +230,9 @@ analyses:
             - "2760__PbPb__inclusive_chjet__pt_alice"
       mcmc:
         <<: *default_mcmc_parameters
-        n_walkers: 200
-        n_burn_steps: 1000
-        n_sampling_steps: 25000
+        n_walkers: 20
+        n_burn_steps: 100
+        n_sampling_steps: 500
       closure:
         <<: *default_closure_parameters
     <<: *model_base
@@ -240,42 +241,42 @@ analyses:
       'chjet__pt_star__R0.4': [16, 100]
     plot_panel_shapes: [[3,3], [3,3], [3,3]]
 
-  analysis_jet_substructure_n_walkers_100_long_prod:
-    parameters:
-      preprocessing:
-        <<: *default_preprocessing_parameters
-      emulators:
-        jet_group:
-          <<: *default_emulator_parameters
-          n_pc: 5
-          observable_list:
-            - 'jet__pt_'
-          observable_exclude_list:
-            - "pt_y_atlas"
-            - "2760__PbPb__inclusive_chjet__pt_alice"
-        substructure_groomed_group:
-          <<: *default_emulator_parameters
-          n_pc: 11
-          observable_list:
-            - 'chjet__zg_'
-            - 'chjet__tg_'
-        substructure_Dz_group:
-          <<: *default_emulator_parameters
-          n_pc: 25
-          observable_list:
-            - 'jet__Dz_'
-      mcmc:
-        <<: *default_mcmc_parameters
-        n_walkers: 100
-        n_burn_steps: 1000
-        n_sampling_steps: 50000
-      closure:
-        <<: *default_closure_parameters
-    <<: *model_base
-    cuts:
-      'chjet__pt_star__R0.2': [14, 100]
-      'chjet__pt_star__R0.4': [16, 100]
-    plot_panel_shapes: [[3,3], [3,3], [3,3], [3,3], [3,3]]
+  # analysis_jet_substructure_n_walkers_100_long_prod:
+  #   parameters:
+  #     preprocessing:
+  #       <<: *default_preprocessing_parameters
+  #     emulators:
+  #       jet_group:
+  #         <<: *default_emulator_parameters
+  #         n_pc: 5
+  #         observable_list:
+  #           - 'jet__pt_'
+  #         observable_exclude_list:
+  #           - "pt_y_atlas"
+  #           - "2760__PbPb__inclusive_chjet__pt_alice"
+  #       substructure_groomed_group:
+  #         <<: *default_emulator_parameters
+  #         n_pc: 11
+  #         observable_list:
+  #           - 'chjet__zg_'
+  #           - 'chjet__tg_'
+  #       substructure_Dz_group:
+  #         <<: *default_emulator_parameters
+  #         n_pc: 25
+  #         observable_list:
+  #           - 'jet__Dz_'
+  #     mcmc:
+  #       <<: *default_mcmc_parameters
+  #       n_walkers: 100
+  #       n_burn_steps: 1000
+  #       n_sampling_steps: 50000
+  #     closure:
+  #       <<: *default_closure_parameters
+  #   <<: *model_base
+  #   cuts:
+  #     'chjet__pt_star__R0.2': [14, 100]
+  #     'chjet__pt_star__R0.4': [16, 100]
+  #   plot_panel_shapes: [[3,3], [3,3], [3,3], [3,3], [3,3]]
 
 
 

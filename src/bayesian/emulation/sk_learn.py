@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 _register_name = "sk_learn"
 
 ####################################################################################################################
-def fit_emulator(config: emulation_base.EmulatorOrganizationConfig) -> dict[str, Any]:
+def fit_emulator_group(config: emulation_base.ConcreteEmulatorConfig) -> dict[str, Any]:
     '''
     Do PCA, fit emulators, and write to file for an individual emulation group.
 
@@ -40,8 +40,6 @@ def fit_emulator(config: emulation_base.EmulatorOrganizationConfig) -> dict[str,
 
     :param EmulationConfig config: we take an instance of EmulationConfig as an argument to keep track of config info.
     '''
-    # Initialize the specific emulator config
-    emulator_config = EmulatorConfig.from_config(config=config)
 
     # Check if emulator already exists
     if config.emulation_outputfile.exists():

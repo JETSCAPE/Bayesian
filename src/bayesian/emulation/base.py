@@ -35,8 +35,8 @@ def _validate_emulator(name: str, module: Any) -> None:
     """
     Validate that an emulator module follows the expected interface.
     """
-    if not hasattr(module, "fit_emulator_group"):
-        msg = f"Emulator module {name} does not have a required 'fit_emulator_group' method"
+    if not hasattr(module, "fit_emulator"):
+        msg = f"Emulator module {name} does not have a required 'fit_emulator' method"
         raise ValueError(msg)
     # TODO: Re-enable when things stablize a bit.
     # if not hasattr(module, "predict"):
@@ -62,7 +62,7 @@ def fit_emulators(emulation_config: EmulatorOrganizationConfig) -> None:
 
         logger.info(f"Fitting emulator for group '{emulation_group_name}' using backend '{emulator_name}'")
 
-        emulator_groups_output[emulation_group_name] = emulator.fit_emulator_group(emulation_group_config)
+        emulator_groups_output[emulation_group_name] = emulator.fit_emulator(emulation_group_config)
         # NOTE: If it returns early because an emulator already exists, then we don't want to overwrite it!
         if emulator_groups_output[emulation_group_name]:
             write_emulators(config=emulation_group_config, output_dict=emulator_groups_output[emulation_group_name])
@@ -255,85 +255,6 @@ class EmulatorConfig(Protocol):
 
 
 @attrs.define
-class ConcreteEmulatorConfig:
-    emulator_name: str
-    base_config: EmulatorBaseConfig
-    settings: dict[str, Any]
-
-    @property
-    def observable_filter(self) -> data_IO.ObservableFilter | None:
-        observable_list = self.settings.get("observable_list", [])
-        observable_exclude_list = self.settings.get("observable_exclude_list", [])
-        if observable_list or observable_exclude_list:
-            return data_IO.ObservableFilter(
-                include_list=observable_list,
-                exclude_list=observable_exclude_list,
-            )
-        return None
-
-    # Expose base_config fields
-    @property
-    def emulation_outputfile(self) -> Path:
-        return self.base_config.emulation_outputfile
-
-    @property
-    def output_dir(self) -> Path:
-        return self.base_config.emulation_outputfile.parent
-
-    @property
-    def observables_filename(self) -> str:
-        return self.base_config.observables_filename
-
-    @property
-    def observable_table_dir(self) -> Path | str:
-        return self.base_config.observables_table_dir
-
-    @property
-    def observable_config_dir(self) -> Path | str:
-        return self.base_config.observables_config_dir
-
-    @property
-    def config(self) -> dict[str, Any]:
-        return self.base_config.config
-
-    @property
-    def analysis_config(self) -> dict[str, Any]:
-        return self.base_config.analysis_config
-
-    @property
-    def parameterization(self) -> str:
-        return self.base_config.parameterization
-
-    @property
-    def analysis_name(self) -> str:
-        return self.base_config.analysis_name
-
-    @property
-    def n_pc(self) -> int:
-        return self.settings["n_pc"]
-
-    @property
-    def max_n_components_to_calculate(self) -> int | None:
-        return self.settings.get("max_n_components_to_calculate", None)
-
-    @property
-    def force_retrain(self) -> bool:
-        return self.settings.get("force_retrain", False)
-
-    @property
-    def active_kernels(self) -> dict[str, Any]:
-        return self.settings["kernels"]
-
-    @property
-    def n_restarts(self) -> int:
-        return self.settings["GPR"]["n_restarts"]
-
-    @property
-    def alpha(self) -> float:
-        return self.settings["GPR"]["alpha"]
-
-
-@attrs.define
 class EmulatorBaseConfig:
     """
     Base configuration for an emulator.
@@ -371,7 +292,7 @@ class EmulatorBaseConfig:
 
         # Choose file name based on group name
         if self.emulation_group_name:
-            emulation_outputfile_name = f'emulation_group_{self.emulation_group_name}.pkl'
+            emulation_outputfile_name = f'emulation_{self.emulation_group_name}.pkl'
         else:
             emulation_outputfile_name = 'emulation.pkl'
 
@@ -387,6 +308,7 @@ class EmulatorBaseConfig:
             analysis_name=config['analysis_name'],
             parameterization=config['parameterization'],
             config_file=config['config_file'],
+            emulation_group_name=config.get('emulation_group_name', None),
         )
         return c
 
@@ -425,6 +347,14 @@ class EmulatorOrganizationConfig(common_base.CommonBase):
         # I/O
         self.output_dir = Path(self.config['output_dir']) / f'{self.analysis_name}_{self.parameterization}'
 
+    @staticmethod
+    def _import_backend(name: str):
+        if name == "sk_learn":
+            from bayesian.emulation import sk_learn
+            return sk_learn.SklearnEmulatorConfig
+        else:
+            raise ValueError(f"No emulator backend named '{name}'")
+
     @classmethod
     def from_config_file(cls, analysis_name: str, parameterization: str, config_file: Path, analysis_config: dict[str, Any]):
         """
@@ -438,18 +368,14 @@ class EmulatorOrganizationConfig(common_base.CommonBase):
         )
         # Initialize the config for each emulation group
         c.emulation_groups_config = {
-            k: ConcreteEmulatorConfig(
-                emulator_name = group_cfg.get("emulator_name", "sk_learn"),
-                base_config=EmulatorBaseConfig(
-                    emulator_name=c.analysis_config["parameters"]["emulators"][k]["emulator_name"],
-                    analysis_name=c.analysis_name,
-                    parameterization=c.parameterization,
-                    config_file=c.config_file,
-                    analysis_config=c.analysis_config,
-                ),
-                settings = c.analysis_config["parameters"]["emulators"][k]
+            group_name: cls._import_backend(group_cfg.get("emulator_name", "sk_learn"))(
+                analysis_name=analysis_name,
+                parameterization=parameterization,
+                analysis_config=analysis_config,
+                config_file=config_file,
+                emulation_name=group_name
             )
-            for k, group_cfg in analysis_config["parameters"]["emulators"].items()
+            for group_name, group_cfg in analysis_config["parameters"]["emulators"].items()
         }
         return c
 

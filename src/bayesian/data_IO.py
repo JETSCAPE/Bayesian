@@ -358,6 +358,9 @@ def data_array_from_h5(output_dir, filename, pseudodata_index: int =-1, observab
     # Sort observables, to keep well-defined ordering in matrix
     sorted_observable_list = sorted_observable_list_from_dict(observables, observable_filter=observable_filter)
 
+    if not sorted_observable_list:
+        logger.warning("No observables passed the filter. Check observable_list / observable_exclude_list in your config.")
+
     # Get data dictionary (or in case of closure test, pseudodata from validation set)
     if pseudodata_index < 0:
         data_dict = observables['Data']

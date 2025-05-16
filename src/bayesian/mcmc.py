@@ -17,6 +17,8 @@ import multiprocessing
 import pickle
 from pathlib import Path
 
+import os
+
 import emcee
 import numpy as np
 import numpy.typing as npt

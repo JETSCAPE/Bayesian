@@ -31,17 +31,15 @@ logger = logging.getLogger(__name__)
 _register_name = "sk_learn"
 
 ####################################################################################################################
-def fit_emulator(config: emulation_base.EmulatorOrganizationConfig) -> dict[str, Any]:
+def fit_emulator(config: emulation_base.EmulatorConfig) -> dict[str, Any]:
     '''
-    Do PCA, fit emulators, and write to file for an individual emulation group.
+    Do PCA, fit emulators, and write to file for an individual emulation.
 
     The first config.n_pc principal components (PCs) are emulated by independent Gaussian processes (GPs)
     The emulators map design points to PCs; the output will need to be inverted from PCA space to physical space.
 
     :param EmulationConfig config: we take an instance of EmulationConfig as an argument to keep track of config info.
     '''
-    # Initialize the specific emulator config
-    emulator_config = EmulatorConfig.from_config(config=config)
 
     # Check if emulator already exists
     if config.emulation_outputfile.exists():
@@ -183,7 +181,7 @@ class EmulatorConfig(common_base.CommonBase):
     #---------------------------------------------------------------
     # Constructor
     #---------------------------------------------------------------
-    def __init__(self, analysis_name='', parameterization='', analysis_config='', config_file='', emulation_group_name: str | None = None):
+    def __init__(self, analysis_name='', parameterization='', analysis_config='', config_file='', emulation_name: str | None = None):
 
         self.analysis_name = analysis_name
         self.parameterization = parameterization
@@ -201,10 +199,10 @@ class EmulatorConfig(common_base.CommonBase):
         ########################
         # Emulator configuration
         ########################
-        if emulation_group_name is None:
+        if emulation_name is None:
             emulator_configuration = self.analysis_config["parameters"]["emulators"]
         else:
-            emulator_configuration = self.analysis_config["parameters"]["emulators"][emulation_group_name]
+            emulator_configuration = self.analysis_config["parameters"]["emulators"][emulation_name]
         self.force_retrain = emulator_configuration['force_retrain']
         self.n_pc = emulator_configuration['n_pc']
         self.max_n_components_to_calculate = emulator_configuration.get("max_n_components_to_calculate", None)
@@ -248,6 +246,10 @@ class EmulatorConfig(common_base.CommonBase):
         # Output options
         self.output_dir = Path(config['output_dir']) / f'{analysis_name}_{parameterization}'
         emulation_outputfile_name = 'emulation.pkl'
-        if emulation_group_name is not None:
-            emulation_outputfile_name = f'emulation_group_{emulation_group_name}.pkl'
+        if emulation_name is not None:
+            emulation_outputfile_name = f'emulation_{emulation_name}.pkl'
         self.emulation_outputfile = Path(self.output_dir) /  emulation_outputfile_name
+
+
+# Register the config class as backend entry point
+SklearnEmulatorConfig = EmulatorConfig

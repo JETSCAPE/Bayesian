@@ -15,6 +15,17 @@ The main functionalities are:
  - sorted_observable_list_from_dict() -- get sorted list of observable_label keys, using fixed ordering convention that we enforce
 
 authors: J.Mulligan, R.Ehlers
+
+# CHANGES MADE:
+# 1. Added new functions for systematic uncertainty support (all marked NEW)
+# 2. Renamed 'y_err' -> 'y_err_stat' in data structure
+# 3. Added 'systematics' dict to both Data and Prediction structures
+# 4. Added parsing for new config format with sys_data/sys_theory
+# 5. Added systematic reading and filtering
+# 6. Copy xmin/xmax from Data to Prediction for consistency
+# 7. Apply cuts to systematics along with other data
+# 8. Maintain empty systematics dict for backward compatibility
+authors: Jingyu Zhang (2025)
 '''
 
 from __future__ import annotations
@@ -38,6 +49,13 @@ logger = logging.getLogger(__name__)
 ####################################################################################################################
 def initialize_observables_dict_from_tables(table_dir, analysis_config, parameterization):
     '''
+    NEW FEATURES ADDED:
+    - Reads systematic columns from Data files (s_jec, s_taa, etc.)
+    - Supports new config format with sys_data/sys_theory
+    - Stores systematics in enhanced data structure
+    - Maintains backward compatibility
+
+    
     Initialize from .dat files into a dictionary of numpy arrays
       - We loop through all observables in the table directory for the given model and parameterization
       - We include only those observables:
@@ -83,19 +101,36 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
     #----------------------
     # Read experimental data
     data_dir = os.path.join(table_dir, 'Data')
+
+    parsed_observables = _parse_config_observables(analysis_config)
+    systematic_config_map = {obs_name: (sys_data, sys_theory) for obs_name, sys_data, sys_theory in parsed_observables}
+
     for filename in os.listdir(data_dir):
         if _accept_observable(analysis_config, filename):
 
+            # ORIGINAL: Read standard data
             data = np.loadtxt(os.path.join(data_dir, filename), ndmin=2)
             data_entry = {}
             data_entry['xmin'] = data[:,0]
             data_entry['xmax'] = data[:,1]
             data_entry['y'] = data[:,2]
-            data_entry['y_err'] = data[:,3]
+            data_entry['y_err_stat'] = data[:,3]  # RENAMED from 'y_err'
 
             observable_label, _ = _filename_to_labels(filename)
+            
+            # NEW: Read systematic uncertainties
+            sys_data_list, _ = systematic_config_map.get(observable_label, ([], []))
+            if sys_data_list:
+                systematic_columns = _parse_data_systematic_header(os.path.join(data_dir, filename))
+                systematic_data = _read_data_systematics(os.path.join(data_dir, filename), systematic_columns)
+                filtered_systematics = _filter_systematics_by_config(systematic_data, sys_data_list)
+                data_entry['systematics'] = filtered_systematics
+            else:
+                data_entry['systematics'] = {}  # Empty dict for backward compatibility
+            
             observables['Data'][observable_label] = data_entry
 
+            # ORIGINAL: Validation check
             if 0 in data_entry['y']:
                 msg = f'{filename} has value=0'
                 raise ValueError(msg)
@@ -158,7 +193,7 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
 
                 # Apply cuts to the prediction values and errors (as well as data dict)
                 # We do this by construct a mask of bins (rows) to keep
-                cuts = analysis_config['cuts']
+                cuts = analysis_config.get('cuts', {})
                 for obs_key, cut_range in cuts.items():
                     if obs_key in observable_label:
                         x_min, x_max = cut_range
@@ -186,11 +221,37 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
                     design_points_to_exclude=design_points_to_exclude,
                 )
 
-                observables['Prediction'][observable_label]['y'] = np.take(prediction_values, training_indices, axis=1)
-                observables['Prediction'][observable_label]['y_err'] = np.take(prediction_errors, training_indices, axis=1)
+                _, sys_theory_list = systematic_config_map.get(observable_label, ([], []))
+                model_name = analysis_config.get('model_name', 'exponential')
+                theory_systematics = _read_theory_systematics(table_dir, model_name, observable_label, sys_theory_list)
+                filtered_theory_systematics = _filter_systematics_by_config(theory_systematics, sys_theory_list)
 
-                observables['Prediction_validation'][observable_label]['y'] = np.take(prediction_values, validation_indices, axis=1)
-                observables['Prediction_validation'][observable_label]['y_err'] = np.take(prediction_errors, validation_indices, axis=1)
+                if cuts:
+                    for obs_key, cut_range in cuts.items():
+                        if obs_key in observable_label:
+                            x_min, x_max = cut_range
+                            mask = (x_min <= observables['Data'][observable_label]['xmin']) & (observables['Data'][observable_label]['xmax'] <= x_max)
+                            for sys_name, sys_data in filtered_theory_systematics.items():
+                                filtered_theory_systematics[sys_name] = sys_data[mask, :]
+
+                # MODIFIED: Store predictions with systematic support
+                observables['Prediction'][observable_label] = {
+                    'xmin': observables['Data'][observable_label]['xmin'],  # NEW: Copy from Data
+                    'xmax': observables['Data'][observable_label]['xmax'],  # NEW: Copy from Data
+                    'y': np.take(prediction_values, training_indices, axis=1),
+                    'y_err_stat': np.take(prediction_errors, training_indices, axis=1),  # RENAMED
+                    'systematics': {sys_name: np.take(sys_data, training_indices, axis=1) 
+                                   for sys_name, sys_data in filtered_theory_systematics.items()}  # NEW
+                }
+
+                observables['Prediction_validation'][observable_label] = {
+                    'xmin': observables['Data'][observable_label]['xmin'],  # NEW: Copy from Data
+                    'xmax': observables['Data'][observable_label]['xmax'],  # NEW: Copy from Data  
+                    'y': np.take(prediction_values, validation_indices, axis=1),
+                    'y_err_stat': np.take(prediction_errors, validation_indices, axis=1),  # RENAMED
+                    'systematics': {sys_name: np.take(sys_data, validation_indices, axis=1) 
+                                   for sys_name, sys_data in filtered_theory_systematics.items()}  # NEW
+                }
 
                 # TODO: Do something about bins that have value=0?
                 if 0 in prediction_values:
@@ -204,12 +265,9 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
                     logging.info(f'  Note: Removing {observable_label} from observables dict because no bins left after cuts')
 
     #----------------------
-    # TODO: Construct covariance matrices
-
-    #----------------------
     # Print observables that we will use
     # NOTE: We don't need to pass the observable filter because we already filtered the observables via `_accept_observables``
-    [logger.info(f'  {s}') for s in sorted_observable_list_from_dict(observables['Prediction'])]
+    [logger.info(f'Accepted observable {s}') for s in sorted_observable_list_from_dict(observables['Prediction'])]
 
     return observables
 
@@ -636,10 +694,10 @@ class ObservableFilter:
 
         return found_observable
 
-#---------------------------------------------------------------
 def _accept_observable(analysis_config, filename):
     '''
     Check if observable should be included in the analysis.
+    MODIFIED: Handle new config format with systematic specifications
     It must:
       - Have sqrts,centrality specified in the analysis_config
       - Have a filename that contains a string from analysis_config observable_list
@@ -656,8 +714,9 @@ def _accept_observable(analysis_config, filename):
     if int(sqrts) not in analysis_config['sqrts_list']:
         return False
 
-    # Check centrality
+    # Check centrality - FIXED VERSION
     centrality_min, centrality_max = centrality.split('-')
+    
     # Validation
     # Provided a single centrality range - convert to a list of ranges
     centrality_ranges = analysis_config['centrality_range']
@@ -674,18 +733,39 @@ def _accept_observable(analysis_config, filename):
     if not accepted_centrality:
         return False
 
-    # Check observable
+    # Check observable - MODIFIED to handle new config format
     # Select observables based on the input list, with the possibility of excluding some
     # observables with additional selection strings (eg. remove one experiment from the
     # observables for an exploratory analysis).
     # NOTE: This is equivalent to EmulationConfig.observable_filter
     accept_observable = False
     global_observable_exclude_list = analysis_config.get("global_observable_exclude_list", [])
+    
     for emulation_group_settings in analysis_config["parameters"]["emulators"].values():
+        
+        # NEW: Extract observable names from both old and new formats
+        observable_list = emulation_group_settings['observable_list']
+        include_list = []
+        
+        for obs_item in observable_list:
+            if isinstance(obs_item, str):
+                # Old format: just the observable name
+                include_list.append(obs_item)
+            elif isinstance(obs_item, dict) and 'observable' in obs_item:
+                # New format: extract observable name from dict
+                obs_name = obs_item['observable']
+                include_list.append(obs_name)
+        
+        # Verify include_list contains only strings (safety check)
+        for item in include_list:
+            if not isinstance(item, str):
+                raise ValueError(f"include_list must contain only strings, got: {type(item)} - {item}")
+        
         observable_filter = ObservableFilter(
-            include_list=emulation_group_settings['observable_list'],
+            include_list=include_list,  # Now properly extracted as strings
             exclude_list=emulation_group_settings.get("observable_exclude_list", []) + global_observable_exclude_list,
         )
+        
         accept_observable = observable_filter.accept_observable(
             observable_name=filename,
         )
@@ -825,3 +905,216 @@ def _recursive_defaultdict():
     :return recursive defaultdict
     '''
     return defaultdict(_recursive_defaultdict)
+
+
+#---------------------------------------------------------------
+def _parse_data_systematic_header(filepath):
+    """
+    FIXED: Parse systematic columns accounting for np.loadtxt behavior
+    
+    np.loadtxt skips non-numeric columns (like 'Label'), so we need to adjust indices
+    
+    Expected format:
+    # Label xmin xmax y y_err s_jec s_taa
+    
+    After np.loadtxt (skips Label):
+    Column 0: xmin
+    Column 1: xmax  
+    Column 2: y
+    Column 3: y_err
+    Column 4: s_jec
+    Column 5: s_taa
+    """
+    
+    systematic_columns = {}
+    
+    try:
+        with open(filepath, 'r') as f:
+            for line_num, line in enumerate(f):
+                if line.startswith('#') and any(col in line.lower() for col in ['label', 'xmin', 'xmax', 'y']):
+                    columns = line.strip('#').strip().split()
+                    
+                    # Find systematic columns in header
+                    systematic_header_indices = {}
+                    for i, col in enumerate(columns):
+                        if col.startswith('s_'):
+                            systematic_name = col[2:]  # Remove 's_' prefix
+                            systematic_header_indices[systematic_name] = i
+                    
+                    # Adjust indices for np.loadtxt behavior (skips Label column)
+                    # If 'Label' is the first column, subtract 1 from all indices
+                    label_offset = 1 if columns[0].lower() == 'label' else 0
+                    
+                    for sys_name, header_index in systematic_header_indices.items():
+                        adjusted_index = header_index - label_offset
+                        systematic_columns[sys_name] = adjusted_index
+                    break
+                    
+                if line_num > 10:
+                    break
+                    
+    except Exception as e:
+        logger.warning(f"Could not parse header for {filepath}: {e}")
+    
+    return systematic_columns
+
+
+# =============================================================================
+# NEW FUNCTIONS: Only for systematic uncertainty support
+# =============================================================================
+
+def _parse_data_systematic_header(filepath):
+    """
+    Parse systematic columns, ignoring #Label column that np.loadtxt skips
+    
+    Header: # Label xmin xmax y y_err s_jec s_taa s_other...
+    np.loadtxt sees: xmin(0) xmax(1) y(2) y_err(3) s_jec(4) s_taa(5) s_other(6)...
+    """
+    
+    systematic_columns = {}
+    
+    try:
+        with open(filepath, 'r') as f:
+            for line_num, line in enumerate(f):
+                if line.startswith('#') and any(col in line.lower() for col in ['label', 'xmin', 'xmax', 'y']):
+                    columns = line.strip('#').strip().split()
+                    
+                    # Count data columns (skip Label)
+                    data_col_index = 0
+                    for col in columns:
+                        if col.lower() == 'label':
+                            continue  # Skip Label - np.loadtxt ignores it
+                        
+                        if col.startswith('s_'):
+                            systematic_name = col[2:]  # Remove 's_' prefix
+                            systematic_columns[systematic_name] = data_col_index
+                        
+                        data_col_index += 1
+                    
+                    break
+                    
+                if line_num > 10:
+                    break
+                    
+    except Exception as e:
+        logger.warning(f"Could not parse header for {filepath}: {e}")
+
+    return systematic_columns
+
+
+def _read_data_systematics(filepath, systematic_columns):
+    """
+    NEW FUNCTION: Read systematic columns from Data file.
+    
+    :param str filepath: Path to the data file
+    :param dict systematic_columns: Dict of systematic names and column indices
+    :return dict: systematic_data
+    """
+    
+    if not systematic_columns:
+        return {}
+    
+    try:
+        full_data = np.loadtxt(filepath, ndmin=2)
+        logger.info(f"{filepath}")
+    except Exception as e:
+        logger.error(f"Failed to load data from {filepath}: {e}")
+        return {}
+    
+    systematic_data = {}
+    for sys_name, col_index in systematic_columns.items():
+        logger.info(f"Reading systematic '{sys_name}' from column {col_index}")
+        if col_index < full_data.shape[1]:
+            systematic_data[sys_name] = full_data[:, col_index]
+        else:
+            logger.warning(f"Systematic column {sys_name} at index {col_index} not found in {filepath} (only {full_data.shape[1]} columns)")
+    
+    return systematic_data
+
+
+def _read_theory_systematics(table_dir, model, observable_name, theory_systematics):
+    """
+    NEW FUNCTION: Read theory systematic files (future feature).
+    
+    :param str table_dir: Base table directory
+    :param str model: Model name
+    :param str observable_name: Observable name
+    :param list theory_systematics: List of theory systematic names to read
+    :return dict: theory_syst_data
+    """
+    
+    theory_syst_data = {}
+    prediction_dir = os.path.join(table_dir, 'Prediction')
+    base_filename = f'Prediction__{model}__{observable_name}'
+    
+    for sys_name in theory_systematics:
+        syst_filepath = os.path.join(prediction_dir, f'{base_filename}__systs_{sys_name}.dat')
+        
+        if os.path.exists(syst_filepath):
+            try:
+                syst_array = np.loadtxt(syst_filepath, ndmin=2)
+                theory_syst_data[sys_name] = syst_array
+                logger.info(f"Loaded theory systematic '{sys_name}' for {observable_name}")
+            except Exception as e:
+                logger.warning(f"Failed to load theory systematic {sys_name}: {e}")
+    
+    return theory_syst_data
+
+
+def _parse_config_observables(analysis_config):
+    """
+    NEW FUNCTION: Parse observable configuration for systematic support.
+    Handles both old and new formats.
+    
+    :param dict analysis_config: Analysis configuration
+    :return list: List of tuples (observable_name, sys_data_list, sys_theory_list)
+    """
+    
+    # Get observable list from emulators config (the actual location)
+    parsed_observables = []
+    
+    try:
+        for emulation_group_settings in analysis_config["parameters"]["emulators"].values():
+            observable_config_list = emulation_group_settings.get('observable_list', [])
+            
+            for obs_config in observable_config_list:
+                if isinstance(obs_config, str):
+                    # Old format: just observable name
+                    parsed_observables.append((obs_config, [], []))
+                elif isinstance(obs_config, dict) and 'observable' in obs_config:
+                    # New format: {'observable': name, 'sys_data': [...], 'sys_theory': [...]}
+                    obs_name = obs_config['observable']
+                    sys_data = obs_config.get('sys_data', [])
+                    sys_theory = obs_config.get('sys_theory', [])
+                    parsed_observables.append((obs_name, sys_data, sys_theory))
+                    
+    except KeyError as e:
+        logger.error(f"Config structure issue: {e}")
+        logger.error(f"Expected: analysis_config['parameters']['emulators'][group]['observable_list']")
+        return []
+    
+    logger.info(f"Parsed {len(parsed_observables)} observables:")
+    for obs_name, sys_data, sys_theory in parsed_observables:
+        logger.info(f"  {obs_name}: sys_data={sys_data}, sys_theory={sys_theory}")
+    
+    return parsed_observables
+
+
+def _filter_systematics_by_config(systematic_data, config_systematics):
+    """
+    NEW FUNCTION: Filter systematics based on config.
+    
+    :param dict systematic_data: Available systematic data
+    :param list config_systematics: Requested systematic names
+    :return dict: Filtered systematic data
+    """
+    
+    if not config_systematics:
+        return {}
+    
+    filtered_systematics = {}
+    for sys_name in config_systematics:
+        if sys_name in systematic_data:
+            filtered_systematics[sys_name] = systematic_data[sys_name]
+    
+    return filtered_systematics

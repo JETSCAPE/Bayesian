@@ -182,7 +182,7 @@ def _smooth_statistical_outliers_in_predictions(
             # large statistical uncertainty points
             outliers = outliers_smoothing.find_large_statistical_uncertainty_points(
                 values=all_observables[prediction_key][observable_key]["y"],
-                y_err=all_observables[prediction_key][observable_key]["y_err"],
+                y_err=all_observables[prediction_key][observable_key]["y_err_stat"],
                 outliers_config=preprocessing_config.smoothing_outliers_config,
             )
         elif outlier_identification_method == "large_central_value_difference":
@@ -218,7 +218,7 @@ def _smooth_statistical_outliers_in_predictions(
 
         # Finally, interpolate at the selected outlier point features to find the value and error
         new_observables[prediction_key][observable_key] = {}
-        for key_type in ["y", "y_err"]:
+        for key_type in ["y", "y_err_stat"]:
             new_observables[prediction_key][observable_key][key_type] = np.array(
                 all_observables[prediction_key][observable_key][key_type], copy=True,
             )

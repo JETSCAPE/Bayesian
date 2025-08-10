@@ -12,7 +12,7 @@ import shutil
 import yaml
 from pathlib import Path
 
-from bayesian import data_IO, preprocess_input_data, mcmc
+from bayesian import data_IO, preprocess_input_data, mcmc, debug
 from bayesian import plot_input_data, plot_emulation, plot_mcmc, plot_qhat, plot_closure, plot_analyses
 
 from bayesian import common_base, helpers
@@ -100,6 +100,10 @@ class SteerAnalysis(common_base.CommonBase):
                                                 os.path.join(self.output_dir, f'{analysis_name}_{parameterization}'),
                                                 filename='observables.h5')
                         progress.update(initialization_task, advance=100, visible=False)
+
+                        test.detailed_initialization_example()
+                        test.write_dict_to_h5_explanation() 
+                        test.integration_with_existing_code()
 
                     if self.preprocess_input_data:
                         # Just indicate that it's working

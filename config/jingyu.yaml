@@ -5,7 +5,7 @@
 output_dir: '/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/20230116_20250806/'
 
 initialize_observables: True
-preprocess_input_data: False
+preprocess_input_data: True
 fit_emulators: False
 run_mcmc: False
 run_closure_tests: False
@@ -225,9 +225,9 @@ analyses:
           n_pc: 5
           observable_list:
             - observable: '5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10'
-              sys_data: ['jec', 'taa']
+              sys_data: ['jec:alice', 'taa:5020']
             - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.2__0-10'
-              sys_data: ['jec', 'taa']
+              sys_data: ['jec:cms', 'taa:5020']
       mcmc:
         <<: *default_mcmc_parameters
         n_walkers: 20

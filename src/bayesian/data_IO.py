@@ -16,15 +16,34 @@ The main functionalities are:
 
 authors: J.Mulligan, R.Ehlers
 
-# CHANGES MADE:
-# 1. Added new functions for systematic uncertainty support (all marked NEW)
-# 2. Renamed 'y_err' -> 'y_err_stat' in data structure
-# 3. Added 'systematics' dict to both Data and Prediction structures
-# 4. Added parsing for new config format with sys_data/sys_theory
-# 5. Added systematic reading and filtering
-# 6. Copy xmin/xmax from Data to Prediction for consistency
-# 7. Apply cuts to systematics along with other data
-# 8. Maintain empty systematics dict for backward compatibility
+SYSTEMATIC UNCERTAINTY INCLUSION:
+================================================================================
+The following add systematic uncertainty support with correlation structure:
+
+1. Enhanced data structure for systematic uncertainties:
+   - Renamed 'y_err' -> 'y_err_stat' for clarity between statistical and systematic uncertainties
+   - Added 'systematics' dict to both Data and Prediction structures
+   - Structure: observables['Data'][obs]['systematics']['jec'] = [uncertainty_values]
+
+2. Configuration parsing for systematic correlations:
+   - Support for new config format: {'observable': name, 'sys_data': ['jec:alice', 'taa:5020']}
+   - Correlation tags (e.g., 'alice', '5020') define how systematics correlate across observables
+   - Backward compatible with old config format (simple observable name strings)
+
+3. Data file reading enhancements:
+   - Parse systematic columns from Data files (s_jec, s_taa, etc.)
+   - Filter systematics based on configuration requirements
+   - Maintain consistency between config expectations and data file contents
+
+4. Integration with SystematicCorrelationManager:
+   - Store correlation manager in observables dict for later use
+   - Preserve correlation information through preprocessing steps
+
+5. Robustness improvements:
+   - Apply cuts to systematic uncertainties along with other data
+   - Copy xmin/xmax from Data to Prediction for consistency
+   - Maintain empty systematics dict for backward compatibility
+
 authors: Jingyu Zhang (2025)
 '''
 from __future__ import annotations
@@ -49,45 +68,88 @@ logger = logging.getLogger(__name__)
 ####################################################################################################################
 def initialize_observables_dict_from_tables(table_dir, analysis_config, parameterization):
     '''
-    NEW FEATURES ADDED:
-    - Reads systematic columns from Data files (s_jec, s_taa, etc.)
-    - Supports new config format with sys_data/sys_theory
-    - Stores systematics in enhanced data structure
-    - Maintains backward compatibility
-
+    Initialize observables dictionary from .dat files with systematic uncertainty support.
+    CORE FUNCTIONALITY:
+    ==================
+    Initialize from .dat files into a dictionary of numpy arrays:
+      - Loop through all observables in the table directory for the given model and parameterization
+      - Include only those observables that:
+         - Have sqrts, centrality specified in the analysis_config
+         - Whose filename contains a string from analysis_config observable_list
+      - Apply optional cuts to the x-range of the predictions and data (e.g. pt_hadron>10 GeV)
+      - Separate out the design/predictions with indices in the validation set
+      - Parse and store systematic uncertainties with correlation information
     
-    Initialize from .dat files into a dictionary of numpy arrays
-      - We loop through all observables in the table directory for the given model and parameterization
-      - We include only those observables:
-         - That have sqrts, centrality specified in the analysis_config
-        - Whose filename contains a string from analysis_config observable_list
-      - We apply optional cuts to the x-range of the predictions and data (e.g. pt_hadron>10 GeV)
-      - We also separate out the design/predictions with indices in the validation set
-
-    Note that all of the data points are the ratio of AA/pp
-
+    Note: All data points are the ratio of AA/pp
+    
     :param str table_dir: directory where tables are located
     :param dict analysis_config: dictionary of analysis configuration
     :param str parameterization: name of qhat parameterization
-    :return Return a dictionary with the following structure:
-       observables['Data'][observable_label]['y'] -- value
-                                            ['y_err'] -- total uncertainty (TODO: include uncertainty breakdowns)
-                                            ['xmin'] -- bin lower edge (used only for plotting)
-                                            ['xmax'] -- bin upper edge (used only for plotting)
-       # NOTE: The "Design" key is the actual parameters, while the indices is the index of the design point (ie. assigned in the .dat file)
-       # NOTE: As of August 2023, the "Design" key doesn't pass around the parameterization!
-       observables['Design'][parameterization] -- design points for a given parameterization
-       observables['Design_indices'][parameterization] -- indices of design points included for a given parameterization
-       observables['Prediction'][observable_label]['y'] -- value
-                                                  ['y_err'] -- statistical uncertainty
-
-       observables['Design_validation']... -- design points for validation set
-       observables['Design_indices_validation'][parameterization] -- indices of validation design points included for a given parameterization
-       observables['Prediction_validation']... -- predictions for validation set
-
-       where observable_label follows the convention from the table filenames:
-           observable_label = f'{sqrts}__{system}__{observable_type}__{observable}__{subobservable}__{centrality}'
-    :rtype dict
+    
+    :return: Dictionary with the following enhanced structure:
+    :rtype: dict
+    
+    RETURN STRUCTURE:
+    ================
+    observables['Data'][observable_label]['y'] -- measurement values
+                                         ['y_err_stat'] -- statistical uncertainties (renamed from 'y_err')
+                                         ['systematics']['jec'] -- JEC systematic uncertainties (NEW)
+                                         ['systematics']['taa'] -- TAA systematic uncertainties (NEW)
+                                         ['systematics'][...] -- other systematic uncertainties (NEW)
+                                         ['xmin'] -- bin lower edge (used for plotting)
+                                         ['xmax'] -- bin upper edge (used for plotting)
+    
+    observables['Prediction'][observable_label]['y'] -- theory prediction values
+                                               ['y_err_stat'] -- statistical uncertainties (renamed from 'y_err')
+                                               ['systematics'] -- systematic uncertainties dict (NEW)
+                                               ['xmin'] -- bin lower edge (copied from Data, NEW)
+                                               ['xmax'] -- bin upper edge (copied from Data, NEW)
+    
+    observables['Prediction_validation'][observable_label] -- same structure as Prediction
+    
+    observables['Design'][parameterization] -- design points for given parameterization
+    observables['Design_indices'][parameterization] -- indices of design points included
+    observables['Design_validation'][parameterization] -- design points for validation set  
+    observables['Design_indices_validation'][parameterization] -- indices of validation design points
+    
+    observables['_correlation_manager'] -- SystematicCorrelationManager instance (NEW)
+                                        -- Contains correlation structure from config parsing
+                                        -- Used for correlation-aware covariance calculations
+    
+    OBSERVABLE LABEL CONVENTION:
+    ===========================
+    observable_label = f'{sqrts}__{system}__{observable_type}__{observable}__{subobservable}__{centrality}'
+    
+    Example: '5020__PbPb__hadron__pt_ch_cms____0-5'
+    
+    CONFIGURATION FORMATS:
+    =====================
+    OLD FORMAT (still supported):
+    observable_list: ['5020__PbPb__hadron__pt_ch_cms____0-5']
+    
+    NEW FORMAT (with systematic correlations):
+    observable_list:
+      - observable: '5020__PbPb__hadron__pt_ch_cms____0-5'
+        sys_data: ['jec:cms', 'taa:5020']  # correlation tags define systematic correlations
+        sys_theory: []                     # theory systematics (future feature)
+    
+    SYSTEMATIC CORRELATION TAGS:
+    ===========================
+    - 'jec:cms' -- JEC systematic correlated within CMS measurements only
+    - 'jec:alice' -- JEC systematic correlated within ALICE measurements only  
+    - 'taa:5020' -- TAA systematic correlated across all 5.02 TeV measurements
+    - 'lumi:uncor' -- Luminosity systematic uncorrelated (diagonal)
+    - Custom tags supported: 'group1', 'experiment_a', etc.
+    
+    NOTE: Correlation tags are only in config files, not in .dat files
+    NOTE: Base systematic names in .dat files (s_jec, s_taa) remain unchanged
+    
+    DESIGN NOTES:
+    ============
+    - The "Design" key contains actual parameters, "Design_indices" contains design point indices
+    - As of August 2023, the "Design" key doesn't pass around the parameterization
+    - Systematic uncertainties are stored as separate columns, not combined into total uncertainty
+    - Empty systematics dict maintained for observables without systematic uncertainties (backward compatibility)
     '''
     logger.info('Including the following observables:')
 
@@ -399,55 +461,6 @@ def data_dict_from_h5(output_dir, filename, observable_table_dir=None):
 
     return data
 
-####################################################################################################################
-## def data_array_from_h5(output_dir, filename, pseudodata_index: int =-1, observable_filter: ObservableFilter | None = None):
-##     '''
-##     Initialize data array from observables.h5 file
-## 
-##     :param str output_dir: location of filename
-##     :param str filename: h5 filename (typically 'observables.h5')
-##     :param int pseudodata_index: index of validation design to use as pseudodata instead of actual experimental data (default: -1, i.e. use actual data)
-##     :return 2darray data: arrays of data points (n_features,)
-##     '''
-## 
-##     # Initialize observables dict from observables.h5 file
-##     observables = read_dict_from_h5(output_dir, filename, verbose=False)
-## 
-##     # Sort observables, to keep well-defined ordering in matrix
-##     sorted_observable_list = sorted_observable_list_from_dict(observables, observable_filter=observable_filter)
-## 
-##     if not sorted_observable_list:
-##         logger.warning("No observables passed the filter. Check observable_list / observable_exclude_list in your config.")
-## 
-##     # Get data dictionary (or in case of closure test, pseudodata from validation set)
-##     if pseudodata_index < 0:
-##         data_dict = observables['Data']
-##     else:
-##         # If closure test, assign experimental data uncertainties and smear prediction values
-##         data_dict = observables['Prediction_validation']
-##         exp_data_dict = observables['Data']
-##         for i,observable_label in enumerate(sorted_observable_list):
-##             exp_uncertainty = exp_data_dict[observable_label]['y_err']
-##             prediction_central_value = data_dict[observable_label]['y'][:,pseudodata_index]
-##             data_dict[observable_label]['y'] = prediction_central_value + np.random.normal(loc=0., scale=exp_uncertainty)
-##             data_dict[observable_label]['y_err'] = exp_uncertainty
-## 
-##     # Loop through sorted observables and concatenate them into a single array:
-##     #   (design_point_index, observable_bins) i.e. (n_samples, n_features)
-##     data = {}
-##     for i,observable_label in enumerate(sorted_observable_list):
-##         y_values = data_dict[observable_label]['y'].T
-##         y_err_values = data_dict[observable_label]['y_err'].T
-##         if i==0:
-##             data['y'] = y_values
-##             data['y_err'] = y_err_values
-##         else:
-##             data['y'] = np.concatenate([data['y'],y_values])
-##             data['y_err'] = np.concatenate([data['y_err'],y_err_values])
-##     logger.info(f"  Total shape of Data (n_features,): {data['y'].shape}")
-## 
-##     return data
-## 
 ####################################################################################################################
 def observable_dict_from_matrix(Y, observables, cov=np.array([]), config=None, validation_set=False, observable_filter: ObservableFilter | None = None):
     '''
@@ -906,61 +919,8 @@ def _recursive_defaultdict():
     '''
     return defaultdict(_recursive_defaultdict)
 
-
-#---------------------------------------------------------------
-def _parse_data_systematic_header(filepath):
-    """
-    FIXED: Parse systematic columns accounting for np.loadtxt behavior
-    
-    np.loadtxt skips non-numeric columns (like 'Label'), so we need to adjust indices
-    
-    Expected format:
-    # Label xmin xmax y y_err s_jec s_taa
-    
-    After np.loadtxt (skips Label):
-    Column 0: xmin
-    Column 1: xmax  
-    Column 2: y
-    Column 3: y_err
-    Column 4: s_jec
-    Column 5: s_taa
-    """
-    
-    systematic_columns = {}
-    
-    try:
-        with open(filepath, 'r') as f:
-            for line_num, line in enumerate(f):
-                if line.startswith('#') and any(col in line.lower() for col in ['label', 'xmin', 'xmax', 'y']):
-                    columns = line.strip('#').strip().split()
-                    
-                    # Find systematic columns in header
-                    systematic_header_indices = {}
-                    for i, col in enumerate(columns):
-                        if col.startswith('s_'):
-                            systematic_name = col[2:]  # Remove 's_' prefix
-                            systematic_header_indices[systematic_name] = i
-                    
-                    # Adjust indices for np.loadtxt behavior (skips Label column)
-                    # If 'Label' is the first column, subtract 1 from all indices
-                    label_offset = 1 if columns[0].lower() == 'label' else 0
-                    
-                    for sys_name, header_index in systematic_header_indices.items():
-                        adjusted_index = header_index - label_offset
-                        systematic_columns[sys_name] = adjusted_index
-                    break
-                    
-                if line_num > 10:
-                    break
-                    
-    except Exception as e:
-        logger.warning(f"Could not parse header for {filepath}: {e}")
-    
-    return systematic_columns
-
-
 # =============================================================================
-# NEW FUNCTIONS: Only for systematic uncertainty support
+# NEW FUNCTIONS: For systematic uncertainty support
 # =============================================================================
 
 def _parse_data_systematic_header(filepath):
@@ -1253,77 +1213,3 @@ def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1,
         logger.warning(f"  Correlation validation: {warning}")
     
     return data
-
-
-def calculate_systematic_covariance_matrix(experimental_data):
-    """
-    Calculate systematic covariance matrix from enhanced experimental data structure.
-    This is a standalone function that can be called when needed.
-    
-    :param experimental_data: Enhanced data structure from enhanced_data_array_from_h5
-    :return: Systematic covariance matrix (n_features, n_features)
-    """
-    correlation_manager = experimental_data.get('correlation_manager')
-    systematic_uncertainties = experimental_data.get('y_err_syst')
-    systematic_names = experimental_data.get('systematic_names', [])
-    n_features = len(experimental_data['y'])
-    
-    if correlation_manager is None:
-        logger.warning("No correlation manager found - using basic covariance calculation")
-        return _calculate_basic_systematic_covariance(systematic_uncertainties)
-    
-    if systematic_uncertainties is None or systematic_uncertainties.shape[1] == 0:
-        logger.info("No systematic uncertainties found")
-        return np.zeros((n_features, n_features))
-    
-    logger.info("Calculating correlation-aware systematic covariance matrix")
-    systematic_cov = correlation_manager.create_systematic_covariance_matrix(
-        systematic_uncertainties, systematic_names, n_features
-    )
-    
-    return systematic_cov
-
-
-def _calculate_basic_systematic_covariance(systematic_uncertainties):
-    """
-    Fallback: calculate basic systematic covariance assuming full correlation per source
-    """
-    if systematic_uncertainties is None or systematic_uncertainties.shape[1] == 0:
-        return np.zeros((systematic_uncertainties.shape[0], systematic_uncertainties.shape[0]))
-    
-    n_features, n_systematics = systematic_uncertainties.shape
-    systematic_cov = np.zeros((n_features, n_features))
-    
-    # Assume full correlation within each systematic source
-    for sys_idx in range(n_systematics):
-        sys_uncertainty = systematic_uncertainties[:, sys_idx]
-        systematic_cov += np.outer(sys_uncertainty, sys_uncertainty)
-    
-    return systematic_cov
-
-def print_correlation_summary(experimental_data):
-    """
-    Print detailed summary of correlation structure for debugging
-    """
-    correlation_manager = experimental_data.get('correlation_manager')
-    if correlation_manager is None:
-        print("No correlation manager found")
-        return
-    
-    summary = correlation_manager.get_correlation_summary()
-    
-    print("=== Systematic Correlation Summary ===")
-    print(f"Total systematics: {summary['n_systematics']}")
-    print(f"Total observables: {summary['n_observables']}")
-    print(f"Correlation groups: {summary['n_correlation_groups']}")
-    
-    print("\nCorrelation Groups:")
-    for group_tag, group_info in summary['correlation_groups'].items():
-        print(f"  '{group_tag}': {group_info['n_entries']} entries")
-        print(f"    Systematics: {group_info['systematics']}")
-        print(f"    Observables: {group_info['observables']}")
-    
-    if summary['uncorrelated_systematics']:
-        print(f"\nUncorrelated systematics: {summary['uncorrelated_systematics']}")
-    
-    print("=======================================")

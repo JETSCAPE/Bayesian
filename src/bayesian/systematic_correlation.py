@@ -1,3 +1,45 @@
+#!/usr/bin/env python
+'''
+Systematic uncertainty correlation management for Bayesian inference
+
+This module provides functionality to handle systematic uncertainty correlations based on 
+user-defined correlation tags in configuration files.
+
+MAIN CLASSES:
+- SystematicInfo: Data structure for individual systematic uncertainty information
+- SystematicCorrelationManager: Core class managing correlation groups and covariance calculation
+
+KEY FEATURES:
+- Parse correlation tags from config (e.g., 'jec:alice', 'taa:global', 'tracking:uncor')
+- Build correlation groups based on user-defined tags (no assumptions about tag meanings)
+- Create correlation-aware covariance matrices for likelihood calculations
+- Validation and debugging tools for correlation structure
+
+CORRELATION MODEL:
+- Systematics with same correlation tag are fully correlated
+- Systematics with different correlation tags are uncorrelated
+- Special tag 'uncor' creates diagonal (uncorrelated) contributions
+- Flexible: correlation tags can be experiment names, energy scales, or arbitrary user-defined groups
+
+USAGE EXAMPLE:
+    # Config file specifies correlation structure
+    observable_list:
+      - observable: 'jet_pt_alice'
+        sys_data: ['jec:alice', 'taa:global']
+      - observable: 'jet_pt_cms' 
+        sys_data: ['jec:cms', 'taa:global']
+    
+    # Create and use correlation manager
+    correlation_manager = SystematicCorrelationManager()
+    correlation_manager.parse_configuration(parsed_observables)
+    correlation_manager.register_observable_ranges(observable_ranges)
+    
+    # Calculate correlation-aware covariance matrix
+    systematic_cov = correlation_manager.create_systematic_covariance_matrix(
+        systematic_uncertainties, systematic_names, n_features
+    )
+authors: Jingyu Zhang (2025)
+'''
 import logging
 import numpy as np
 from typing import Dict, List, Tuple, Set, Optional

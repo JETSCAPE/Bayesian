@@ -101,9 +101,9 @@ class SteerAnalysis(common_base.CommonBase):
                                                 filename='observables.h5')
                         progress.update(initialization_task, advance=100, visible=False)
 
-                        test.detailed_initialization_example()
-                        test.write_dict_to_h5_explanation() 
-                        test.integration_with_existing_code()
+                        debug.detailed_initialization_example()
+                        debug.write_dict_to_h5_explanation() 
+                        debug.integration_with_existing_code()
 
                     if self.preprocess_input_data:
                         # Just indicate that it's working

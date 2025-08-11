@@ -16,7 +16,7 @@ The main functionalities are:
 
 authors: J.Mulligan, R.Ehlers
 
-SYSTEMATIC UNCERTAINTY INCLUSION:
+SYSTEMATIC UNCERTAINTY INCLUSION (August 2025):
 ================================================================================
 The following add systematic uncertainty support with correlation structure:
 
@@ -44,8 +44,9 @@ The following add systematic uncertainty support with correlation structure:
    - Copy xmin/xmax from Data to Prediction for consistency
    - Maintain empty systematics dict for backward compatibility
 
-authors: Jingyu Zhang (2025)
+authors: Jingyu Zhang <jingyu.zhang@cern.ch>, Vanderbilt 
 '''
+
 from __future__ import annotations
 
 from systematic_correlation import SystematicCorrelationManager
@@ -165,7 +166,16 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
     data_dir = os.path.join(table_dir, 'Data')
 
     parsed_observables, correlation_manager = _parse_config_observables(analysis_config)
-    systematic_config_map = {obs_name: (sys_data, sys_theory) for obs_name, sys_data, sys_theory in parsed_observables}
+
+    systematic_config_map = {}
+    for obs_name, sys_data_list, sys_theory_list in parsed_observables:
+        systematic_config_map[obs_name] = (sys_data_list, sys_theory_list)
+
+    if correlation_manager.get_all_systematic_names():
+        logger.info(f"Adding correlation manager with {len(correlation_manager.get_all_systematic_names())} systematics")
+        observables['_correlation_manager'] = correlation_manager.to_dict()
+    else:
+        logger.info("No systematic correlations found in config")
 
     for filename in os.listdir(data_dir):
         if _accept_observable(analysis_config, filename):
@@ -331,6 +341,20 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
     # NOTE: We don't need to pass the observable filter because we already filtered the observables via `_accept_observables``
     [logger.info(f'Accepted observable {s}') for s in sorted_observable_list_from_dict(observables['Prediction'])]
 
+    try:
+        parsed_observables, correlation_manager = _parse_config_observables(analysis_config)
+        
+        if correlation_manager.get_all_systematic_names():
+            logger.info(f"Adding correlation manager with {len(correlation_manager.get_all_systematic_names())} systematics")
+            # Convert to serializable format for HDF5 storage
+            observables['_correlation_manager'] = correlation_manager.to_dict()
+        else:
+            logger.info("No systematic correlations found in config")
+            
+    except Exception as e:
+        logger.warning(f"Could not create correlation manager: {e}")
+        logger.info("Proceeding without systematic correlations")
+    
     return observables
 
 ####################################################################################################################
@@ -441,7 +465,7 @@ def data_dict_from_h5(output_dir, filename, observable_table_dir=None):
 
     :param str output_dir: location of filename
     :param str filename: h5 filename (typically 'observables.h5')
-    :return dict data: dict of arrays of data points (columns of data[observable_label]: xmin xmax y y_err)
+    :return dict data: dict of arrays of data points (columns of data[observable_label]: xmin xmax y y_err_stat)
     '''
 
     # Initialize observables dict from observables.h5 file
@@ -457,7 +481,53 @@ def data_dict_from_h5(output_dir, filename, observable_table_dir=None):
             assert np.allclose(data[observable_label]['xmin'], data_table[:,0])
             assert np.allclose(data[observable_label]['xmax'], data_table[:,1])
             assert np.allclose(data[observable_label]['y'], data_table[:,2])
-            assert np.allclose(data[observable_label]['y_err'] , data_table[:,3])
+            assert np.allclose(data[observable_label]['y_err_stat'] , data_table[:,3])
+
+    return data
+
+####################################################################################################################
+def data_array_from_h5_nosys(output_dir, filename, pseudodata_index: int =-1, observable_filter: ObservableFilter | None = None):
+    '''
+    Initialize data array from observables.h5 file
+
+    :param str output_dir: location of filename
+    :param str filename: h5 filename (typically 'observables.h5')
+    :param int pseudodata_index: index of validation design to use as pseudodata instead of actual experimental data (default: -1, i.e. use actual data)
+    :return 2darray data: arrays of data points (n_features,)
+    '''
+
+    # Initialize observables dict from observables.h5 file
+    observables = read_dict_from_h5(output_dir, filename, verbose=False)
+
+    # Sort observables, to keep well-defined ordering in matrix
+    sorted_observable_list = sorted_observable_list_from_dict(observables, observable_filter=observable_filter)
+
+    # Get data dictionary (or in case of closure test, pseudodata from validation set)
+    if pseudodata_index < 0:
+        data_dict = observables['Data']
+    else:
+        # If closure test, assign experimental data uncertainties and smear prediction values
+        data_dict = observables['Prediction_validation']
+        exp_data_dict = observables['Data']
+        for i,observable_label in enumerate(sorted_observable_list):
+            exp_uncertainty = exp_data_dict[observable_label]['y_err_stat']
+            prediction_central_value = data_dict[observable_label]['y'][:,pseudodata_index]
+            data_dict[observable_label]['y'] = prediction_central_value + np.random.normal(loc=0., scale=exp_uncertainty)
+            data_dict[observable_label]['y_err_stat'] = exp_uncertainty
+
+    # Loop through sorted observables and concatenate them into a single array:
+    #   (design_point_index, observable_bins) i.e. (n_samples, n_features)
+    data = {}
+    for i,observable_label in enumerate(sorted_observable_list):
+        y_values = data_dict[observable_label]['y'].T
+        y_err_values = data_dict[observable_label]['y_err_stat'].T
+        if i==0:
+            data['y'] = y_values
+            data['y_err_stat'] = y_err_values
+        else:
+            data['y'] = np.concatenate([data['y'],y_values])
+            data['y_err_stat'] = np.concatenate([data['y_err_stat'],y_err_values])
+    logger.info(f"  Total shape of Data (n_features,): {data['y'].shape}")
 
     return data
 
@@ -591,6 +661,11 @@ def sorted_observable_list_from_dict(observables, observable_filter: ObservableF
     observable_keys = list(observables.keys())
     if 'Prediction' in observables.keys():
         observable_keys = list(observables['Prediction'].keys())
+
+    # PHASE 2 FIX: Filter out special keys that are not observables
+    # The correlation manager and other metadata should not be treated as observables
+    special_keys = ['_correlation_manager', 'Design', 'Design_validation', 'Prediction', 'Prediction_validation', 'Data']
+    observable_keys = [k for k in observable_keys if k not in special_keys]
 
     if observable_filter is not None:
         # Filter the observables based on the provided filter
@@ -1067,20 +1142,22 @@ def _parse_config_observables(analysis_config):
 
 def _filter_systematics_by_config(systematic_data, config_systematics):
     """
-    NEW FUNCTION: Filter systematics based on config.
-    
-    :param dict systematic_data: Available systematic data
-    :param list config_systematics: Requested systematic names
-    :return dict: Filtered systematic data
+    Filter systematics based on config, mapping full names to base names.
     """
-    
     if not config_systematics:
         return {}
     
     filtered_systematics = {}
-    for sys_name in config_systematics:
-        if sys_name in systematic_data:
-            filtered_systematics[sys_name] = systematic_data[sys_name]
+    for sys_full_name in config_systematics:
+        # Extract base name from full name (remove correlation tag)
+        if ':' in sys_full_name:
+            base_sys_name, _ = sys_full_name.split(':', 1)
+        else:
+            base_sys_name = sys_full_name
+            
+        # Look for base name in systematic_data
+        if base_sys_name in systematic_data:
+            filtered_systematics[base_sys_name] = systematic_data[base_sys_name]
     
     return filtered_systematics
 
@@ -1094,11 +1171,22 @@ def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1,
     
     # Load observables dict (which should contain correlation manager if available)
     observables = read_dict_from_h5(output_dir, filename, verbose=False)
-    correlation_manager = observables.get('_correlation_manager', None)
+    correlation_manager_data = observables.get('_correlation_manager', None)
+    
+    # Deserialize correlation manager if it exists
+    if correlation_manager_data is not None:
+        try:
+            from systematic_correlation import SystematicCorrelationManager
+            correlation_manager = SystematicCorrelationManager.from_dict(correlation_manager_data)
+        except Exception as e:
+            logger.warning(f"Failed to deserialize correlation manager: {e}")
+            correlation_manager = None
+    else:
+        correlation_manager = None
     
     if correlation_manager is None:
-        logger.info("No correlation manager found - using basic systematic handling")
-        return data_array_from_h5(output_dir, filename, pseudodata_index, observable_filter)
+        #logger.info("No correlation manager found - using basic systematic handling")
+        return data_array_from_h5_nosys(output_dir, filename, pseudodata_index, observable_filter)
     
     logger.info("Using correlation-aware systematic handling")
     
@@ -1118,6 +1206,11 @@ def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1,
         exp_data_dict = observables['Data']
         for observable_label in sorted_observable_list:
             exp_uncertainty = exp_data_dict[observable_label]['y_err_stat']
+            prediction_data = data_dict[observable_label]['y']
+            if prediction_data.shape[1] <= pseudodata_index:
+                raise ValueError(f"Validation prediction data not available for observable {observable_label}. "
+                                 f"Available design points: {prediction_data.shape[1]}, "
+                                 f"Requested index: {pseudodata_index}")
             prediction_central_value = data_dict[observable_label]['y'][:,pseudodata_index]
             data_dict[observable_label]['y'] = prediction_central_value + np.random.normal(loc=0., scale=exp_uncertainty)
             data_dict[observable_label]['y_err_stat'] = exp_uncertainty

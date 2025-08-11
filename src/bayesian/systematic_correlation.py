@@ -307,3 +307,97 @@ class SystematicCorrelationManager:
                 warnings.append(f"Correlation group '{group_tag}' has only {len(group_members)} member(s)")
         
         return warnings
+
+    def to_dict(self) -> Dict:
+        """
+        Convert SystematicCorrelationManager to a serializable dictionary for HDF5 storage.
+        
+        :return: Dictionary representation of the correlation manager
+        """
+        return {
+            'correlation_groups': dict(self.correlation_groups),  # Convert defaultdict to dict
+            'systematic_info': {
+                full_name: {
+                    'base_name': info.base_name,
+                    'correlation_tag': info.correlation_tag,
+                    'full_name': info.full_name,
+                    'is_uncorrelated': info.is_uncorrelated
+                }
+                for full_name, info in self.systematic_info.items()
+            },
+            'observable_systematics': dict(self.observable_systematics),
+            'all_systematic_names': self.all_systematic_names,
+            'class_name': 'SystematicCorrelationManager'  # For validation during loading
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'SystematicCorrelationManager':
+        """
+        Reconstruct SystematicCorrelationManager from serialized dictionary.
+        
+        :param data: Dictionary representation from to_dict()
+        :return: Reconstructed SystematicCorrelationManager instance
+        """
+        # Validate that this is the right type of data
+        class_name = data.get('class_name')
+        if isinstance(class_name, np.ndarray):
+            class_name = str(class_name.item())  # Convert numpy scalar to string
+        if class_name != 'SystematicCorrelationManager':
+            raise ValueError(f"Invalid data format for SystematicCorrelationManager: {class_name}")
+        
+        # Create new instance
+        manager = cls()
+        
+        # Restore correlation_groups (convert back to defaultdict)
+        # Handle potential numpy arrays from HDF5
+        manager.correlation_groups = defaultdict(list)
+        for tag, group_list in data['correlation_groups'].items():
+            # Ensure tag is a string
+            tag_str = str(tag.item()) if isinstance(tag, np.ndarray) else str(tag)
+            
+            # Convert group_list items if they are numpy arrays
+            processed_group_list = []
+            for item in group_list:
+                if isinstance(item, (list, tuple)) and len(item) == 4:
+                    # Convert each element to proper type
+                    obs_label = str(item[0].item()) if isinstance(item[0], np.ndarray) else str(item[0])
+                    start_idx = int(item[1].item()) if isinstance(item[1], np.ndarray) else int(item[1])
+                    end_idx = int(item[2].item()) if isinstance(item[2], np.ndarray) else int(item[2])
+                    sys_name = str(item[3].item()) if isinstance(item[3], np.ndarray) else str(item[3])
+                    processed_group_list.append((obs_label, start_idx, end_idx, sys_name))
+                else:
+                    processed_group_list.append(item)
+            
+            manager.correlation_groups[tag_str] = processed_group_list
+        
+        # Restore systematic_info with type conversion
+        manager.systematic_info = {}
+        for full_name, info_dict in data['systematic_info'].items():
+            # Ensure all strings are proper strings, not numpy arrays
+            full_name_str = str(full_name.item()) if isinstance(full_name, np.ndarray) else str(full_name)
+            base_name = str(info_dict['base_name'].item()) if isinstance(info_dict['base_name'], np.ndarray) else str(info_dict['base_name'])
+            correlation_tag = str(info_dict['correlation_tag'].item()) if isinstance(info_dict['correlation_tag'], np.ndarray) else str(info_dict['correlation_tag'])
+            full_name_from_dict = str(info_dict['full_name'].item()) if isinstance(info_dict['full_name'], np.ndarray) else str(info_dict['full_name'])
+            is_uncorrelated = bool(info_dict['is_uncorrelated'].item()) if isinstance(info_dict['is_uncorrelated'], np.ndarray) else bool(info_dict['is_uncorrelated'])
+            
+            manager.systematic_info[full_name_str] = SystematicInfo(
+                base_name=base_name,
+                correlation_tag=correlation_tag,
+                full_name=full_name_from_dict,
+                is_uncorrelated=is_uncorrelated
+            )
+        
+        # Restore other attributes with type conversion
+        manager.observable_systematics = {}
+        for obs_label, sys_list in data['observable_systematics'].items():
+            obs_label_str = str(obs_label.item()) if isinstance(obs_label, np.ndarray) else str(obs_label)
+            sys_list_str = [str(item.item()) if isinstance(item, np.ndarray) else str(item) for item in sys_list]
+            manager.observable_systematics[obs_label_str] = sys_list_str
+        
+        # Convert all_systematic_names to proper strings
+        manager.all_systematic_names = [
+            str(item.item()) if isinstance(item, np.ndarray) else str(item) 
+            for item in data['all_systematic_names']
+        ]
+        
+        return manager

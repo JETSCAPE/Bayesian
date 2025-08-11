@@ -12,7 +12,7 @@ import shutil
 import yaml
 from pathlib import Path
 
-from bayesian import data_IO, preprocess_input_data, mcmc, debug
+from bayesian import data_IO, preprocess_input_data, mcmc
 from bayesian import plot_input_data, plot_emulation, plot_mcmc, plot_qhat, plot_closure, plot_analyses
 
 from bayesian import common_base, helpers
@@ -101,10 +101,6 @@ class SteerAnalysis(common_base.CommonBase):
                                                 filename='observables.h5')
                         progress.update(initialization_task, advance=100, visible=False)
 
-                        debug.detailed_initialization_example()
-                        debug.write_dict_to_h5_explanation() 
-                        debug.integration_with_existing_code()
-
                     if self.preprocess_input_data:
                         # Just indicate that it's working
                         preprocess_task = progress.add_task("[deep_sky_blue4]Preprocessing...", total=None)
@@ -171,23 +167,24 @@ class SteerAnalysis(common_base.CommonBase):
                     #   - Use validation point as pseudodata
                     #   - Use emulator already trained on training points
                     if self.run_closure_tests:
-                        n_design_points = analysis_config['validation_indices'][1] - analysis_config['validation_indices'][0]
+                        validation_indices = list(range(analysis_config['validation_indices'][0], analysis_config['validation_indices'][1]))
+                        n_design_points = len(validation_indices)
                         closure_test_task = progress.add_task("[deep_sky_blue4]Running closure tests...", total=n_design_points)
                         progress.start_task(closure_test_task)
                         logger.info("")
                         logger.info('------------------------------------------------------------------------')
-                        for design_point_index in range(n_design_points):
-                            logger.info(f'Running closure tests for {analysis_name}_{parameterization}, validation_index={design_point_index}...')
+                        
+                        for i, validation_design_point in enumerate(validation_indices):
+                            logger.info(f'Running closure tests for {analysis_name}_{parameterization}, validation_design_point={validation_design_point}, validation_index={i}...')
                             mcmc_config = mcmc.MCMCConfig(analysis_name=analysis_name,
                                                           parameterization=parameterization,
                                                           analysis_config=analysis_config,
                                                           config_file=self.config_file,
-                                                          closure_index=design_point_index)
-                            mcmc.run_mcmc(mcmc_config, closure_index=design_point_index)
+                                                          closure_index=i)  # Use validation array index, not design point ID
+                            mcmc.run_mcmc(mcmc_config, closure_index=i)
                             progress.update(closure_test_task, advance=1)
-                        progress.update(closure_test_task, visible=False)
 
-                    progress.update(parameterization_task, advance=1)
+                    #progress.update(parameterization_task, advance=1)
                 # Hide once we're done!
                 progress.update(parameterization_task, visible=False)
 

@@ -7,7 +7,7 @@ The main functionalities are:
 
 A configuration class EmulationConfig provides simple access to emulation settings
 
-authors: J.Mulligan, R.Ehlers
+authors: J.Mulligan, R.Ehlers, Jingyu Zhang
 Based in part on JETSCAPE/STAT code.
 '''
 
@@ -235,11 +235,25 @@ class EmulatorConfig(common_base.CommonBase):
         # Observable list
         # None implies a convention of accepting all available data
         self.observable_filter = None
-        observable_list = emulator_configuration.get("observable_list", [])
+        observable_list_raw = emulator_configuration.get("observable_list", [])
         observable_exclude_list = emulator_configuration.get("observable_exclude_list", [])
-        if observable_list or observable_exclude_list:
+        
+        # Extract observable names from both old and new config formats
+        include_list = []
+        for obs_item in observable_list_raw:
+            if isinstance(obs_item, str):
+                # Old format: just the observable name
+                include_list.append(obs_item)
+            elif isinstance(obs_item, dict) and 'observable' in obs_item:
+                # New format: extract observable name from dict
+                obs_name = obs_item['observable']
+                include_list.append(obs_name)
+            else:
+                logger.warning(f"Unrecognized observable format in emulator config: {obs_item}")
+        
+        if include_list or observable_exclude_list:
             self.observable_filter = data_IO.ObservableFilter(
-                include_list=observable_list,
+                include_list=include_list,  # Now properly extracted as strings
                 exclude_list=observable_exclude_list,
             )
 

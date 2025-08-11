@@ -233,9 +233,32 @@ def _run_using_emcee(
             logger.info(f"Could not compute autocorrelation time: {e!s}")
         # If closure test, save the design point parameters and experimental pseudodata
         if closure_index >= 0:
-            design_point =  data_IO.design_array_from_h5(config.output_dir, filename='observables.h5', validation_set=True)[closure_index]
+            design_point = data_IO.design_array_from_h5(config.output_dir, filename='observables.h5', validation_set=True)[closure_index]
             output_dict['design_point'] = design_point
-            output_dict['experimental_pseudodata'] = experimental_results
+    
+            cleaned_results = {}
+            
+            # Copy essential arrays with proper dtypes
+            for key in ['y', 'y_err_stat']:
+                if key in experimental_results:
+                    cleaned_results[key] = np.array(experimental_results[key], dtype=np.float64)
+            
+            # Handle systematic uncertainties
+            if 'y_err_syst' in experimental_results:
+                cleaned_results['y_err_syst'] = np.array(experimental_results['y_err_syst'], dtype=np.float64)
+            
+            # Handle systematic names as clean strings
+            if 'systematic_names' in experimental_results:
+                cleaned_results['systematic_names'] = [str(name) for name in experimental_results['systematic_names']]
+            
+            # Copy other simple fields
+            for key in ['y_err']:  # Include any other simple fields you need
+                if key in experimental_results and key not in cleaned_results:
+                    cleaned_results[key] = experimental_results[key]
+            
+            # Replace with cleaned version
+            experimental_results = cleaned_results
+            
         data_IO.write_dict_to_h5(output_dict, config.mcmc_output_dir, 'mcmc.h5', verbose=True)
 
         # Save the sampler to file as well, in case we want to access it later

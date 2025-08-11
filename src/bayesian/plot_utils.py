@@ -73,7 +73,7 @@ def plot_observable_panels(plot_list, labels, colors, columns, config, plot_dir,
 
         # Get experimental data
         data_y = data[observable_label]['y']
-        data_y_err = data[observable_label]['y_err']
+        data_y_err = data[observable_label]['y_err_stat']
 
         # Plot -- create new plot and/or fill appropriate subplot
         plot_shape = plot_panel_shapes[i_plot]
@@ -180,12 +180,12 @@ def latex_from_tlatex(s):
     '''
     s = f'${s}$'
     s = s.replace('#it','')
-    s = s.replace(' ','\;')
-    s = s.replace('} {','},\;{')
+    s = s.replace(' ',r'\;')
+    s = s.replace('} {',r'},\;{')
     s = s.replace('#','\\')
-    s = s.replace('SD',',\;SD')
+    s = s.replace('SD',r',\;SD')
     s = s.replace(', {\\beta} = 0', '')
-    s = s.replace('{\Delta R}','')
-    s = s.replace('Standard_WTA','\mathrm{Standard-WTA}')
-    s = s.replace('{\\lambda}_{{\\alpha}},\;{\\alpha} = ','\lambda_')
+    s = s.replace(r'{\Delta R}','')
+    s = s.replace('Standard_WTA',r'\mathrm{Standard-WTA}')
+    s = s.replace(r'{\\lambda}_{{\\alpha}},\;{\\alpha} = ',r'\lambda_')
     return s

@@ -282,11 +282,11 @@ class LoggingEnsembleSampler(emcee.EnsembleSampler):
         """
         Run MCMC with logging every 'logging_steps' steps (default: log every 100 steps).
         """
-        logger.info(f'  running {self.nwalkers} walkers for {n_sampling_steps} steps')
+        #logger.info(f'  running {self.nwalkers} walkers for {n_sampling_steps} steps')
         for n, result in enumerate(self.sample(X0, iterations=n_sampling_steps, **kwargs), start=1):
             if n % n_logging_steps == 0 or n == n_sampling_steps:
                 af = self.acceptance_fraction
-                logger.info(f'  step {n}: acceptance fraction: mean {af.mean()}, std {af.std()}, min {af.min()}, max {af.max()}')
+                #logger.info(f'  step {n}: acceptance fraction: mean {af.mean()}, std {af.std()}, min {af.min()}, max {af.max()}')
 
         return result
 

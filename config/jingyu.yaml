@@ -14,6 +14,7 @@ plot:
   input_data: True
   emulators: True
   mcmc: True
+  covariance: True
   qhat: True
   closure_tests: True
   across_analyses: True

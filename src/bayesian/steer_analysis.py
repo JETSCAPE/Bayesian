@@ -13,7 +13,7 @@ import yaml
 from pathlib import Path
 
 from bayesian import data_IO, preprocess_input_data, mcmc
-from bayesian import plot_input_data, plot_emulation, plot_mcmc, plot_qhat, plot_closure, plot_analyses
+from bayesian import plot_input_data, plot_emulation, plot_mcmc, plot_qhat, plot_closure, plot_analyses, plot_covariance
 
 from bayesian import common_base, helpers
 from bayesian.emulation import base
@@ -237,6 +237,13 @@ class SteerAnalysis(common_base.CommonBase):
                     logger.info(f'Done!')
                     logger.info("")
 
+                if self.plot["covariance"]:
+                    logger.info('------------------------------------------------------------------------')
+                    logger.info(f'Plotting covariance matrices for {analysis_name}_{parameterization}...')
+                    plot_covariance.plot(analysis_name, parameterization, analysis_config, self.config_file)
+                    logger.info('Done!')
+                    logger.info("")
+                    
                 if self.plot['qhat']:
                     logger.info('------------------------------------------------------------------------')
                     logger.info(f'Plotting qhat results {analysis_name}_{parameterization}...')

@@ -10,16 +10,14 @@ build-backend = "pdm.pep517.api"
 name = "jetscape-bayesian"
 description = "Analysis pipeline to implement Bayesian inference in high-energy physics "
 license = {text = "BSD-3-Clause"}
-# NOTE: <3.13 cap needed for tensorflow-io-gcs-filesystem
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10"
 authors = [
   { name = "Raymond Ehlers", email = "raymond.ehlers@cern.ch" },
   { name = "Luna (Yi) Chen", email = "chen.yi.first@gmail.com" },
   { name = "Christal Martin", email = "cbaillar@vols.utk.edu" },
   { name = "Cameron Parker", email = "cameron.parker@tamu.edu" },
 ]
-# For hatch, need to remove the dependencies references here
-dynamic = ["dependencies", "optional-dependencies", "version"]
+dynamic = ["version"]
 dependencies = [
     # Data analysis and plotting
     "matplotlib >=3.5.2",
@@ -39,9 +37,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+test = [
+    "pytest >=6.2.4",
+    "pytest-cov >=3",
+    "pytest-sugar >=0.9.5",
+]
 dev = [
     "ruff >=0.0.209",
-    "black >=22.1.0",
     "mypy>=1.13.0",
     "ipython >=8.0",
     "ipykernel >=6.15.1",

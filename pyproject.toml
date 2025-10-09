@@ -49,6 +49,7 @@ dev = [
     "ipykernel >=6.15.1",
     "pytest >=7.4.0",
     "pocoMC >=1.2.2",
+    "ipython>=8.37.0",
 ]
 
 [tool.hatch]

@@ -97,6 +97,8 @@ exclude = [
     'dist',
 ]
 line-length = 120
+
+[tool.ruff.lint]
 select = [
     "E", "F", "W", # flake8
     "C901",        # mccabe

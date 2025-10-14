@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 class ValidationFunction(Protocol):
     def __call__(self, name: str, module: Any) -> None: ...
 
+
 def validation_noop(name: str, module: Any) -> None: ...
+
 
 def discover_and_register_modules(
     calling_module_name: Any,
@@ -27,9 +29,9 @@ def discover_and_register_modules(
     validation_function: ValidationFunction | None = None,
     fail_on_failed_validation: bool = True,
 ) -> dict[str, ModuleType]:
-    """Automatically discovery and registeration of modules in the directory of the calling module.
+    """Automatically discovery and registration of modules in the directory of the calling module.
 
-    Modules in the directory indicate they should be registred by defining a '_register_name' attribute.
+    Modules in the directory indicate they should be registered by defining a '_register_name' attribute.
     Such modules are then validated and passed to the calling modules.
 
     Args:
@@ -70,9 +72,9 @@ def discover_and_register_modules(
         module = importlib.import_module(f".{module_info.name}", calling_module_package)
 
         # The module must have the appropriate attributes to be considered.
-        # First, it signals that it might be of interst by having the register_attribute
+        # First, it signals that it might be of interest by having the register_attribute
         if not hasattr(module, register_attribute):
-            logger.info(f"Skippping module {module_info.name}")
+            logger.info(f"Skipping module {module_info.name}")
             continue
 
         has_required_attributes = [hasattr(module, _attr) for _attr in required_attributes]
@@ -95,4 +97,3 @@ def discover_and_register_modules(
             registered_modules[name] = module
 
     return registered_modules
-

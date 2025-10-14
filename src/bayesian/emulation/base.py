@@ -1,4 +1,4 @@
-'''
+"""
 Module related to emulators, with functionality to train and call emulators for a given analysis run
 
 The main functionalities are:
@@ -9,7 +9,7 @@ A configuration class EmulationConfig provides simple access to emulation settin
 
 .. codeauthor:: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
 Based in part on JETSCAPE/STAT code.
-'''
+"""
 
 from __future__ import annotations
 
@@ -30,20 +30,21 @@ _emulators: dict[str, ModuleType] = {}
 
 logger = logging.getLogger(__name__)
 
-def _validate_emulator(name: str, module: Any) -> None:
+def _validate_emulator(name: str, module: ModuleType) -> None:
     """
     Validate that an emulator module follows the expected interface.
     """
     if not hasattr(module, "fit_emulator"):
         msg = f"Emulator module {name} does not have a required 'fit_emulator' method"
         raise ValueError(msg)
-    # TODO: Re-enable when things stablize a bit.
+    # TODO: Re-enable when things stabilize a bit.
     # if not hasattr(module, "predict"):
     #     msg = f"Emulator module {name} does not have a required 'predict' method"
     #     raise ValueError(msg)
 
+
 def fit_emulators(emulation_config: EmulatorOrganizationConfig) -> None:
-    """ Do PCA, fit emulators, and write to file.
+    """Do PCA, fit emulators, and write to file.
 
     :param EmulationConfig config: Configuration for the emulators, including all groups.
     """
@@ -57,7 +58,8 @@ def fit_emulators(emulation_config: EmulatorOrganizationConfig) -> None:
         try:
             emulator = _emulators[emulator_name]
         except KeyError as e:
-            raise KeyError(f"Emulator backend '{emulator_name}' not registered or available") from e
+            msg = f"Emulator backend '{emulator_name}' not registered or available"
+            raise KeyError(msg) from e
 
         emulator_groups_output[emulation_group_name] = emulator.fit_emulator(emulation_group_config)
         # NOTE: If it returns early because an emulator already exists, then we don't want to overwrite it!
@@ -72,10 +74,11 @@ def predict_from_emulator(
     emulation_config: EmulatorOrganizationConfig,
     merge_predictions_over_groups: bool = True,
     emulation_group_results: dict[str, dict[str, Any]] | None = None,
-    emulator_cov_unexplained: dict | None = None
+    emulator_cov_unexplained: dict | None = None,
 ) -> dict[str, npt.NDArray[np.float64]]:
     # Called from MCMC
     ...
+
 
 def predict(
     parameters: npt.NDArray[np.float64],
@@ -83,7 +86,8 @@ def predict(
     *,
     merge_predictions_over_groups: bool = True,
     emulation_group_results: dict | None = None,
-    emulator_cov_unexplained: dict | None = None) -> dict[str, npt.NDArray[np.float64]]:
+    emulator_cov_unexplained: dict | None = None,
+) -> dict[str, npt.NDArray[np.float64]]:
     """
     Construct dictionary of emulator predictions for each observable
 
@@ -117,13 +121,15 @@ def predict(
         if emulator_cov_unexplained:
             emulator_group_cov_unexplained = emulator_cov_unexplained[emulation_group_name]
         else:
-            emulator_group_cov_unexplained = compute_emulator_group_cov_unexplained(emulation_group_config, emulation_group_result)
+            emulator_group_cov_unexplained = compute_emulator_group_cov_unexplained(
+                emulation_group_config, emulation_group_result
+            )
 
         predict_output[emulation_group_name] = predict_emulation_group(
             parameters,
             emulation_group_result,
             emulation_group_config,
-            emulator_group_cov_unexplained=emulator_group_cov_unexplained
+            emulator_group_cov_unexplained=emulator_group_cov_unexplained,
         )
 
     # Allow the option to return immediately to allow the study of performance per emulation group
@@ -134,8 +140,10 @@ def predict(
     return emulation_config.sort_observables_in_matrix.convert(group_matrices=predict_output)
 
 
-def predict_emulation_group(parameters, results, emulation_group_config, emulator_group_cov_unexplained: npt.NDArray[np.float64] | None = None):
-    '''
+def predict_emulation_group(
+    parameters, results, emulation_group_config, emulator_group_cov_unexplained: npt.NDArray[np.float64] | None = None
+):
+    """
     Construct dictionary of emulator predictions for each observable in an emulation group.
 
     :param ndarray[float] parameters: list of parameter values (e.g. [tau0, c1, c2, ...]), with shape (n_samples, n_parameters)
@@ -150,10 +158,10 @@ def predict_emulation_group(parameters, results, emulation_group_config, emulato
                                                                          observables,
                                                                          cov=emulator_cov_reconstructed,
                                                                          validation_set=validation_set)
-    '''
+    """
 
     # The emulators are stored as a list (one for each PC)
-    emulators = results['emulators']
+    emulators = results["emulators"]
 
     if emulator_group_cov_unexplained is None:
         emulator_group_cov_unexplained = compute_emulator_group_cov_unexplained(emulation_group_config, results)
@@ -164,13 +172,13 @@ def predict_emulation_group(parameters, results, emulation_group_config, emulato
     n_samples = parameters.shape[0]
     emulator_central_value = np.zeros((n_samples, emulation_group_config.n_pc))
     emulator_cov = np.zeros((n_samples, emulation_group_config.n_pc, emulation_group_config.n_pc))
-    
+
     for i, emulator in enumerate(emulators):
         try:
             # Try to get full covariance matrix
             y_central_value, y_cov = emulator.predict(parameters, return_cov=True)
             emulator_central_value[:, i] = y_central_value
-            
+
             # y_cov should be shape (n_samples, n_samples) for the covariance between different parameter points
             # We want the diagonal elements which give the variance for each parameter point
             if y_cov.ndim == 2 and y_cov.shape[0] == n_samples and y_cov.shape[1] == n_samples:
@@ -179,21 +187,23 @@ def predict_emulation_group(parameters, results, emulation_group_config, emulato
             else:
                 logger.warning(f"Unexpected covariance shape from emulator {i}: {y_cov.shape}")
                 emulator_cov[:, i, i] = np.diag(y_cov) if y_cov.ndim == 2 else y_cov
-                    
+
         except (TypeError, ValueError) as e:
             # Fallback to standard deviation approach if return_cov fails
             logger.warning(f"Failed to get covariance from emulator {i}, falling back to std: {e}")
             y_central_value, y_std = emulator.predict(parameters, return_std=True)
             emulator_central_value[:, i] = y_central_value
-            emulator_cov[:, i, i] = y_std**2    
-    
+            emulator_cov[:, i, i] = y_std**2
+
     assert emulator_cov.shape == (n_samples, emulation_group_config.n_pc, emulation_group_config.n_pc)
 
     # Reconstruct the physical space from the PCs, and invert preprocessing.
     # Note we use array broadcasting to calculate over all samples.
-    pca = results['PCA']['pca']
-    scaler = results['PCA']['scaler']
-    emulator_central_value_reconstructed_scaled = emulator_central_value.dot(pca.components_[:emulation_group_config.n_pc,:])
+    pca = results["PCA"]["pca"]
+    scaler = results["PCA"]["scaler"]
+    emulator_central_value_reconstructed_scaled = emulator_central_value.dot(
+        pca.components_[: emulation_group_config.n_pc, :]
+    )
     emulator_central_value_reconstructed = scaler.inverse_transform(emulator_central_value_reconstructed_scaled)
 
     # Propagate uncertainty through the linear transformation back to feature space.
@@ -209,11 +219,11 @@ def predict_emulation_group(parameters, results, emulation_group_config, emulato
     # TODO: one can make this faster with broadcasting/einsum
     # TODO: NOTE-STAT: Compare this more carefully with STAT L286 and on.
     n_features = pca.components_.shape[1]
-    S = pca.components_.T[:,:emulation_group_config.n_pc]
+    S = pca.components_.T[:, : emulation_group_config.n_pc]
     emulator_cov_reconstructed_scaled = np.zeros((n_samples, n_features, n_features))
     for i_sample in range(n_samples):
         emulator_cov_reconstructed_scaled[i_sample] = S.dot(emulator_cov[i_sample].dot(S.T))
-        
+
     assert emulator_cov_reconstructed_scaled.shape == (n_samples, n_features, n_features)
 
     # Include predictive variance due to truncated PCs.
@@ -227,14 +237,14 @@ def predict_emulation_group(parameters, results, emulation_group_config, emulato
     # We can do this by computing an outer product (i.e. product of each pairwise scaling),
     #   and multiplying each element of the covariance matrix by this.
     scale_factors = scaler.scale_
-    emulator_cov_reconstructed = emulator_cov_reconstructed_scaled*np.outer(scale_factors, scale_factors)
-    
+    emulator_cov_reconstructed = emulator_cov_reconstructed_scaled * np.outer(scale_factors, scale_factors)
+
     # Return the stacked matrices:
     #   Central values: (n_samples, n_features)
     #   Covariances: (n_samples, n_features, n_features)
     emulator_predictions = {}
-    emulator_predictions['central_value'] = emulator_central_value_reconstructed
-    emulator_predictions['cov'] = emulator_cov_reconstructed
+    emulator_predictions["central_value"] = emulator_central_value_reconstructed
+    emulator_predictions["cov"] = emulator_cov_reconstructed
 
     return emulator_predictions
 
@@ -258,13 +268,15 @@ def write_emulators(config: EmulatorConfig, output_dict: dict[str, Any]) -> None
     # Validation
     filename = Path(config.emulation_outputfile)
 
-    with filename.open('wb') as f:
+    with filename.open("wb") as f:
         pickle.dump(output_dict, f)
+
 
 class EmulatorConfig(Protocol):
     """
     Protocol for an emulator configuration.
     """
+
     emulator_name: str
     base_config: EmulatorBaseConfig
     settings: dict[str, Any]
@@ -278,6 +290,7 @@ class EmulatorBaseConfig:
     Store this class in your specialized emulator config class.
     Composition is preferred to inheritance.
     """
+
     emulator_name: str
     analysis_name: str
     parameterization: str
@@ -299,18 +312,18 @@ class EmulatorBaseConfig:
 
         # Observable inputs
         self.config = config
-        self.observables_table_dir = config['observable_table_dir']
-        self.observables_config_dir = config['observable_config_dir']
+        self.observables_table_dir = config["observable_table_dir"]
+        self.observables_config_dir = config["observable_config_dir"]
         self.observables_filename = config["observables_filename"]
 
         # Build the output directory
-        output_dir = Path(config['output_dir']) / f'{self.analysis_name}_{self.parameterization}'
+        output_dir = Path(config["output_dir"]) / f"{self.analysis_name}_{self.parameterization}"
 
         # Choose file name based on group name
         if self.emulation_group_name:
-            emulation_outputfile_name = f'emulation_{self.emulation_group_name}.pkl'
+            emulation_outputfile_name = f"emulation_{self.emulation_group_name}.pkl"
         else:
-            emulation_outputfile_name = 'emulation.pkl'
+            emulation_outputfile_name = "emulation.pkl"
 
         self.emulation_outputfile = output_dir / emulation_outputfile_name
 
@@ -320,11 +333,11 @@ class EmulatorBaseConfig:
         Initialize the emulator configuration from a config file.
         """
         c = cls(
-            emulator_name=config['emulator_name'],
-            analysis_name=config['analysis_name'],
-            parameterization=config['parameterization'],
-            config_file=config['config_file'],
-            emulation_group_name=config.get('emulation_group_name', None),
+            emulator_name=config["emulator_name"],
+            analysis_name=config["analysis_name"],
+            parameterization=config["parameterization"],
+            config_file=config["config_file"],
+            emulation_group_name=config.get("emulation_group_name"),
         )
         return c
 
@@ -334,6 +347,7 @@ class EmulatorOrganizationConfig(common_base.CommonBase):
     """
     Configuration for an emulator.
     """
+
     analysis_name: str
     parameterization: str
     config_file: Path = attrs.field(converter=Path)
@@ -357,22 +371,24 @@ class EmulatorOrganizationConfig(common_base.CommonBase):
 
         # Retrieve parameters from the config
         # Observables
-        self.observable_table_dir = self.config['observable_table_dir']
-        self.observable_config_dir = self.config['observable_config_dir']
+        self.observable_table_dir = self.config["observable_table_dir"]
+        self.observable_config_dir = self.config["observable_config_dir"]
         self.observables_filename = self.config["observables_filename"]
         # I/O
-        self.output_dir = Path(self.config['output_dir']) / f'{self.analysis_name}_{self.parameterization}'
+        self.output_dir = Path(self.config["output_dir"]) / f"{self.analysis_name}_{self.parameterization}"
 
     @staticmethod
     def _import_backend(name: str):
         if name == "sk_learn":
             from bayesian.emulation import sk_learn
+
             return sk_learn.SklearnEmulatorConfig
-        else:
-            raise ValueError(f"No emulator backend named '{name}'")
+        raise ValueError(f"No emulator backend named '{name}'")
 
     @classmethod
-    def from_config_file(cls, analysis_name: str, parameterization: str, config_file: Path, analysis_config: dict[str, Any]):
+    def from_config_file(
+        cls, analysis_name: str, parameterization: str, config_file: Path, analysis_config: dict[str, Any]
+    ):
         """
         Initialize the emulation configuration from a config file.
         """
@@ -389,14 +405,14 @@ class EmulatorOrganizationConfig(common_base.CommonBase):
                 parameterization=parameterization,
                 analysis_config=analysis_config,
                 config_file=config_file,
-                emulation_name=group_name
+                emulation_name=group_name,
             )
             for group_name, group_cfg in analysis_config["parameters"]["emulators"].items()
         }
         return c
 
     def read_all_emulator_groups(self) -> dict[str, dict[str, npt.NDArray[np.float64]]]:
-        """ Read all emulator groups.
+        """Read all emulator groups.
 
         Just a convenience function.
         """
@@ -439,7 +455,7 @@ class EmulatorOrganizationConfig(common_base.CommonBase):
 
 @attrs.define
 class SortEmulationGroupObservables:
-    """ Class to track and convert between emulation group matrices to match sorted observables.
+    """Class to track and convert between emulation group matrices to match sorted observables.
 
     emulation_group_to_observable_matrix: Mapping from emulation group matrix to the matrix of observables. Format:
         {observable_name: (emulator_group_name, slice in output_matrix, slice in emulator_group_matrix)}
@@ -448,13 +464,14 @@ class SortEmulationGroupObservables:
         group outputs (which implicitly contains the required number of design points).
     available_value_types: Available value types in the group matrices. These will be extracted when the mapping is learned.
     """
+
     emulation_group_to_observable_matrix: dict[str, tuple[str, slice, slice]]
     shape: tuple[int, int]
     _available_value_types: set[str] | None = attrs.field(init=False, default=None)
 
     @classmethod
     def learn_mapping(cls, emulation_config: EmulatorOrganizationConfig) -> SortEmulationGroupObservables:
-        """ Construct this object by learning the mapping from the emulation group prediction matrices to the sorted and merged matrices.
+        """Construct this object by learning the mapping from the emulation group prediction matrices to the sorted and merged matrices.
 
         :param EmulationConfig emulation_config: Configuration for the emulator(s).
         :return: Constructed object.
@@ -467,11 +484,11 @@ class SortEmulationGroupObservables:
         # First, we need to start with all available observables (beyond just what's in any given group)
         # to learn the entire mapping
         # NOTE: It doesn't matter what observables file we use here since it's just to find all of the observables which are used.
-        all_observables = data_IO.read_dict_from_h5(emulation_config.output_dir, 'observables.h5')
+        all_observables = data_IO.read_dict_from_h5(emulation_config.output_dir, "observables.h5")
         current_position = 0
         observable_slices = {}
         for observable_key in data_IO.sorted_observable_list_from_dict(all_observables[prediction_key]):
-            n_bins = all_observables[prediction_key][observable_key]['y'].shape[0]
+            n_bins = all_observables[prediction_key][observable_key]["y"].shape[0]
             observable_slices[observable_key] = slice(current_position, current_position + n_bins)
             current_position += n_bins
 
@@ -479,29 +496,30 @@ class SortEmulationGroupObservables:
         # matrix is consistent with the order of the observable names).
         observable_emulation_group_map = {}
         for emulation_group_name, emulation_group_config in emulation_config.emulation_groups_config.items():
-            emulation_group_observable_keys = data_IO.sorted_observable_list_from_dict(all_observables[prediction_key], observable_filter=emulation_group_config.observable_filter)
+            emulation_group_observable_keys = data_IO.sorted_observable_list_from_dict(
+                all_observables[prediction_key], observable_filter=emulation_group_config.observable_filter
+            )
             current_group_bin = 0
             for observable_key in emulation_group_observable_keys:
                 observable_slice = observable_slices[observable_key]
                 observable_emulation_group_map[observable_key] = (
                     emulation_group_name,
                     observable_slice,
-                    slice(current_group_bin, current_group_bin + (observable_slice.stop - observable_slice.start))
+                    slice(current_group_bin, current_group_bin + (observable_slice.stop - observable_slice.start)),
                 )
-                current_group_bin += (observable_slice.stop - observable_slice.start)
-                logger.debug(f"{observable_key=}, {observable_emulation_group_map[observable_key]=}, {current_group_bin=}")
+                current_group_bin += observable_slice.stop - observable_slice.start
+                logger.debug(
+                    f"{observable_key=}, {observable_emulation_group_map[observable_key]=}, {current_group_bin=}"
+                )
         logger.debug(f"Sorted order: {observable_slices=}")
 
         # And then finally put them in the proper sorted observable order
-        observable_emulation_group_map = {
-            k: observable_emulation_group_map[k]
-            for k in observable_slices
-        }
+        observable_emulation_group_map = {k: observable_emulation_group_map[k] for k in observable_slices}
 
         # We want the shape to allow us to preallocate the array:
         # Default shape: (n_design_points, n_features)
         last_observable = list(observable_slices)[-1]
-        shape = (all_observables[prediction_key][observable_key]['y'].shape[1], observable_slices[last_observable].stop)
+        shape = (all_observables[prediction_key][observable_key]["y"].shape[1], observable_slices[last_observable].stop)
         logger.debug(f"{shape=} (note: for all design points)")
 
         return cls(
@@ -509,19 +527,17 @@ class SortEmulationGroupObservables:
             shape=shape,
         )
 
-    def convert(self, group_matrices: dict[str, dict[str, npt.NDArray[np.float64]]]) -> dict[str, npt.NDArray[np.float64]]:
-        """ Convert a matrix to match the sorted observables.
+    def convert(
+        self, group_matrices: dict[str, dict[str, npt.NDArray[np.float64]]]
+    ) -> dict[str, npt.NDArray[np.float64]]:
+        """Convert a matrix to match the sorted observables.
 
         :param group_matrices: Matrixes to convert by emulation group. eg:
             {"group_1": {"central_value": np.array, "cov": [...]}, "group_2": np.array}
         :return: Converted matrix for each available value type.
         """
         if self._available_value_types is None:
-            self._available_value_types = set([  # noqa: C403
-                value_type
-                for group in group_matrices.values()
-                for value_type in group
-            ])
+            self._available_value_types = set([value_type for group in group_matrices.values() for value_type in group])
 
         output = {}
         # Requires special handling since we're adding matrices (ie. 3d rather than 2d)
@@ -533,11 +549,17 @@ class SortEmulationGroupObservables:
             # However, it's not quite as trivial to just insert them (as we do for the central values),
             # so we'll use the output matrix slice as the key to sort by below.
             inputs_for_block_diag = {}
-            for observable_name, (emulation_group_name, slice_in_output_matrix, slice_in_emulation_group_matrix) in self.emulation_group_to_observable_matrix.items():  # noqa: B007
+            for observable_name, (
+                emulation_group_name,
+                slice_in_output_matrix,
+                slice_in_emulation_group_matrix,
+            ) in self.emulation_group_to_observable_matrix.items():
                 emulation_group_matrix = group_matrices[emulation_group_name]
                 # NOTE: The slice_in_output_matrix.start should provide unique integers to sort by
                 #       (basically, we just use the starting position instead of inserting it directly).
-                inputs_for_block_diag[slice_in_output_matrix.start] = emulation_group_matrix[value_type][:, slice_in_emulation_group_matrix, slice_in_emulation_group_matrix]
+                inputs_for_block_diag[slice_in_output_matrix.start] = emulation_group_matrix[value_type][
+                    :, slice_in_emulation_group_matrix, slice_in_emulation_group_matrix
+                ]
 
             # And then merge them together in a block diagonal, sorting to put them in the right order
             output[value_type] = nd_block_diag(
@@ -547,9 +569,7 @@ class SortEmulationGroupObservables:
                     #       have to explicitly select the actual matrices (ie. the v of the k, v pair)
                     #       to pass along.
                     m[1]
-                    for m in sorted(
-                        inputs_for_block_diag.items(), key=lambda x: x[0]
-                    )
+                    for m in sorted(inputs_for_block_diag.items(), key=lambda x: x[0])
                 ]
             )
 
@@ -563,17 +583,23 @@ class SortEmulationGroupObservables:
             # until we can extract it from one group output. So we wait to initialize the output matrix until
             # we have the first group output.
             output[value_type] = None
-            for observable_name, (emulation_group_name, slice_in_output_matrix, slice_in_emulation_group_matrix) in self.emulation_group_to_observable_matrix.items():  # noqa: B007
+            for observable_name, (
+                emulation_group_name,
+                slice_in_output_matrix,
+                slice_in_emulation_group_matrix,
+            ) in self.emulation_group_to_observable_matrix.items():
                 emulation_group_matrix = group_matrices[emulation_group_name]
                 if output[value_type] is None:
                     output[value_type] = np.zeros((emulation_group_matrix[value_type].shape[0], *self.shape[1:]))
-                output[value_type][:, slice_in_output_matrix] = emulation_group_matrix[value_type][:, slice_in_emulation_group_matrix]
+                output[value_type][:, slice_in_output_matrix] = emulation_group_matrix[value_type][
+                    :, slice_in_emulation_group_matrix
+                ]
 
         return output
 
 
 def nd_block_diag(arrays):
-    """ Add 2D matrices into a block diagonal matrix in n-dimensions.
+    """Add 2D matrices into a block diagonal matrix in n-dimensions.
 
     See: https://stackoverflow.com/q/62384509
 
@@ -581,10 +607,10 @@ def nd_block_diag(arrays):
     """
     shapes = np.array([i.shape for i in arrays])
 
-    out = np.zeros(np.append(np.amax(shapes[:,:-2],axis=0), [shapes[:,-2].sum(), shapes[:,-1].sum()]))
+    out = np.zeros(np.append(np.amax(shapes[:, :-2], axis=0), [shapes[:, -2].sum(), shapes[:, -1].sum()]))
     r, c = 0, 0
-    for i, (rr, cc) in enumerate(shapes[:,-2:]):
-        out[..., r:r + rr, c:c + cc] = arrays[i]
+    for i, (rr, cc) in enumerate(shapes[:, -2:]):
+        out[..., r : r + rr, c : c + cc] = arrays[i]
         r += rr
         c += cc
 
@@ -601,12 +627,14 @@ def compute_emulator_cov_unexplained(emulation_config, emulation_results) -> dic
         emulation_results = emulation_config.read_all_emulator_groups()
     for emulation_group_name, emulation_group_config in emulation_config.emulation_groups_config.items():
         emulation_group_result = emulation_results.get(emulation_group_name)
-        emulator_cov_unexplained[emulation_group_name] = compute_emulator_group_cov_unexplained(emulation_group_config, emulation_group_result)
+        emulator_cov_unexplained[emulation_group_name] = compute_emulator_group_cov_unexplained(
+            emulation_group_config, emulation_group_result
+        )
     return emulator_cov_unexplained
 
 
 def compute_emulator_group_cov_unexplained(emulation_group_config, emulation_group_result):
-    '''
+    """
     Compute the predictive variance due to PC truncation, for a given emulator group.
     We can do this by decomposing the original covariance in feature space:
       C_Y = S D^2 S^T
@@ -623,11 +651,11 @@ def compute_emulator_group_cov_unexplained(emulation_group_config, emulation_gro
 
     We will generally pre-compute this once in mcmc.py to save time, although we define this function
     here to allow us to re-compute it as needed if it is not pre-computed (e.g. when plotting).
-    '''
+    """
     # TODO: NOTE-STAT: Compare this more carefully with STAT L145 and on.
-    pca = emulation_group_result['PCA']['pca']
-    S_unexplained = pca.components_.T[:,emulation_group_config.n_pc:]
-    D_unexplained = np.diag(pca.explained_variance_[emulation_group_config.n_pc:])
+    pca = emulation_group_result["PCA"]["pca"]
+    S_unexplained = pca.components_.T[:, emulation_group_config.n_pc :]
+    D_unexplained = np.diag(pca.explained_variance_[emulation_group_config.n_pc :])
     emulator_cov_unexplained = S_unexplained.dot(D_unexplained.dot(S_unexplained.T))
 
     # NOTE-STAT: bayesian-inference does not include a small term for numerical stability

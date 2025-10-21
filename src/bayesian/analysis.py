@@ -20,6 +20,7 @@ class AnalysisIO:
     observables_table_dir: Path | str = attrs.field(converter=Path)
     observables_config_dir: Path | str = attrs.field(converter=Path)
     observables_filename: str = attrs.field()
+    _output_dir: Path = attrs.field()
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> AnalysisIO:
@@ -27,6 +28,7 @@ class AnalysisIO:
             observables_table_dir=config["observable_table_dir"],
             observables_config_dir=config["observable_config_dir"],
             observables_filename=config["observables_filename"],
+            output_dir=config["output_dir"],
         )
 
     @classmethod
@@ -36,11 +38,14 @@ class AnalysisIO:
 
         return cls.from_config(config=config)
 
+    def output_dir(self, analysis_config: AnalysisConfig) -> Path:
+        return self._output_dir / f"{analysis_config.name}_{analysis_config.parameterization}"
+
 
 @attrs.define
 class AnalysisConfig:
     name: str
-    parametrization: str
+    parameterization: str
     config_file: Path = attrs.field(converter=Path)
     io: AnalysisIO
     raw_analysis_config: dict[str, Any] = attrs.field(factory=dict)
@@ -52,7 +57,7 @@ class AnalysisConfig:
         """
         return cls(
             name=config["analysis_name"],
-            parametrization=config["parameterization"],
+            parameterization=config["parameterization"],
             config_file=config_file,
             io=AnalysisIO.from_config(config=config),
             raw_analysis_config=config,
@@ -64,3 +69,7 @@ class AnalysisConfig:
             config = yaml.safe_load(stream)
 
         return cls.from_config(config_file=Path(config_file), config=config)
+
+    @property
+    def output_dir(self) -> Path:
+        return self.io.output_dir(self)

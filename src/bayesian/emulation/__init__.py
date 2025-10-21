@@ -14,8 +14,8 @@ A configuration class EmulationConfig provides simple access to emulation settin
 from __future__ import annotations
 
 from bayesian.emulation.base import (  # noqa: F401
-    EmulatorBaseConfig,
-    EmulatorConfig,
+    BaseEmulatorSettings,
+    EmulatorSettings,
     EmulatorOrganizationConfig,
     fit_emulators,
     predict,

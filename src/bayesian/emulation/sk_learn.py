@@ -16,15 +16,16 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
+import attrs
 import numpy as np
-import sklearn.decomposition as sklearn_decomposition
+import sklearn.decomposition as sklearn_decomposition  # type: ignore[import-untyped]
 import sklearn.gaussian_process as sklearn_gaussian_process
 import sklearn.preprocessing as sklearn_preprocessing
 import yaml
 
-from bayesian import common_base, data_IO
+from bayesian import analysis, common_base, data_IO
 from bayesian.emulation import base as emulation_base
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 _register_name = "sk_learn"
 
 ####################################################################################################################
-def fit_emulator(config: emulation_base.EmulatorConfig) -> dict[str, Any]:
+def fit_emulator(config: SKLearnEmulatorSettings, analysis_config: analysis.AnalysisConfig) -> dict[str, Any]:
     '''
     Do PCA, fit emulators, and write to file for an individual emulation.
 
@@ -41,6 +42,8 @@ def fit_emulator(config: emulation_base.EmulatorConfig) -> dict[str, Any]:
 
     :param EmulationConfig config: we take an instance of EmulationConfig as an argument to keep track of config info.
     '''
+    # TODO(RJE): I want to generally separate the concerns of emulators and IO, but I need to deal with them some. I guess
+    #            I should have some emulator_IO functions which take the analysis_config and the emulator settings
 
     # Check if emulator already exists
     if config.emulation_outputfile.exists():
@@ -176,43 +179,28 @@ def fit_emulator(config: emulation_base.EmulatorConfig) -> dict[str, Any]:
     return output_dict
 
 
-####################################################################################################################
-class EmulatorConfig(common_base.CommonBase):
+@attrs.define
+class SKLearnEmulatorSettings(common_base.CommonBase):
+    emulator_name: ClassVar[str] = "sk_learn"
+    base_settings: emulation_base.BaseEmulatorSettings
+    # PCA settings
+    n_pc: int
+    max_n_components_to_calculate: int | None
+    # Kernels
+    active_kernels: dict[str, dict[str, Any]]
+    # Gaussian Process Regressor
+    n_restarts: int
+    alpha: float
+    # Keep a copy of the settings for good measure
+    settings: dict[str, Any]
+    # Additional name, for providing
+    additional_name: str = attrs.field(default="")
 
-    #---------------------------------------------------------------
-    # Constructor
-    #---------------------------------------------------------------
-    def __init__(self, analysis_name='', parameterization='', analysis_config='', config_file='', emulation_name: str | None = None):
-
-        self.analysis_name = analysis_name
-        self.parameterization = parameterization
-        self.analysis_config = analysis_config
-        self.config_file = config_file
-
-        with Path(self.config_file).open() as stream:
-            config = yaml.safe_load(stream)
-
-        # Observable inputs
-        self.observable_table_dir = config['observable_table_dir']
-        self.observable_config_dir = config['observable_config_dir']
-        self.observables_filename = config["observables_filename"]
-
-        ########################
-        # Emulator configuration
-        ########################
-        if emulation_name is None:
-            emulator_configuration = self.analysis_config["parameters"]["emulators"]
-        else:
-            emulator_configuration = self.analysis_config["parameters"]["emulators"][emulation_name]
-        self.force_retrain = emulator_configuration['force_retrain']
-        self.n_pc = emulator_configuration['n_pc']
-        self.max_n_components_to_calculate = emulator_configuration.get("max_n_components_to_calculate", None)
-
-        # Kernels
-        self.active_kernels = {}
-        for kernel_type in emulator_configuration['kernels']['active']:
-            self.active_kernels[kernel_type] = emulator_configuration['kernels'][kernel_type]
-
+    def __attrs_post_init__(self):
+        """
+        Post-creation customization of the emulator configuration.
+        """
+        # Kernel validation
         # Validate that we have exactly one of matern, rbf
         reference_strings = ["matern", "rbf"]
         assert sum([s in self.active_kernels for s in reference_strings]) == 1, "Must provide exactly one of 'matern', 'rbf' kernel"
@@ -229,28 +217,124 @@ class EmulatorConfig(common_base.CommonBase):
                 msg = "Unsupported noise kernel"
                 raise ValueError(msg)
 
-        # GPR
-        self.n_restarts = emulator_configuration["GPR"]['n_restarts']
-        self.alpha = emulator_configuration["GPR"]["alpha"]
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> SKLearnEmulatorSettings:
+        return cls(
+            base_settings=emulation_base.BaseEmulatorSettings.from_config(config),
+            n_pc=config['n_pc'],
+            max_n_components_to_calculate=config.get("max_n_components_to_calculate"),
+            active_kernels={
+                kernel_type: config["kernels"][kernel_type] for kernel_type in config["kernels"]["active"]
+            },
+            n_restarts=config["GPR"]['n_restarts'],
+            alpha=config["GPR"]["alpha"],
+            settings=config,
+        )
 
-        # Observable list
-        # None implies a convention of accepting all available data
-        self.observable_filter = None
-        observable_list = emulator_configuration.get("observable_list", [])
-        observable_exclude_list = emulator_configuration.get("observable_exclude_list", [])
-        if observable_list or observable_exclude_list:
-            self.observable_filter = data_IO.ObservableFilter(
-                include_list=observable_list,
-                exclude_list=observable_exclude_list,
-            )
+    @classmethod
+    def from_config_file(cls, config_file: Path | str, emulator_path: list[str]) -> SKLearnEmulatorSettings:
+        """Initialize from the configuration file.
 
-        # Output options
-        self.output_dir = Path(config['output_dir']) / f'{analysis_name}_{parameterization}'
-        emulation_outputfile_name = 'emulation.pkl'
-        if emulation_name is not None:
-            emulation_outputfile_name = f'emulation_{emulation_name}.pkl'
-        self.emulation_outputfile = Path(self.output_dir) /  emulation_outputfile_name
+        Args:
+            config_file: Path to the configuration file.
+            emulator_path: Path to the emulator inside of the configuration file. Need to specify
+                the entire path!
+        Returns:
+            Emulator settings object
+        """
+        with Path(config_file).open() as stream:
+            config = yaml.safe_load(stream)
+
+        # We want the config specific to the emulator, so we need to drill down to just that config.
+        def get_nested(d: dict[str, Any], keys_to_follow: list[str]) -> dict[str, Any]:
+            for k in keys_to_follow:
+                try:
+                    d = d[k]
+                except KeyError as e:
+                    msg = f"Could not find {k=} in dict {d}"
+                    raise RuntimeError(msg) from e
+            return d
+        config = get_nested(d=config, keys_to_follow=emulator_path)
+
+        return cls.from_config(config=config)
+
+    @property
+    def force_retrain(self) -> bool:
+        # For convenience
+        return self.base_settings.force_retrain
+
+    # #---------------------------------------------------------------
+    # # Constructor
+    # #---------------------------------------------------------------
+    # def __init__(self, analysis_name='', parameterization='', analysis_config='', config_file='', emulation_name: str | None = None):
+
+    #     self.analysis_name = analysis_name
+    #     self.parameterization = parameterization
+    #     self.analysis_config = analysis_config
+    #     self.config_file = config_file
+
+    #     with Path(self.config_file).open() as stream:
+    #         config = yaml.safe_load(stream)
+
+    #     # Observable inputs
+    #     self.observable_table_dir = config['observable_table_dir']
+    #     self.observable_config_dir = config['observable_config_dir']
+    #     self.observables_filename = config["observables_filename"]
+
+    #     ########################
+    #     # Emulator configuration
+    #     ########################
+    #     if emulation_name is None:
+    #         emulator_configuration = self.analysis_config["parameters"]["emulators"]
+    #     else:
+    #         emulator_configuration = self.analysis_config["parameters"]["emulators"][emulation_name]
+    #     self.force_retrain = emulator_configuration['force_retrain']
+    #     self.n_pc = emulator_configuration['n_pc']
+    #     self.max_n_components_to_calculate = emulator_configuration.get("max_n_components_to_calculate", None)
+
+    #     # Kernels
+    #     self.active_kernels = {}
+    #     for kernel_type in emulator_configuration['kernels']['active']:
+    #         self.active_kernels[kernel_type] = emulator_configuration['kernels'][kernel_type]
+
+    #     # Validate that we have exactly one of matern, rbf
+    #     reference_strings = ["matern", "rbf"]
+    #     assert sum([s in self.active_kernels for s in reference_strings]) == 1, "Must provide exactly one of 'matern', 'rbf' kernel"
+
+    #     # Validation for noise configuration
+    #     if 'noise' in self.active_kernels:
+    #         # Check we have the appropriate keys
+    #         assert [k in self.active_kernels['noise'] for k in ["type", "args"]], "Noise configuration must have keys 'type' and 'args'"
+    #         if self.active_kernels['noise']["type"] == "white":
+    #             # Validate arguments
+    #             # We don't want to do too much since we'll just be reinventing the wheel, but a bit can be helpful.
+    #             assert set(self.active_kernels['noise']["args"]) == set(["noise_level", "noise_level_bounds"]), "Must provide arguments 'noise_level' and 'noise_level_bounds' for white noise kernel"  # noqa: C405
+    #         else:
+    #             msg = "Unsupported noise kernel"
+    #             raise ValueError(msg)
+
+    #     # GPR
+    #     self.n_restarts = emulator_configuration["GPR"]['n_restarts']
+    #     self.alpha = emulator_configuration["GPR"]["alpha"]
+
+    #     # Observable list
+    #     # None implies a convention of accepting all available data
+    #     self.observable_filter = None
+    #     observable_list = emulator_configuration.get("observable_list", [])
+    #     observable_exclude_list = emulator_configuration.get("observable_exclude_list", [])
+    #     if observable_list or observable_exclude_list:
+    #         self.observable_filter = data_IO.ObservableFilter(
+    #             include_list=observable_list,
+    #             exclude_list=observable_exclude_list,
+    #         )
+
+    #     # Output options
+    #     self.output_dir = Path(config['output_dir']) / f'{analysis_name}_{parameterization}'
+    #     emulation_outputfile_name = 'emulation.pkl'
+    #     if emulation_name is not None:
+    #         emulation_outputfile_name = f'emulation_{emulation_name}.pkl'
+    #     self.emulation_outputfile = Path(self.output_dir) /  emulation_outputfile_name
 
 
 # Register the config class as backend entry point
-SklearnEmulatorConfig = EmulatorConfig
+SklearnEmulatorConfig = SKLearnEmulatorSettings

@@ -137,14 +137,14 @@ unfixable = [
     "F841",     # Removes unused variables
 ]
 
-[tool.ruff.mccabe]
+[tool.ruff.lint.mccabe]
 max-complexity = 12
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 known-first-party = []
 
 [tool.pylint]
-master.py-version = "3.9"
+master.py-version = "3.10"
 master.ignore-paths= []
 reports.output-format = "colorized"
 similarities.ignore-imports = "yes"

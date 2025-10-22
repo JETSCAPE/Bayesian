@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 @attrs.define
 class BaseEmulatorSettings:
-    """Base configuration for an emulator.
+    """Base (i.e. shared) settings for an emulator.
 
     Store this class in your specialized emulator settings class.
     Composition is preferred to inheritance.
@@ -117,7 +117,7 @@ class BaseEmulatorSettings:
 
 class EmulatorSettings(Protocol):
     """
-    Protocol for an emulator configuration.
+    Protocol for an emulator settings.
     """
 
     emulator_name: ClassVar[str]
@@ -130,18 +130,18 @@ class EmulatorSettings(Protocol):
 @attrs.define
 class IO:
     @staticmethod
-    def output_filename(emulator_settings: EmulatorSettings, analysis_config: analysis.AnalysisConfig) -> Path:
+    def output_filename(emulator_settings: EmulatorSettings, analysis_settings: analysis.AnalysisSettings) -> Path:
         filename = "emulator.pkl"
         if emulator_settings.additional_name:
             filename = f"emulator_{emulator_settings.additional_name}.pkl"
-        return analysis_config.output_dir / filename
+        return analysis_settings.output_dir / filename
 
     @staticmethod
-    def read_emulator(emulator_settings: EmulatorSettings, analysis_config: analysis.AnalysisConfig) -> Any:
+    def read_emulator(emulator_settings: EmulatorSettings, analysis_settings: analysis.AnalysisSettings) -> Any:
         """
         Read emulators from file.
         """
-        filename = IO.output_filename(emulator_settings=emulator_settings, analysis_config=analysis_config)
+        filename = IO.output_filename(emulator_settings=emulator_settings, analysis_settings=analysis_settings)
 
         with filename.open("rb") as f:
             results: dict[str, Any] = pickle.load(f)
@@ -149,12 +149,12 @@ class IO:
 
     @staticmethod
     def write_emulator(
-        emulator: Any, emulator_settings: EmulatorSettings, analysis_config: analysis.AnalysisConfig
+        emulator: Any, emulator_settings: EmulatorSettings, analysis_settings: analysis.AnalysisSettings
     ) -> None:
         """
         Write emulators stored in a result from `fit_emulator_group` to file.
         """
-        filename = IO.output_filename(emulator_settings=emulator_settings, analysis_config=analysis_config)
+        filename = IO.output_filename(emulator_settings=emulator_settings, analysis_settings=analysis_settings)
 
         with filename.open("wb") as f:
             pickle.dump({"emulator": emulator}, f)

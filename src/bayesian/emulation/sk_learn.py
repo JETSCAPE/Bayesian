@@ -2,7 +2,7 @@
 Module related to emulators, with functionality to train and call emulators for a given analysis run
 
 The main functionalities are:
- - fit_emulators() performs PCA, fits an emulator to each PC, and writes the emulator to file
+ - fit_emulator() performs PCA, fits an emulator to each PC, and writes the emulator to file
  - predict() construct mean, std of emulator for a given set of parameter values
 
 A configuration class EmulationConfig provides simple access to emulation settings
@@ -34,8 +34,7 @@ logger = logging.getLogger(__name__)
 _register_name = "sk_learn"
 
 
-####################################################################################################################
-def fit_emulator(config: SKLearnEmulatorSettings, analysis_config: analysis.AnalysisConfig) -> dict[str, Any]:
+def fit_emulator(config: SKLearnEmulatorSettings, analysis_settings: analysis.AnalysisSettings) -> dict[str, Any]:
     """
     Do PCA, fit emulators, and write to file for an individual emulation.
 
@@ -44,11 +43,10 @@ def fit_emulator(config: SKLearnEmulatorSettings, analysis_config: analysis.Anal
 
     :param EmulationConfig config: we take an instance of EmulationConfig as an argument to keep track of config info.
     """
-    # TODO(RJE): I want to generally separate the concerns of emulators and IO, but I need to deal with them some. I guess
-    #            I should have some emulator_IO functions which take the analysis_config and the emulator settings
+    # Setup
+    output_filename = emulation_base.IO.output_filename(emulator_settings=config, analysis_settings=analysis_settings)
 
     # Check if emulator already exists
-    output_filename = emulation_base.IO.output_filename(emulator_settings=config, analysis_config=analysis_config)
     if output_filename.exists():
         if config.force_retrain:
             output_filename.unlink()
@@ -62,8 +60,8 @@ def fit_emulator(config: SKLearnEmulatorSettings, analysis_config: analysis.Anal
     # NOTE: One sample corresponds to one design point, while one feature is one bin of one observable
     logger.info("Doing PCA...")
     Y = data_IO.predictions_matrix_from_h5(
-        output_dir=analysis_config.output_dir,
-        filename=analysis_config.io.observables_filename,
+        output_dir=analysis_settings.output_dir,
+        filename=analysis_settings.io.observables_filename,
         observable_filter=config.base_settings.observable_filter,
     )
 
@@ -121,11 +119,13 @@ def fit_emulator(config: SKLearnEmulatorSettings, analysis_config: analysis.Anal
     )
 
     # Get design
-    design = data_IO.design_array_from_h5(analysis_config.output_dir, filename=analysis_config.io.observables_filename)
+    design = data_IO.design_array_from_h5(
+        analysis_settings.output_dir, filename=analysis_settings.io.observables_filename
+    )
 
     # Define GP kernel (covariance function)
-    min = np.array(analysis_config.raw_analysis_config["parameterization"][analysis_config.parameterization]["min"])
-    max = np.array(analysis_config.raw_analysis_config["parameterization"][analysis_config.parameterization]["max"])
+    min = np.array(analysis_settings.raw_analysis_config["parameterization"][analysis_settings.parameterization]["min"])
+    max = np.array(analysis_settings.raw_analysis_config["parameterization"][analysis_settings.parameterization]["max"])
 
     kernel = None
     for kernel_type, kernel_args in config.active_kernels.items():
@@ -230,9 +230,9 @@ class SKLearnEmulatorSettings(common_base.CommonBase):
             if self.active_kernels["noise"]["type"] == "white":
                 # Validate arguments
                 # We don't want to do too much since we'll just be reinventing the wheel, but a bit can be helpful.
-                assert set(self.active_kernels["noise"]["args"]) == set(["noise_level", "noise_level_bounds"]), (
+                assert set(self.active_kernels["noise"]["args"]) == set(["noise_level", "noise_level_bounds"]), (  # noqa: C405
                     "Must provide arguments 'noise_level' and 'noise_level_bounds' for white noise kernel"
-                )  # noqa: C405
+                )
             else:
                 msg = "Unsupported noise kernel"
                 raise ValueError(msg)
@@ -370,4 +370,4 @@ class SKLearnEmulatorSettings(common_base.CommonBase):
 
 
 # Register the config class as backend entry point
-SklearnEmulatorConfig = SKLearnEmulatorSettings
+EmulatorSettings = SKLearnEmulatorSettings

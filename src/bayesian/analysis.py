@@ -51,24 +51,25 @@ class AnalysisConfig:
     raw_analysis_config: dict[str, Any] = attrs.field(factory=dict)
 
     @classmethod
-    def from_config(cls, config_file: Path, config: dict[str, Any]) -> AnalysisConfig:
+    def from_config(cls, analysis_name: str, config_file: Path, config: dict[str, Any]) -> AnalysisConfig:
         """
         Initialize the analysis configuration from a config file.
         """
+        raw_analysis_config = config["analyses"][analysis_name]
         return cls(
-            name=config["analysis_name"],
-            parameterization=config["parameterization"],
+            name=analysis_name,
+            parameterization=raw_analysis_config["parameterization"],
             config_file=config_file,
             io=AnalysisIO.from_config(config=config),
-            raw_analysis_config=config,
+            raw_analysis_config=raw_analysis_config,
         )
 
     @classmethod
-    def from_config_file(cls, config_file: str | Path) -> AnalysisConfig:
+    def from_config_file(cls, analysis_name: str, config_file: str | Path) -> AnalysisConfig:
         with Path(config_file).open() as stream:
             config = yaml.safe_load(stream)
 
-        return cls.from_config(config_file=Path(config_file), config=config)
+        return cls.from_config(analysis_name=analysis_name, config_file=Path(config_file), config=config)
 
     @property
     def output_dir(self) -> Path:

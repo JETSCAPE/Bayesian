@@ -1,4 +1,4 @@
-'''
+"""
 Module related to emulators, with functionality to train and call emulators for a given analysis run
 
 The main functionalities are:
@@ -11,7 +11,7 @@ A configuration class EmulationConfig provides simple access to emulation settin
 .. codeauthor: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
 .. codeauthor: Jingyu Zhang, Vanderbilt
 Based in part on JETSCAPE/STAT code.
-'''
+"""
 
 from __future__ import annotations
 
@@ -33,33 +33,39 @@ logger = logging.getLogger(__name__)
 
 _register_name = "sk_learn"
 
+
 ####################################################################################################################
 def fit_emulator(config: SKLearnEmulatorSettings, analysis_config: analysis.AnalysisConfig) -> dict[str, Any]:
-    '''
+    """
     Do PCA, fit emulators, and write to file for an individual emulation.
 
     The first config.n_pc principal components (PCs) are emulated by independent Gaussian processes (GPs)
     The emulators map design points to PCs; the output will need to be inverted from PCA space to physical space.
 
     :param EmulationConfig config: we take an instance of EmulationConfig as an argument to keep track of config info.
-    '''
+    """
     # TODO(RJE): I want to generally separate the concerns of emulators and IO, but I need to deal with them some. I guess
     #            I should have some emulator_IO functions which take the analysis_config and the emulator settings
 
     # Check if emulator already exists
-    if config.emulation_outputfile.exists():
+    output_filename = emulation_base.IO.output_filename(emulator_settings=config, analysis_config=analysis_config)
+    if output_filename.exists():
         if config.force_retrain:
-            config.emulation_outputfile.unlink()
-            logger.info(f'Removed {config.emulation_outputfile}')
+            output_filename.unlink()
+            logger.info(f"Removed {output_filename}")
         else:
-            logger.info(f'Emulators already exist: {config.emulation_outputfile} (to force retrain, set force_retrain: True)')
+            logger.info(f"Emulators already exist: {output_filename} (to force retrain, set force_retrain: True)")
             return {}
 
     # Initialize predictions into a single 2D array: (design_point_index, observable_bins) i.e. (n_samples, n_features)
     # A consistent order of observables is enforced internally in data_IO
     # NOTE: One sample corresponds to one design point, while one feature is one bin of one observable
-    logger.info('Doing PCA...')
-    Y = data_IO.predictions_matrix_from_h5(config.output_dir, filename=config.observables_filename, observable_filter=config.observable_filter)
+    logger.info("Doing PCA...")
+    Y = data_IO.predictions_matrix_from_h5(
+        output_dir=analysis_config.output_dir,
+        filename=analysis_config.io.observables_filename,
+        observable_filter=config.base_settings.observable_filter,
+    )
 
     # Use sklearn to:
     #  - Center and scale each feature (and later invert)
@@ -100,82 +106,89 @@ def fit_emulator(config: SKLearnEmulatorSettings, analysis_config: analysis.Anal
         logger.info(f"Running with max n_pc={max_n_components}")
     # NOTE-STAT: Whiten=True, but here, Whiten=False.
     # NOTE-STAT: RJE thinks this doesn't matter, based on the comments above.
-    pca = sklearn_decomposition.PCA(n_components=max_n_components, svd_solver='full', whiten=False) # Include all PCs here, so we can access them later
+    pca = sklearn_decomposition.PCA(
+        n_components=max_n_components, svd_solver="full", whiten=False
+    )  # Include all PCs here, so we can access them later
     # Scale data and perform PCA
     Y_pca = pca.fit_transform(scaler.fit_transform(Y))
-    Y_pca_truncated = Y_pca[:,:config.n_pc]    # Select PCs here
+    Y_pca_truncated = Y_pca[:, : config.n_pc]  # Select PCs here
     # Invert PCA and undo the scaling
-    Y_reconstructed_truncated = Y_pca_truncated.dot(pca.components_[:config.n_pc,:])
+    Y_reconstructed_truncated = Y_pca_truncated.dot(pca.components_[: config.n_pc, :])
     Y_reconstructed_truncated_unscaled = scaler.inverse_transform(Y_reconstructed_truncated)
     explained_variance_ratio = pca.explained_variance_ratio_
-    logger.info(f'  Variance explained by first {config.n_pc} components: {np.sum(explained_variance_ratio[:config.n_pc])}')
+    logger.info(
+        f"  Variance explained by first {config.n_pc} components: {np.sum(explained_variance_ratio[: config.n_pc])}"
+    )
 
     # Get design
-    design = data_IO.design_array_from_h5(config.output_dir, filename=config.observables_filename)
+    design = data_IO.design_array_from_h5(analysis_config.output_dir, filename=analysis_config.io.observables_filename)
 
     # Define GP kernel (covariance function)
-    min = np.array(config.analysis_config['parameterization'][config.parameterization]['min'])
-    max = np.array(config.analysis_config['parameterization'][config.parameterization]['max'])
+    min = np.array(analysis_config.raw_analysis_config["parameterization"][analysis_config.parameterization]["min"])
+    max = np.array(analysis_config.raw_analysis_config["parameterization"][analysis_config.parameterization]["max"])
 
     kernel = None
     for kernel_type, kernel_args in config.active_kernels.items():
         if kernel_type == "matern":
             length_scale = max - min
-            length_scale_bounds_factor = kernel_args['length_scale_bounds_factor']
-            length_scale_bounds = (np.outer(length_scale, tuple(length_scale_bounds_factor)))
-            nu = kernel_args['nu']
-            kernel = sklearn_gaussian_process.kernels.Matern(length_scale=length_scale,
-                                                             length_scale_bounds=length_scale_bounds,
-                                                             nu=nu,
-                                                            )
-        if kernel_type == 'rbf':
+            length_scale_bounds_factor = kernel_args["length_scale_bounds_factor"]
+            length_scale_bounds = np.outer(length_scale, tuple(length_scale_bounds_factor))
+            nu = kernel_args["nu"]
+            kernel = sklearn_gaussian_process.kernels.Matern(
+                length_scale=length_scale,
+                length_scale_bounds=length_scale_bounds,
+                nu=nu,
+            )
+        if kernel_type == "rbf":
             length_scale = max - min
-            length_scale_bounds_factor = kernel_args['length_scale_bounds_factor']
-            length_scale_bounds = (np.outer(length_scale, tuple(length_scale_bounds_factor)))
-            kernel = sklearn_gaussian_process.kernels.RBF(length_scale=length_scale,
-                                                          length_scale_bounds=length_scale_bounds
-                                                         )
-        if kernel_type == 'constant':
+            length_scale_bounds_factor = kernel_args["length_scale_bounds_factor"]
+            length_scale_bounds = np.outer(length_scale, tuple(length_scale_bounds_factor))
+            kernel = sklearn_gaussian_process.kernels.RBF(
+                length_scale=length_scale, length_scale_bounds=length_scale_bounds
+            )
+        if kernel_type == "constant":
             constant_value = kernel_args["constant_value"]
             constant_value_bounds = kernel_args["constant_value_bounds"]
-            kernel_constant = sklearn_gaussian_process.kernels.ConstantKernel(constant_value=constant_value,
-                                                                              constant_value_bounds=constant_value_bounds
-                                                                             )
-            kernel = (kernel + kernel_constant)
-        if kernel_type == 'noise':
+            kernel_constant = sklearn_gaussian_process.kernels.ConstantKernel(
+                constant_value=constant_value, constant_value_bounds=constant_value_bounds
+            )
+            kernel = kernel + kernel_constant
+        if kernel_type == "noise":
             kernel_noise = sklearn_gaussian_process.kernels.WhiteKernel(
                 noise_level=kernel_args["args"]["noise_level"],
                 noise_level_bounds=kernel_args["args"]["noise_level_bounds"],
             )
-            kernel = (kernel + kernel_noise)
+            kernel = kernel + kernel_noise
 
     # Fit a GP (optimize the kernel hyperparameters) to map each design point to each of its PCs
     # Note that Y_PCA=(n_samples, n_components), so each PC corresponds to a row (i.e. a column of Y_PCA.T)
     logger.info("")
-    logger.info('Fitting GPs...')
-    logger.info(f'  The design has {design.shape[1]} parameters')
-    emulators = [sklearn_gaussian_process.GaussianProcessRegressor(kernel=kernel,
-                                                             alpha=config.alpha,
-                                                             n_restarts_optimizer=config.n_restarts,
-                                                             copy_X_train=False).fit(design, y) for y in Y_pca_truncated.T]
+    logger.info("Fitting GPs...")
+    logger.info(f"  The design has {design.shape[1]} parameters")
+    emulators = [
+        sklearn_gaussian_process.GaussianProcessRegressor(
+            kernel=kernel, alpha=config.alpha, n_restarts_optimizer=config.n_restarts, copy_X_train=False
+        ).fit(design, y)
+        for y in Y_pca_truncated.T
+    ]
 
     # Print hyperparameters
     logger.info("")
-    logger.info('Kernel hyperparameters:')
-    [logger.info(f'  {emulator.kernel_}') for emulator in emulators]  # type: ignore[func-returns-value]
+    logger.info("Kernel hyperparameters:")
+    [logger.info(f"  {emulator.kernel_}") for emulator in emulators]  # type: ignore[func-returns-value]
     logger.info("")
 
     # Write all info we want to file
     output_dict: dict[str, Any] = {}
-    output_dict['PCA'] = {}
-    output_dict['PCA']['Y'] = Y
-    output_dict['PCA']['Y_pca'] = Y_pca
-    output_dict['PCA']['Y_pca_truncated'] = Y_pca_truncated
-    output_dict['PCA']['Y_reconstructed_truncated'] = Y_reconstructed_truncated
-    output_dict['PCA']['Y_reconstructed_truncated_unscaled'] = Y_reconstructed_truncated_unscaled
-    output_dict['PCA']['pca'] = pca
-    output_dict['PCA']['scaler'] = scaler
-    output_dict['emulators'] = emulators
+    output_dict["PCA"] = {}
+    output_dict["PCA"]["Y"] = Y
+    output_dict["PCA"]["Y_pca"] = Y_pca
+    output_dict["PCA"]["Y_pca_truncated"] = Y_pca_truncated
+    output_dict["PCA"]["Y_reconstructed_truncated"] = Y_reconstructed_truncated
+    output_dict["PCA"]["Y_reconstructed_truncated_unscaled"] = Y_reconstructed_truncated_unscaled
+    output_dict["PCA"]["pca"] = pca
+    output_dict["PCA"]["scaler"] = scaler
+    output_dict["emulators"] = emulators
 
     return output_dict
 
@@ -204,16 +217,22 @@ class SKLearnEmulatorSettings(common_base.CommonBase):
         # Kernel validation
         # Validate that we have exactly one of matern, rbf
         reference_strings = ["matern", "rbf"]
-        assert sum([s in self.active_kernels for s in reference_strings]) == 1, "Must provide exactly one of 'matern', 'rbf' kernel"
+        assert sum([s in self.active_kernels for s in reference_strings]) == 1, (
+            "Must provide exactly one of 'matern', 'rbf' kernel"
+        )
 
         # Validation for noise configuration
-        if 'noise' in self.active_kernels:
+        if "noise" in self.active_kernels:
             # Check we have the appropriate keys
-            assert [k in self.active_kernels['noise'] for k in ["type", "args"]], "Noise configuration must have keys 'type' and 'args'"
-            if self.active_kernels['noise']["type"] == "white":
+            assert [k in self.active_kernels["noise"] for k in ["type", "args"]], (
+                "Noise configuration must have keys 'type' and 'args'"
+            )
+            if self.active_kernels["noise"]["type"] == "white":
                 # Validate arguments
                 # We don't want to do too much since we'll just be reinventing the wheel, but a bit can be helpful.
-                assert set(self.active_kernels['noise']["args"]) == set(["noise_level", "noise_level_bounds"]), "Must provide arguments 'noise_level' and 'noise_level_bounds' for white noise kernel"  # noqa: C405
+                assert set(self.active_kernels["noise"]["args"]) == set(["noise_level", "noise_level_bounds"]), (
+                    "Must provide arguments 'noise_level' and 'noise_level_bounds' for white noise kernel"
+                )  # noqa: C405
             else:
                 msg = "Unsupported noise kernel"
                 raise ValueError(msg)
@@ -221,13 +240,11 @@ class SKLearnEmulatorSettings(common_base.CommonBase):
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> SKLearnEmulatorSettings:
         return cls(
-            base_settings=emulation_base.BaseEmulatorSettings.from_config(config),
-            n_pc=config['n_pc'],
+            base_settings=emulation_base.BaseEmulatorSettings.from_emulator_settings(config),
+            n_pc=config["n_pc"],
             max_n_components_to_calculate=config.get("max_n_components_to_calculate"),
-            active_kernels={
-                kernel_type: config["kernels"][kernel_type] for kernel_type in config["kernels"]["active"]
-            },
-            n_restarts=config["GPR"]['n_restarts'],
+            active_kernels={kernel_type: config["kernels"][kernel_type] for kernel_type in config["kernels"]["active"]},
+            n_restarts=config["GPR"]["n_restarts"],
             alpha=config["GPR"]["alpha"],
             settings=config,
         )
@@ -255,6 +272,7 @@ class SKLearnEmulatorSettings(common_base.CommonBase):
                     msg = f"Could not find {k=} in dict {d}"
                     raise RuntimeError(msg) from e
             return d
+
         config = get_nested(d=config, keys_to_follow=emulator_path)
 
         return cls.from_config(config=config)
@@ -309,7 +327,7 @@ class SKLearnEmulatorSettings(common_base.CommonBase):
     #         if self.active_kernels['noise']["type"] == "white":
     #             # Validate arguments
     #             # We don't want to do too much since we'll just be reinventing the wheel, but a bit can be helpful.
-    #             assert set(self.active_kernels['noise']["args"]) == set(["noise_level", "noise_level_bounds"]), "Must provide arguments 'noise_level' and 'noise_level_bounds' for white noise kernel"  # noqa: C405
+    #             assert set(self.active_kernels['noise']["args"]) == set(["noise_level", "noise_level_bounds"]), "Must provide arguments 'noise_level' and 'noise_level_bounds' for white noise kernel"
     #         else:
     #             msg = "Unsupported noise kernel"
     #             raise ValueError(msg)

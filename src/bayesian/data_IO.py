@@ -1293,23 +1293,20 @@ def predictions_matrix_from_h5(output_dir, filename, validation_set=False, obser
     return Y
 
 
-####################################################################################################################
-def design_array_from_h5(output_dir, filename, validation_set=False):
+def design_array_from_h5(output_dir: Path, filename: str, validation_set: bool = False) -> npt.NDArray[np.float32 | np.float64]:
     """
     Initialize design array from observables.h5 file
 
-    :param str output_dir: location of filename
-    :param str filename: h5 filename (typically 'observables.h5')
-    :return 2darray design: array of design points
+    Args:
+        output_dir: location of filename
+        filename: h5 filename (typically 'observables.h5')
+    Returns:
+        2D array array of design points
     """
-
     # Initialize observables dict from observables.h5 file
-    observables = read_dict_from_h5(output_dir, filename, verbose=False)
-    if validation_set:
-        design = observables["Design_validation"]
-    else:
-        design = observables["Design"]
-    return design
+    observables = read_dict_from_h5(output_dir, filename, verbose=False)  # type: ignore[no-untyped-call]
+    k = "Design_validation" if validation_set else "Design"
+    return observables[k]  # type: ignore[no-any-return]
 
 
 ####################################################################################################################

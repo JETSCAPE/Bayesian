@@ -1,10 +1,20 @@
 """ Functionality for identifying outliers and smoothing them.
 
 .. codeauthor:: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
+
+Extension to outliers_smoothing.py for DESIGN POINT filtering only
+
+FUNCTIONALITY:
+=============
+- Filter DESIGN POINTS (remove rows from prediction matrix)
+
+AUTHORS: Jingyu Zhang (2025)
 """
+
 from __future__ import annotations
 
 import logging
+from typing import Dict, List, Tuple, Any
 
 import attrs
 import numpy as np
@@ -373,3 +383,296 @@ def perform_interpolation_on_values(
 
     return interpolated_values
 
+@attrs.frozen
+class FilteringConfig:
+    """Configuration for filtering (permanent removal) of design points.
+    
+    This is different from OutliersConfig which smooths/interpolates outliers.
+    Filtering removes entire design points when they have too many bad features.
+    """
+    method: str = "relative_statistical_error"  # 'relative_statistical_error', 'absolute_statistical_error'
+    threshold: float = 0.5  # Threshold value
+    min_design_points: int = 50  # Safety: minimum design points to keep
+    max_filtered_fraction: float = 0.3  # Safety: maximum fraction to filter
+    problem_fraction_threshold: float = 0.2  # If >20% of features are bad, filter the design point
+
+
+def identify_high_uncertainty_points_absolute_threshold(
+    values: npt.NDArray[np.float64],
+    uncertainties: npt.NDArray[np.float64],
+    method: str,
+    threshold: float,
+) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """
+    Identify high uncertainty points using absolute thresholds.
+    
+    Complements existing RMS-based outlier detection with absolute threshold option.
+    
+    Args:
+        values: Observable values, shape (n_bins, n_design_points)
+        uncertainties: Statistical uncertainties, shape (n_bins, n_design_points)
+        method: 'relative_statistical_error' or 'absolute_statistical_error'
+        threshold: Absolute threshold value
+        
+    Returns:
+        (feature_indices, design_point_indices) matching existing function signature
+        
+    Note:
+        Return format matches existing find_large_statistical_uncertainty_points()
+        which returns (n_feature_index, n_design_point_index)
+    """
+    if method == "relative_statistical_error":
+        # Filter where |σ / y| > threshold
+        with np.errstate(divide='ignore', invalid='ignore'):
+            relative_error = np.abs(uncertainties / values)
+            relative_error[~np.isfinite(relative_error)] = 0
+        mask = relative_error > threshold
+        
+    elif method == "absolute_statistical_error":
+        # Filter where |σ| > threshold
+        mask = np.abs(uncertainties) > threshold
+        
+    else:
+        raise ValueError(f"Unknown filtering method: {method}")
+    
+    # np.where returns (row_indices, col_indices)
+    # For shape (n_bins, n_design_points): rows=features, cols=design_points
+    feature_indices, design_point_indices = np.where(mask)
+    return feature_indices, design_point_indices
+
+
+def identify_design_points_to_filter(
+    observables: Dict[str, Any],
+    config: FilteringConfig,
+    prediction_key: str = "Prediction",
+) -> List[int]:
+    """
+    Identify design points that should be completely removed.
+    
+    A design point (row in prediction matrix) is marked for removal if it has 
+    too many problematic features (columns) across all observables.
+    
+    Args:
+        observables: Observables dictionary
+        config: FilteringConfig with filtering parameters
+        prediction_key: 'Prediction' or 'Prediction_validation'
+        
+    Returns:
+        List of design point indices (row indices) to remove
+    """
+    # Count problematic features per design point
+    design_point_problem_count: Dict[int, int] = {}
+    total_features_per_design_point: Dict[int, int] = {}
+    
+    for obs_label, obs_data in observables[prediction_key].items():
+        values = obs_data['y']  # shape: (n_bins, n_design_points)
+        uncertainties = obs_data['y_err_stat']  # shape: (n_bins, n_design_points)
+        n_bins, n_design_points = values.shape
+        
+        # Identify problematic points
+        feature_indices, design_point_indices = identify_high_uncertainty_points_absolute_threshold(
+            values, uncertainties, config.method, config.threshold
+        )
+        
+        # Count problems per design point
+        for dp_idx in design_point_indices:
+            design_point_problem_count[dp_idx] = design_point_problem_count.get(dp_idx, 0) + 1
+            total_features_per_design_point[dp_idx] = total_features_per_design_point.get(dp_idx, 0) + n_bins
+    
+    # Determine which design points to filter
+    design_points_to_filter = []
+    for dp_idx in design_point_problem_count.keys():
+        problem_fraction = design_point_problem_count[dp_idx] / total_features_per_design_point[dp_idx]
+        if problem_fraction > config.problem_fraction_threshold:
+            design_points_to_filter.append(dp_idx)
+            logger.debug(
+                f"Design point {dp_idx}: {design_point_problem_count[dp_idx]}/{total_features_per_design_point[dp_idx]} "
+                f"({problem_fraction:.1%}) features problematic"
+            )
+    
+    design_points_to_filter = sorted(design_points_to_filter)
+    
+    # Safety checks
+    if not design_points_to_filter:
+        return []
+    
+    n_total = next(iter(observables[prediction_key].values()))['y'].shape[1]
+    n_filtered = len(design_points_to_filter)
+    filtered_fraction = n_filtered / n_total if n_total > 0 else 0
+    
+    if filtered_fraction > config.max_filtered_fraction:
+        logger.warning(
+            f"Filtering would remove {filtered_fraction:.1%} of design points "
+            f"(limit: {config.max_filtered_fraction:.1%}). Filtering disabled for safety."
+        )
+        return []
+    
+    if n_total - n_filtered < config.min_design_points:
+        logger.warning(
+            f"Filtering would leave only {n_total - n_filtered} design points "
+            f"(minimum: {config.min_design_points}). Filtering disabled for safety."
+        )
+        return []
+    
+    logger.info(
+        f"Identified {n_filtered}/{n_total} design points for filtering ({filtered_fraction:.1%}): "
+        f"{design_points_to_filter}"
+    )
+    return design_points_to_filter
+
+
+def apply_design_point_filtering(
+    observables: Dict[str, Any],
+    design_points_to_filter: List[int],
+    prediction_key: str = "Prediction",
+) -> Dict[str, Any]:
+    """
+    Apply design point filtering to observables dictionary.
+    
+    This removes columns from the prediction arrays (axis=1).
+    Design points are stored as columns in the raw format.
+    
+    Args:
+        observables: Input observables dictionary
+        design_points_to_filter: List of design point indices (column indices) to remove
+        prediction_key: 'Prediction' or 'Prediction_validation'
+        
+    Returns:
+        Filtered observables dictionary
+    """
+    if not design_points_to_filter:
+        return observables
+    
+    logger.info(f"Applying filtering to {prediction_key}: removing {len(design_points_to_filter)} design points")
+    
+    filtered_observables = {}
+    
+    # Copy everything EXCEPT the keys we're explicitly filtering
+    keys_to_filter = [prediction_key]
+    if prediction_key == "Prediction":
+        keys_to_filter.extend(["Design", "Design_indices"])
+    elif prediction_key == "Prediction_validation":
+        keys_to_filter.extend(["Design_validation", "Design_indices_validation"])
+
+    for key in observables:
+        if key not in keys_to_filter:
+            filtered_observables[key] = observables[key] 
+    
+    # Determine which Design/Design_indices keys to filter
+    if prediction_key == "Prediction":
+        design_key = "Design"
+        indices_key = "Design_indices"
+    elif prediction_key == "Prediction_validation":
+        design_key = "Design_validation"
+        indices_key = "Design_indices_validation"
+    else:
+        raise ValueError(f"Unknown prediction_key: {prediction_key}")
+    
+    # Filter Prediction arrays
+    filtered_observables[prediction_key] = {}
+    for obs_label, obs_data in observables[prediction_key].items():
+        filtered_obs_data = {}
+        
+        n_design_points = obs_data['y'].shape[1]
+        keep_mask = np.ones(n_design_points, dtype=bool)
+        keep_mask[design_points_to_filter] = False
+        
+        for key, value in obs_data.items():
+            if isinstance(value, np.ndarray) and value.ndim == 2:
+                # Filter columns (design points)
+                filtered_obs_data[key] = value[:, keep_mask]
+            elif isinstance(value, dict):
+                # Systematics
+                filtered_systematics = {}
+                for sys_name, sys_value in value.items():
+                    if isinstance(sys_value, np.ndarray) and sys_value.ndim == 2:
+                        filtered_systematics[sys_name] = sys_value[:, keep_mask]
+                    else:
+                        filtered_systematics[sys_name] = sys_value
+                filtered_obs_data[key] = filtered_systematics
+            else:
+                filtered_obs_data[key] = value
+        
+        filtered_observables[prediction_key][obs_label] = filtered_obs_data
+    
+    # Filter corresponding Design array (rows)
+    if design_key in observables:
+        design = observables[design_key]
+        keep_mask = np.ones(design.shape[0], dtype=bool)
+        keep_mask[design_points_to_filter] = False
+        filtered_observables[design_key] = design[keep_mask, :]
+    
+    # Filter corresponding Design_indices
+    if indices_key in observables:
+        indices = observables[indices_key]
+        keep_mask = np.ones(len(indices), dtype=bool)
+        keep_mask[design_points_to_filter] = False
+        filtered_observables[indices_key] = indices[keep_mask]
+    
+    # Copy other Design/indices keys unchanged
+    for key in ["Design", "Design_indices", "Design_validation", "Design_indices_validation"]:
+        if key in observables and key != design_key and key != indices_key:
+            filtered_observables[key] = observables[key]
+    
+    logger.info(f"  {prediction_key}: {n_design_points} → {np.sum(keep_mask)} design points")
+    if design_key in observables:
+        logger.info(f"  {design_key}: {observables[design_key].shape} → {filtered_observables[design_key].shape}")
+    
+    return filtered_observables
+
+
+def filter_problematic_design_points(
+    observables: Dict[str, Any],
+    filtering_config: FilteringConfig,
+    prediction_key: str = "Prediction",
+) -> Tuple[Dict[str, Any], List[int]]:
+    """
+    High-level interface: Filter design points with excessive uncertainty.
+    
+    This complements the existing smoothing workflow:
+    - Existing: Find outliers → Interpolate → Keep all design points
+    - New: Find design points with many outliers → Remove entirely
+    
+    Usage: Call this BEFORE smoothing to remove worst design points,
+           then smooth remaining mild outliers.
+    
+    Args:
+        observables: Input observables dictionary
+        filtering_config: Configuration for filtering
+        prediction_key: 'Prediction' or 'Prediction_validation'
+        
+    Returns:
+        (filtered_observables, list of removed design point indices)
+        
+    Example:
+        >>> config = FilteringConfig(
+        ...     method='relative_statistical_error',
+        ...     threshold=0.7,  # Remove if >70% relative error
+        ...     problem_fraction_threshold=0.3  # If >30% of features are bad
+        ... )
+        >>> filtered_obs, removed = filter_problematic_design_points(obs, config)
+        >>> # Then continue with existing smoothing...
+        >>> smoothed_obs = find_and_smooth_outliers_standalone(filtered_obs, ...)
+    """
+    logger.info("=" * 70)
+    logger.info("Filtering problematic design points")
+    logger.info(f"  Method: {filtering_config.method}")
+    logger.info(f"  Threshold: {filtering_config.threshold}")
+    logger.info(f"  Problem fraction threshold: {filtering_config.problem_fraction_threshold}")
+    logger.info("=" * 70)
+    
+    design_points_to_filter = identify_design_points_to_filter(
+        observables, filtering_config, prediction_key
+    )
+    
+    if design_points_to_filter:
+        filtered_obs = apply_design_point_filtering(
+            observables, design_points_to_filter, prediction_key
+        )
+        logger.info(f"✓ Removed {len(design_points_to_filter)} design points")
+        logger.info("=" * 70)
+        return filtered_obs, design_points_to_filter
+    else:
+        logger.info("✓ No design points need filtering")
+        logger.info("=" * 70)
+        return observables, []

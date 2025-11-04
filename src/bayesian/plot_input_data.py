@@ -248,7 +248,7 @@ def _plot_predictions_for_all_design_points(
             # Plot each design point separately
             observable = all_observables[prediction_key][observable_key]["y"]
             observable_preprocessed = all_observables_preprocessed[prediction_key][observable_key]["y"]
-            for i_design_point in range(observable.shape[1]):
+            for i_design_point in range(observable_preprocessed.shape[1]):
                 for label, color, obs in zip(["standard", "preprocessed"], colors, [observable, observable_preprocessed]):
                     if label not in select_which_to_plot:
                         continue

@@ -768,11 +768,6 @@ class ObservableFilter:
             (observable_in_exclude_list_no_glob or observable_in_exclude_list_glob)
         )
 
-        #logger.debug(
-        #    f"'{observable_name}': {found_observable=},"
-        #    f" {observable_in_include_list_no_glob=}, {observable_in_include_list_glob=}, {observable_in_exclude_list_no_glob=}, {observable_in_exclude_list_glob=}"
-        #)
-
         # Helpful for cross checking when debugging
         if observable_in_exclude_list_no_glob or observable_in_exclude_list_glob:
             logger.debug(
@@ -813,8 +808,8 @@ def _accept_observable(analysis_config, filename):
 
     accepted_centrality = False
     for (selected_cent_min, selected_cent_max) in centrality_ranges:
-        if int(centrality_min) >= selected_cent_min:
-            if int(centrality_max) <= selected_cent_max:
+        if float(centrality_min) >= selected_cent_min:
+            if float(centrality_max) <= selected_cent_max:
                 accepted_centrality = True
                 # Bail out - no need to keep looping if it's already accepted
                 break
@@ -1020,8 +1015,8 @@ def _parse_data_systematic_header(filepath):
                         if col.lower() == 'label':
                             continue  # Skip Label - np.loadtxt ignores it
                         
-                        if col.startswith('s_'):
-                            systematic_name = col[2:]  # Remove 's_' prefix
+                        if col.startswith('sys_'):
+                            systematic_name = col  # Remove 's_' prefix
                             systematic_columns[systematic_name] = data_col_index
                         
                         data_col_index += 1

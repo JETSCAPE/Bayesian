@@ -2,22 +2,22 @@
 #-------------------------------------------
 # General parameters
 
-output_dir: '/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/20230116_20250806/'
+output_dir: '/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/20230116_20251106_sum/'
 
 initialize_observables: True
 preprocess_input_data: True
-fit_emulators: False
-run_mcmc: False
-run_closure_tests: False
+fit_emulators: True
+run_mcmc: True
+run_closure_tests: True
 
 plot:
   input_data: True
-  emulators: False
-  mcmc: False
-  covariance: False
-  qhat: False
-  closure_tests: False
-  across_analyses: False
+  emulators: True
+  mcmc: True
+  covariance: True
+  qhat: True
+  closure_tests: True
+  across_analyses: True
 
 debug_level: 0
 
@@ -178,9 +178,11 @@ analyses:
           n_pc: 5
           observable_list:
             - observable: '5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10'
-              sys_data: ['sys_jec:alice', 'sys_taa:5020']
+              sys_data: ['sum']
+              #sys_data: ['sys_jec:alice', 'sys_taa:5020']
             - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.2__0-10'
-              sys_data: ['sys_jec:cms', 'sys_taa:5020']
+              sys_data: ['sum']
+              #sys_data: ['sys_jec:cms', 'sys_taa:5020']
       mcmc:
         <<: *default_mcmc_parameters
         n_walkers: 20
@@ -190,9 +192,3 @@ analyses:
         <<: *default_closure_parameters
     <<: *model_base
     plot_panel_shapes: [[3,3], [3,3], [3,3]]
-
-
-
-
-
-

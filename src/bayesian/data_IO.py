@@ -49,7 +49,7 @@ authors: Jingyu Zhang <jingyu.zhang@cern.ch>, Vanderbilt
 
 from __future__ import annotations
 
-from systematic_correlation import SystematicCorrelationManager
+from bayesian.systematic_correlation import SystematicCorrelationManager
 import fnmatch
 import os
 import logging
@@ -190,15 +190,36 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
 
             observable_label, _ = _filename_to_labels(filename)
             
-            # NEW: Read systematic uncertainties
             sys_data_list, _ = systematic_config_map.get(observable_label, ([], []))
             if sys_data_list:
                 systematic_columns = _parse_data_systematic_header(os.path.join(data_dir, filename))
                 systematic_data = _read_data_systematics(os.path.join(data_dir, filename), systematic_columns)
+                
+                # NEW: Handle 'sum' configurations - check if this observable wants summed systematics
+                for sys_config in sys_data_list:
+                    if sys_config.startswith('sum'):
+                        # This observable wants summed systematics
+                        logger.info(f"Observable '{observable_label}' requests summed systematics")
+                        
+                        if systematic_data:
+                            # Sum all available systematics in quadrature
+                            summed_sys = _sum_systematics_quadrature(systematic_data)
+                            
+                            # Replace individual systematics with single summed one
+                            logger.info(f"  Replaced {len(systematic_data)} individual systematics with 1 summed systematic")
+                            systematic_data = {'sum': summed_sys}
+                        else:
+                            logger.warning(f"  No systematic columns found to sum for '{observable_label}'")
+                            # Create empty sum systematic to maintain structure
+                            systematic_data = {}
+                        
+                        # Only one 'sum' directive should exist per observable
+                        break
+                
                 filtered_systematics = _filter_systematics_by_config(systematic_data, sys_data_list)
                 data_entry['systematics'] = filtered_systematics
             else:
-                data_entry['systematics'] = {}  # Empty dict for backward compatibility
+                data_entry['systematics'] = {}
             
             observables['Data'][observable_label] = data_entry
 
@@ -1156,6 +1177,51 @@ def _filter_systematics_by_config(systematic_data, config_systematics):
     
     return filtered_systematics
 
+def _sum_systematics_quadrature(systematics_dict: Dict[str, np.ndarray]) -> np.ndarray:
+    """
+    Sum all systematics in quadrature: sqrt(sum of squares).
+    
+    This is used when config specifies 'sum:...' to combine multiple systematic
+    sources into a single combined systematic uncertainty.
+    
+    Formula: σ_total = sqrt(σ_1² + σ_2² + ... + σ_n²)
+    
+    Args:
+        systematics_dict: Dictionary of systematic arrays {name: array}
+                         e.g., {'jec': [0.1, 0.2], 'taa': [0.05, 0.08], ...}
+    
+    Returns:
+        Array of summed systematic uncertainties (same length as input arrays)
+        Returns empty array if no systematics provided
+        
+    Example:
+        >>> sys_dict = {'jec': np.array([0.3, 0.4]), 'taa': np.array([0.4, 0.3])}
+        >>> result = _sum_systematics_quadrature(sys_dict)
+        >>> print(result)  # [0.5, 0.5]  (sqrt(0.3² + 0.4²) = 0.5)
+    """
+    if not systematics_dict:
+        logger.warning("No systematics to sum - returning empty array")
+        return np.array([])
+    
+    arrays = list(systematics_dict.values())
+    
+    # Check all arrays have the same length
+    lengths = [len(arr) for arr in arrays]
+    if len(set(lengths)) > 1:
+        logger.error(f"Systematic arrays have different lengths: {lengths}")
+        raise ValueError(f"Cannot sum systematics with different lengths: {lengths}")
+    
+    # Quadrature sum: sqrt(sum of squares)
+    sum_squared = sum(arr**2 for arr in arrays)
+    summed = np.sqrt(sum_squared)
+    
+    logger.info(f"Summed {len(arrays)} systematics in quadrature:")
+    for name in systematics_dict.keys():
+        logger.debug(f"  Included: {name}")
+    logger.info(f"  Result: {len(summed)} bins, mean uncertainty = {np.mean(summed):.4f}")
+    
+    return summed
+
 def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1, 
                                observable_filter=None):
     """
@@ -1288,6 +1354,8 @@ def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1,
     
     # Register observable ranges with correlation manager
     correlation_manager.register_observable_ranges(data['observable_ranges'])
+
+    correlation_manager.resolve_bin_counts(data['observable_ranges'])
     
     # Log summary information
     logger.info(f"Data loading complete:")

@@ -51,16 +51,124 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SystematicInfo:
     """
-    Store information about a systematic uncertainty
+    Store information about a systematic uncertainty.
+    
+    Two types:
+    1. Individual systematics: Use group tags for cross-observable correlation
+       - Always fully correlated within observable
+       - cor_length and cor_strength not used
+    
+    2. Summed systematics: Use cor_length/cor_strength for intra-observable correlation
+       - No cross-observable correlation (no group tag)
+       - cor_length and cor_strength define bin-to-bin correlation
     """
-    base_name: str        # e.g., 'jec', 'taa'  
-    correlation_tag: str  # e.g., 'group1', 'alice', 'experiment_a', etc. (user-defined)
-    full_name: str       # e.g., 'jec:group1', 'taa:alice'
-    is_uncorrelated: bool = False
-
+    base_name: str           # e.g., 'jec', 'taa', 'sum'
+    correlation_tag: str     # e.g., 'alice', '5020' (empty string for sum)
+    full_name: str           # e.g., 'jec:alice' or 'sum_observable_name'
+    is_summed: bool = False  # True if this is a summed systematic
+    is_uncorrelated: bool = False  # True if tag is 'uncor'
+    
+    # Correlation parameters (ONLY used for summed systematics)
+    cor_length: int = -1        # -1 means all bins (only applies to sum)
+    cor_strength: float = 1.0   # Only applies to sum
+    
     def __post_init__(self):
         self.is_uncorrelated = (self.correlation_tag.lower() == 'uncor')
+        
+        # Validation: individual systematics should not have correlation parameters
+        if not self.is_summed:
+            if self.cor_length != -1 or self.cor_strength != 1.0:
+                logger.warning(f"Individual systematic {self.full_name} has cor_length/cor_strength - these are ignored")
 
+def parse_systematic_config(sys_config_string: str) -> Dict:
+    """
+    Parse systematic configuration string.
+    
+    ALLOWED FORMATS:
+    1. Individual systematic: 'name:group_tag'
+       - Example: 'jec:alice', 'taa:5020'
+       - Always fully correlated within observable (all bins)
+       - Group tag controls cross-observable correlation
+    
+    2. Summed systematic: 'sum:cor_length:cor_strength' or 'sum'
+       - Example: 'sum:10:0.8', 'sum'
+       - cor_length and cor_strength control intra-observable correlation
+       - No cross-observable correlation
+    
+    DISABLED FORMATS (will raise ValueError):
+    ❌ 'sum:group_tag:...'              - sum cannot have group tags
+    ❌ 'name:tag:cor_length:cor_strength' - individual systematics cannot have correlation params
+    
+    Args:
+        sys_config_string: Configuration string from config file
+    
+    Returns:
+        Dictionary with keys:
+            - 'type': 'individual' or 'sum'
+            - 'name': base systematic name
+            - 'group_tag': correlation group tag (empty for sum)
+            - 'cor_length': correlation length (-1 for individual or all bins)
+            - 'cor_strength': correlation coefficient (1.0 for individual)
+    """
+    parts = sys_config_string.split(':')
+    
+    if parts[0] == 'sum':
+        # Summed systematic: sum[:cor_length[:cor_strength]]
+        if len(parts) > 3:
+            raise ValueError(
+                f"Invalid sum format: '{sys_config_string}'. "
+                f"Sum systematics cannot have group tags. "
+                f"Use format: 'sum' or 'sum:cor_length:cor_strength'"
+            )
+        
+        try:
+            cor_length = int(parts[1]) if len(parts) > 1 else -1
+            cor_strength = float(parts[2]) if len(parts) > 2 else 1.0
+        except (ValueError, IndexError) as e:
+            raise ValueError(
+                f"Invalid sum format: '{sys_config_string}'. "
+                f"Expected 'sum' or 'sum:cor_length:cor_strength' where cor_length is int and cor_strength is float. "
+                f"Error: {e}"
+            )
+        
+        config = {
+            'type': 'sum',
+            'name': 'sum',
+            'group_tag': '',  # Empty - no cross-observable correlation
+            'cor_length': cor_length,
+            'cor_strength': cor_strength
+        }
+        logger.debug(f"Parsed sum: {sys_config_string} -> length={cor_length}, strength={cor_strength}")
+        
+    else:
+        # Individual systematic: name:group_tag
+        if len(parts) != 2:
+            raise ValueError(
+                f"Invalid individual systematic format: '{sys_config_string}'. "
+                f"Individual systematics must use format 'name:group_tag' (e.g., 'jec:alice'). "
+                f"Correlation length/strength parameters are not allowed - individual systematics are always fully correlated within observable."
+            )
+        
+        config = {
+            'type': 'individual',
+            'name': parts[0],
+            'group_tag': parts[1],
+            'cor_length': -1,     # Not used for individual
+            'cor_strength': 1.0   # Not used for individual
+        }
+        logger.debug(f"Parsed individual: {sys_config_string} -> name='{parts[0]}', group='{parts[1]}'")
+    
+    # Validate correlation parameters (only meaningful for sum)
+    if config['type'] == 'sum':
+        if config['cor_strength'] < 0.0 or config['cor_strength'] > 1.0:
+            logger.warning(f"Correlation strength {config['cor_strength']} outside [0,1], clipping to [0,1]")
+            config['cor_strength'] = np.clip(config['cor_strength'], 0.0, 1.0)
+        
+        if config['cor_length'] < -1 or config['cor_length'] == 0:
+            logger.warning(f"Invalid correlation length {config['cor_length']}, setting to -1 (all bins)")
+            config['cor_length'] = -1
+    
+    return config
 
 class SystematicCorrelationManager:
     """
@@ -84,13 +192,30 @@ class SystematicCorrelationManager:
         # Store all unique systematic full names for consistent ordering
         self.all_systematic_names: List[str] = []
 
+        # Store observable ranges for covariance calculation
+        self._observable_ranges: List[Tuple[int, int, str]] = []
+
     def parse_configuration(self, parsed_observables: List[Tuple[str, List[str], List[str]]]):
         """
-        Parse the configuration format with correlation tags.
-        Makes no assumptions about tag meanings - they are just user-defined strings.
+        Parse systematic configuration with two separate systems:
         
-        :param parsed_observables: List of (observable_name, sys_data_list, sys_theory_list)
-                                  where sys_data_list contains items like ['jec:group1', 'taa:alice']
+        System 1 - Individual systematics (NEW, recommended):
+            Format: 'name:group_tag' (e.g., 'jec:alice', 'taa:5020')
+            - Always fully correlated within observable
+            - Cross-observable correlation via group tags
+            - Clean physics interpretation
+        
+        System 2 - Summed systematics (LEGACY):
+            Format: 'sum:cor_length:cor_strength' or 'sum'
+            - Intra-observable correlation via cor_length/cor_strength
+            - NO cross-observable correlation
+            - Each observable is independent
+        
+        NOTE: Cannot mix individual and sum within same observable.
+        NOTE: cor_length=-1 will be resolved to actual bin counts in resolve_bin_counts()
+        
+        Args:
+            parsed_observables: List of (observable_name, sys_data_list, sys_theory_list)
         """
         logger.info("Parsing systematic correlation configuration...")
         
@@ -99,33 +224,75 @@ class SystematicCorrelationManager:
         for obs_name, sys_data_list, sys_theory_list in parsed_observables:
             self.observable_systematics[obs_name] = []
             
-            # Process data systematics
-            for sys_spec in sys_data_list:
-                if ':' in sys_spec:
-                    base_name, correlation_tag = sys_spec.split(':', 1)
-                else:
-                    # If no tag specified, treat as uncorrelated
-                    base_name = sys_spec
-                    correlation_tag = 'uncor'
-                    logger.warning(f"No correlation tag for {sys_spec}, treating as uncorrelated")
+            # Check for mixing (not allowed)
+            has_individual = False
+            has_sum = False
+            
+            for sys_config_string in sys_data_list:
+                config = parse_systematic_config(sys_config_string)
                 
-                full_name = f"{base_name}:{correlation_tag}"
+                if config['type'] == 'sum':
+                    has_sum = True
+                else:
+                    has_individual = True
+            
+            if has_individual and has_sum:
+                raise ValueError(
+                    f"Observable '{obs_name}' mixes individual and sum systematics. "
+                    f"You must use EITHER individual systematics OR sum, not both."
+                )
+            
+            # Now process systematics
+            for sys_config_string in sys_data_list:
+                config = parse_systematic_config(sys_config_string)
+                
+                sys_base_name = config['name']
+                correlation_tag = config['group_tag']
+                cor_length = config['cor_length']
+                cor_strength = config['cor_strength']
+                is_summed = (config['type'] == 'sum')
+                
+                # Construct full name
+                if is_summed:
+                    # Sum: Make unique per observable (no cross-observable correlation)
+                    full_name = f"sum_{obs_name}"
+                else:
+                    # Individual: Use base name + group tag
+                    full_name = f"{sys_base_name}:{correlation_tag}"
                 
                 # Store systematic info
                 sys_info = SystematicInfo(
-                    base_name=base_name,
+                    base_name=sys_base_name,
                     correlation_tag=correlation_tag,
-                    full_name=full_name
+                    full_name=full_name,
+                    is_summed=is_summed,
+                    cor_length=cor_length,
+                    cor_strength=cor_strength
                 )
                 self.systematic_info[full_name] = sys_info
                 self.observable_systematics[obs_name].append(full_name)
                 all_systematic_full_names.add(full_name)
                 
-                logger.debug(f"  {obs_name}: {sys_spec} -> {full_name}")
+                if is_summed:
+                    logger.debug(f"  {obs_name}: sum (cor_length={cor_length}, cor_strength={cor_strength})")
+                else:
+                    logger.debug(f"  {obs_name}: {full_name}")
         
-        # Create consistent ordering of systematic names
+        # Create consistent ordering
         self.all_systematic_names = sorted(list(all_systematic_full_names))
-        logger.info(f"Found {len(self.all_systematic_names)} unique systematics: {self.all_systematic_names}")
+        logger.info(f"Found {len(self.all_systematic_names)} unique systematics")
+        
+        # Summary
+        n_summed = sum(1 for info in self.systematic_info.values() if info.is_summed)
+        n_individual = len(self.systematic_info) - n_summed
+        logger.info(f"  Individual systematics: {n_individual}")
+        logger.info(f"  Summed systematics: {n_summed}")
+        
+        # Check for unresolved cor_length
+        n_unresolved = sum(1 for info in self.systematic_info.values() 
+                        if info.is_summed and info.cor_length == -1)
+        if n_unresolved > 0:
+            logger.info(f"  Summed systematics with unresolved cor_length: {n_unresolved} (will resolve after data load)")
 
     def register_observable_ranges(self, observable_ranges: List[Tuple[int, int, str]]):
         """
@@ -134,6 +301,9 @@ class SystematicCorrelationManager:
         :param observable_ranges: List of (start_idx, end_idx, observable_label)
         """
         logger.info("Building correlation groups from observable ranges...")
+
+        # Store observable ranges for later use in covariance calculation
+        self._observable_ranges = observable_ranges
         
         # Clear existing correlation groups
         self.correlation_groups.clear()
@@ -158,6 +328,127 @@ class SystematicCorrelationManager:
             for obs_label, start, end, sys_name in group_members:
                 logger.debug(f"    {sys_name} on {obs_label} (features {start}:{end})")
 
+    def resolve_bin_counts(self, observable_ranges: List[Tuple[int, int, str]]):
+        """
+        Resolve cor_length=-1 to actual bin counts for SUMMED systematics only.
+        
+        Individual systematics are always fully correlated and don't use cor_length.
+        This method only updates summed systematics that have cor_length=-1.
+        
+        Args:
+            observable_ranges: List of (start_idx, end_idx, observable_label)
+        """
+        logger.info("Resolving correlation lengths for summed systematics...")
+        
+        # Build map of observable -> bin count
+        obs_bin_counts = {}
+        for start_idx, end_idx, obs_label in observable_ranges:
+            n_bins = end_idx - start_idx
+            obs_bin_counts[obs_label] = n_bins
+            logger.debug(f"  Observable '{obs_label}': {n_bins} bins")
+        
+        n_resolved = 0
+        n_already_set = 0
+        
+        # Update only summed systematics with cor_length=-1
+        for full_name, sys_info in self.systematic_info.items():
+            if not sys_info.is_summed:
+                continue
+            
+            if sys_info.cor_length == -1:
+                # Extract observable name from full_name (format: 'sum_observable_name')
+                if full_name.startswith('sum_'):
+                    obs_name = full_name[4:]  # Remove 'sum_' prefix
+                    
+                    if obs_name in obs_bin_counts:
+                        actual_bins = obs_bin_counts[obs_name]
+                        logger.debug(f"  Resolved '{full_name}': cor_length -1 -> {actual_bins} bins")
+                        sys_info.cor_length = actual_bins
+                        n_resolved += 1
+                    else:
+                        logger.warning(f"  Could not find bin count for '{obs_name}', leaving cor_length=-1")
+            else:
+                n_already_set += 1
+        
+        logger.info(f"Bin count resolution complete:")
+        logger.info(f"  Resolved: {n_resolved}")
+        logger.info(f"  Already had explicit values: {n_already_set}")
+
+    def build_intra_observable_correlation_matrix(
+        self,
+        systematic_full_name: str,
+        n_bins: int
+    ) -> np.ndarray:
+        """
+        Build intra-observable correlation matrix for a systematic.
+        
+        TWO CASES:
+        1. Individual systematics: Returns identity matrix (placeholder)
+        - Always fully correlated within observable
+        - Actual correlation handled by outer product in covariance calculation
+        
+        2. Summed systematics: Returns correlation matrix using EXPONENTIAL DECAY
+        - C[i,j] = cor_strength * exp(-|i-j| / cor_length) for i ≠ j
+        - Smooth decay with characteristic length cor_length
+        
+        Args:
+            systematic_full_name: Full name of systematic (e.g., 'sum_observable_name')
+            n_bins: Number of bins in the observable
+        
+        Returns:
+            Correlation matrix C of shape (n_bins, n_bins)
+            
+        Example for sum with cor_length=2, cor_strength=0.8, n_bins=5:
+            Exponential decay: C[i,j] = 0.8 * exp(-|i-j|/2)
+            [[1.00, 0.49, 0.29, 0.18, 0.11],
+            [0.49, 1.00, 0.49, 0.29, 0.18],
+            [0.29, 0.49, 1.00, 0.49, 0.29],
+            [0.18, 0.29, 0.49, 1.00, 0.49],
+            [0.11, 0.18, 0.29, 0.49, 1.00]]
+        """
+        sys_info = self.systematic_info.get(systematic_full_name)
+        
+        if sys_info is None:
+            logger.warning(f"Systematic '{systematic_full_name}' not found, returning identity")
+            return np.eye(n_bins)
+        
+        if not sys_info.is_summed:
+            # Individual systematics: fully correlated (identity is placeholder)
+            # Actual correlation handled by outer product in covariance calculation
+            return np.eye(n_bins)
+        
+        # Summed systematic: use exponential decay correlation
+        cor_length = sys_info.cor_length
+        cor_strength = sys_info.cor_strength
+        
+        logger.debug(f"Building exponential correlation matrix for '{systematic_full_name}':")
+        logger.debug(f"  n_bins={n_bins}, cor_length={cor_length}, cor_strength={cor_strength}")
+        
+        # Check if cor_length still needs resolution
+        if cor_length == -1:
+            logger.warning(f"cor_length=-1 for '{systematic_full_name}' not yet resolved!")
+            logger.warning(f"Using full correlation (cor_length=n_bins) as fallback")
+            cor_length = n_bins
+        
+        # Build correlation matrix with exponential decay
+        C = np.zeros((n_bins, n_bins))
+        
+        for i in range(n_bins):
+            for j in range(n_bins):
+                if i == j:
+                    # Diagonal is always 1.0
+                    C[i, j] = 1.0
+                else:
+                    # Exponential decay: cor_strength * exp(-|i-j| / cor_length)
+                    distance = abs(i - j)
+                    C[i, j] = cor_strength * np.exp(-distance / cor_length)
+        
+        logger.debug(f"  Matrix shape: {C.shape}")
+        logger.debug(f"  Min off-diagonal correlation: {np.min(C[~np.eye(n_bins, dtype=bool)]):.6f}")
+        logger.debug(f"  Max off-diagonal correlation: {np.max(C[~np.eye(n_bins, dtype=bool)]):.6f}")
+        
+        return C
+
     def get_systematic_names_for_observable(self, observable_label: str) -> List[str]:
         """Get list of systematic full names for a given observable"""
         return self.observable_systematics.get(observable_label, [])
@@ -167,72 +458,134 @@ class SystematicCorrelationManager:
         return self.all_systematic_names.copy()
 
     def create_systematic_covariance_matrix(self, 
-                                          systematic_uncertainties: np.ndarray,
-                                          systematic_names: List[str],
-                                          n_features: int) -> np.ndarray:
+                                        systematic_uncertainties: np.ndarray,
+                                        systematic_names: List[str],
+                                        n_features: int) -> np.ndarray:
         """
-        Create systematic covariance matrix based on correlation structure.
+        Create systematic covariance matrix with two independent systems:
         
-        :param systematic_uncertainties: Array of shape (n_features, n_systematics)
-        :param systematic_names: List of systematic full names (should match self.all_systematic_names)
-        :param n_features: Total number of features
-        :return: Covariance matrix of shape (n_features, n_features)
+        System 1 - Individual systematics:
+            - Fully correlated within observable (all bins)
+            - Cross-observable correlation controlled by group tags
+            - Same tag → correlated across observables
+            - Different tag → uncorrelated across observables
+        
+        System 2 - Summed systematics:
+            - Intra-observable correlation via cor_length and cor_strength
+            - NO cross-observable correlation (each observable independent)
+        
+        Args:
+            systematic_uncertainties: Matrix of shape (n_features, n_systematics)
+                                    Each column is a systematic source
+            systematic_names: List of systematic names (must match columns)
+            n_features: Total number of features (bins) across all observables
+        
+        Returns:
+            Covariance matrix of shape (n_features, n_features)
         """
-        logger.debug("Creating systematic covariance matrix...")
+        logger.info("Creating systematic covariance matrix...")
+        logger.debug(f"  Input shape: {systematic_uncertainties.shape}")
+        logger.debug(f"  n_features: {n_features}, n_systematics: {len(systematic_names)}")
         
-        # Validate input
-        if systematic_names != self.all_systematic_names:
-            logger.warning("Systematic names don't match expected ordering")
+        # Initialize total covariance matrix
+        total_cov = np.zeros((n_features, n_features))
         
-        systematic_cov = np.zeros((n_features, n_features))
-        
-        # Process each systematic uncertainty
-        for sys_idx, sys_full_name in enumerate(systematic_names):
-            if sys_idx >= systematic_uncertainties.shape[1]:
-                logger.warning(f"Systematic {sys_full_name} index {sys_idx} exceeds uncertainty array size")
+        # PATH 1: Process individual systematics (grouped by correlation tag)
+        for group_tag, group_members in self.correlation_groups.items():
+            if not group_tag:  # Skip empty tags (these are for summed systematics)
                 continue
-                
-            sys_uncertainty = systematic_uncertainties[:, sys_idx]
-            sys_info = self.systematic_info.get(sys_full_name)
             
-            if sys_info is None:
-                logger.warning(f"No info found for {sys_full_name}, treating as uncorrelated")
-                systematic_cov += np.diag(sys_uncertainty**2)
-                continue
+            logger.debug(f"Processing correlation group '{group_tag}' with {len(group_members)} members")
+            
+            # Build covariance for all members in this group
+            # group_members is: [(obs_label, start_idx, end_idx, systematic_full_name), ...]
+            for obs1_label, start1, end1, sys1_name in group_members:
+                if sys1_name not in systematic_names:
+                    logger.warning(f"Systematic '{sys1_name}' not found in systematic_names")
+                    continue
                 
-            if sys_info.is_uncorrelated:
-                # Add as diagonal contribution
-                systematic_cov += np.diag(sys_uncertainty**2)
-                logger.debug(f"  {sys_full_name}: uncorrelated (diagonal)")
-            else:
-                # Find all features that should be correlated for this systematic
-                correlation_tag = sys_info.correlation_tag
-                correlated_feature_indices = []
+                sys1_idx = systematic_names.index(sys1_name)
+                sys1_uncertainties = systematic_uncertainties[start1:end1, sys1_idx]
                 
-                if correlation_tag in self.correlation_groups:
-                    for obs_label, start_idx, end_idx, group_sys_name in self.correlation_groups[correlation_tag]:
-                        # Check if this systematic applies to this observable
-                        if group_sys_name == sys_full_name:
-                            correlated_feature_indices.extend(range(start_idx, end_idx))
-                
-                if correlated_feature_indices:
-                    # Remove duplicates and sort
-                    correlated_feature_indices = sorted(set(correlated_feature_indices))
+                for obs2_label, start2, end2, sys2_name in group_members:
+                    if sys2_name not in systematic_names:
+                        continue
                     
-                    # Create correlation block for these features
-                    correlation_contribution = self._create_correlation_block(
-                        sys_uncertainty, correlated_feature_indices, n_features
-                    )
-                    systematic_cov += correlation_contribution
+                    sys2_idx = systematic_names.index(sys2_name)
+                    sys2_uncertainties = systematic_uncertainties[start2:end2, sys2_idx]
                     
-                    logger.debug(f"  {sys_full_name}: correlated across {len(correlated_feature_indices)} features")
-                else:
-                    # Fallback to diagonal if no correlation group found
-                    systematic_cov += np.diag(sys_uncertainty**2)
-                    logger.warning(f"  {sys_full_name}: no correlation group found, using diagonal")
+                    # Fully correlated: outer product
+                    # This handles both intra-observable (obs1 == obs2) and cross-observable (obs1 != obs2)
+                    cov_block = np.outer(sys1_uncertainties, sys2_uncertainties)
+                    total_cov[start1:end1, start2:end2] += cov_block
+                    
+                    if obs1_label == obs2_label and sys1_name == sys2_name:
+                        logger.debug(f"  Added intra-observable: {sys1_name} on {obs1_label}")
+                    else:
+                        logger.debug(f"  Added cross-observable: {sys1_name} ({obs1_label}) ↔ {sys2_name} ({obs2_label})")
         
-        logger.debug(f"Systematic covariance matrix completed, Frobenius norm: {np.linalg.norm(systematic_cov):.2e}")
-        return systematic_cov
+        # PATH 2: Process summed systematics (independent per observable)
+        for sys_full_name, sys_info in self.systematic_info.items():
+            if not sys_info.is_summed:
+                continue
+            
+            if sys_full_name not in systematic_names:
+                logger.warning(f"Summed systematic '{sys_full_name}' not found in systematic_names")
+                continue
+            
+            sys_idx = systematic_names.index(sys_full_name)
+            
+            # Find which observable this summed systematic belongs to
+            obs_found = False
+            for obs_label, sys_list in self.observable_systematics.items():
+                if sys_full_name not in sys_list:
+                    continue
+                
+                # Find the feature range for this observable
+                for start, end, obs_name in self._observable_ranges:
+                    if obs_name == obs_label:
+                        n_bins = end - start
+                        sys_uncertainties = systematic_uncertainties[start:end, sys_idx]
+                        
+                        # Build intra-observable correlation matrix
+                        C = self.build_intra_observable_correlation_matrix(sys_full_name, n_bins)
+                        
+                        # Add to covariance (only within observable, no cross-observable terms)
+                        cov_block = np.outer(sys_uncertainties, sys_uncertainties) * C
+                        total_cov[start:end, start:end] += cov_block
+                        
+                        logger.debug(f"  Added summed systematic: {sys_full_name} for {obs_label} "
+                                f"(cor_length={sys_info.cor_length}, cor_strength={sys_info.cor_strength})")
+                        obs_found = True
+                        break
+                
+                if obs_found:
+                    break
+            
+            if not obs_found:
+                logger.warning(f"Could not find observable range for summed systematic '{sys_full_name}'")
+        
+        # Handle uncorrelated systematics (diagonal only)
+        for sys_full_name, sys_info in self.systematic_info.items():
+            if not sys_info.is_uncorrelated:
+                continue
+            
+            if sys_full_name not in systematic_names:
+                continue
+            
+            sys_idx = systematic_names.index(sys_full_name)
+            sys_uncertainties = systematic_uncertainties[:, sys_idx]
+            
+            # Add as diagonal contribution only
+            total_cov += np.diag(sys_uncertainties ** 2)
+            logger.debug(f"  Added uncorrelated systematic: {sys_full_name} (diagonal only)")
+        
+        logger.info(f"Systematic covariance matrix created: shape {total_cov.shape}")
+        logger.debug(f"  Diagonal mean: {np.mean(np.diag(total_cov)):.6e}")
+        logger.debug(f"  Off-diagonal mean: {np.mean(total_cov - np.diag(np.diag(total_cov))):.6e}")
+        logger.debug(f"  Total variance: {np.trace(total_cov):.6e}")
+        
+        return total_cov
 
     def _create_correlation_block(self, 
                                 uncertainties: np.ndarray, 
@@ -321,7 +674,10 @@ class SystematicCorrelationManager:
                     'base_name': info.base_name,
                     'correlation_tag': info.correlation_tag,
                     'full_name': info.full_name,
-                    'is_uncorrelated': info.is_uncorrelated
+                    'is_summed': info.is_summed,
+                    'is_uncorrelated': info.is_uncorrelated,
+                    'cor_length': info.cor_length,
+                    'cor_strength': info.cor_strength
                 }
                 for full_name, info in self.systematic_info.items()
             },
@@ -380,11 +736,26 @@ class SystematicCorrelationManager:
             full_name_from_dict = str(info_dict['full_name'].item()) if isinstance(info_dict['full_name'], np.ndarray) else str(info_dict['full_name'])
             is_uncorrelated = bool(info_dict['is_uncorrelated'].item()) if isinstance(info_dict['is_uncorrelated'], np.ndarray) else bool(info_dict['is_uncorrelated'])
             
+            is_summed = info_dict.get('is_summed', False)
+            cor_length = info_dict.get('cor_length', -1)
+            cor_strength = info_dict.get('cor_strength', 1.0)
+
+            # Handle numpy arrays from HDF5
+            if isinstance(is_summed, np.ndarray):
+                is_summed = bool(is_summed.item())
+            if isinstance(cor_length, np.ndarray):
+                cor_length = int(cor_length.item())
+            if isinstance(cor_strength, np.ndarray):
+                cor_strength = float(cor_strength.item())
+
             manager.systematic_info[full_name_str] = SystematicInfo(
                 base_name=base_name,
                 correlation_tag=correlation_tag,
                 full_name=full_name_from_dict,
-                is_uncorrelated=is_uncorrelated
+                is_summed=is_summed,
+                is_uncorrelated=is_uncorrelated,
+                cor_length=cor_length,
+                cor_strength=cor_strength
             )
         
         # Restore other attributes with type conversion

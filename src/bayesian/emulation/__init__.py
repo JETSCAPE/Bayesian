@@ -11,12 +11,13 @@ A configuration class EmulationConfig provides simple access to emulation settin
 
 .. codeauthor:: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
 """
+
 from __future__ import annotations
 
-from bayesian.emulation.base import (  # noqa: F401
+from bayesian.emulation.interface import (  # noqa: F401
     BaseEmulatorSettings,
+    EmulationConfig,
     EmulatorSettings,
-    EmulatorOrganizationConfig,
     fit_emulators,
     predict,
 )

@@ -21,6 +21,7 @@ from typing import Any, ClassVar
 
 import attrs
 import numpy as np
+import numpy.typing as npt
 import sklearn.decomposition as sklearn_decomposition  # type: ignore[import-untyped]
 import sklearn.gaussian_process as sklearn_gaussian_process
 import sklearn.preprocessing as sklearn_preprocessing
@@ -191,6 +192,180 @@ def fit_emulator(config: SKLearnEmulatorSettings, analysis_settings: analysis.An
     output_dict["emulators"] = emulators
 
     return output_dict
+
+
+def predict(
+    parameters: npt.NDArray[np.float64],
+    results: dict[str, Any],
+    emulator_settings: EmulatorSettings,
+    emulator_cov_unexplained: npt.NDArray[np.float64] | None = None,
+) -> dict[str, npt.NDArray[np.float64]]:
+    """Construct dictionary of emulator predictions for each observable in an emulation group.
+
+    This function generally implements predict for a set of emulators where we do PCA beforehand.
+    However, enough of the details are specific to the sk_learn implementation, such that we can't
+    use it fully generically.
+
+    NOTE:
+        One can easily construct a dict of predictions with format emulator_predictions[observable_label]
+        from the returned matrix as follows (useful for plotting / troubleshooting):
+        ```python
+        observables = data_IO.read_dict_from_h5(config.output_dir, 'observables.h5', verbose=False)
+        emulator_predictions = data_IO.observable_dict_from_matrix(
+            emulator_central_value_reconstructed,
+            observables,
+            cov=emulator_cov_reconstructed,
+            validation_set=validation_set
+        )
+       ```
+
+    Args:
+        parameters: Array of parameter values (e.g. [tau0, c1, c2, ...]), with shape (n_samples, n_parameters).
+        results: Dictionary that stores emulator
+
+    Returns:
+        emulator_predictions: dictionary containing matrices of central values and covariance
+    """
+
+    # The emulators are stored as a list (one for each PC)
+    emulators = results["emulators"]
+
+    if emulator_cov_unexplained is None:
+        emulator_cov_unexplained = compute_emulator_cov_unexplained(emulator_settings, results)
+
+    # Get predictions (in PC space) from each emulator and concatenate them into a numpy array with shape (n_samples, n_PCs)
+    # Note: we just get the std rather than cov, since we are interested in the predictive uncertainty
+    #       of a given point, not the correlation between different sample points.
+    n_samples = parameters.shape[0]
+    emulator_central_value = np.zeros((n_samples, emulator_settings.n_pc))
+    emulator_cov = np.zeros((n_samples, emulator_settings.n_pc, emulator_settings.n_pc))
+
+    for i, emulator in enumerate(emulators):
+        try:
+            # Try to get full covariance matrix
+            y_central_value, y_cov = emulator.predict(parameters, return_cov=True)
+            emulator_central_value[:, i] = y_central_value
+
+            # y_cov should be shape (n_samples, n_samples) for the covariance between different parameter points
+            # We want the diagonal elements which give the variance for each parameter point
+            if y_cov.ndim == 2 and y_cov.shape[0] == n_samples and y_cov.shape[1] == n_samples:
+                # Extract diagonal variance for each sample
+                emulator_cov[:, i, i] = np.diag(y_cov)
+            else:
+                logger.warning(f"Unexpected covariance shape from emulator {i}: {y_cov.shape}")
+                emulator_cov[:, i, i] = np.diag(y_cov) if y_cov.ndim == 2 else y_cov
+
+        except (TypeError, ValueError) as e:
+            # Fallback to standard deviation approach if return_cov fails
+            logger.warning(f"Failed to get covariance from emulator {i}, falling back to std: {e}")
+            y_central_value, y_std = emulator.predict(parameters, return_std=True)
+            emulator_central_value[:, i] = y_central_value
+            emulator_cov[:, i, i] = y_std**2
+
+    assert emulator_cov.shape == (n_samples, emulator_settings.n_pc, emulator_settings.n_pc)
+
+    # Reconstruct the physical space from the PCs, and invert preprocessing.
+    # Note we use array broadcasting to calculate over all samples.
+    pca = results["PCA"]["pca"]
+    scaler = results["PCA"]["scaler"]
+    emulator_central_value_reconstructed_scaled = emulator_central_value.dot(
+        pca.components_[: emulator_settings.n_pc, :]
+    )
+    emulator_central_value_reconstructed = scaler.inverse_transform(emulator_central_value_reconstructed_scaled)
+
+    # Propagate uncertainty through the linear transformation back to feature space.
+    # Note that for a vector f = Ax, the covariance matrix of f is C_f = A C_x A^T.
+    #   (see https://en.wikipedia.org/wiki/Propagation_of_uncertainty)
+    #   (Note also that even if C_x is diagonal, C_f will not be)
+    # In our case, we have Y[i].T = S*Y_PCA[i].T for each point i in parameter space, where
+    #    Y[i].T is a column vector of features -- shape (n_features,)
+    #    Y_PCA[i].T is a column vector of corresponding PCs -- shape (n_pc,)
+    #    S is the transfer matrix described above -- shape (n_features, n_pc)
+    # So C_Y[i] = S * C_Y_PCA[i] * S^T.
+    # Note: should be equivalent to: https://github.com/jdmulligan/STAT/blob/master/src/emulator.py#L145
+    # TODO: one can make this faster with broadcasting/einsum
+    # TODO: NOTE-STAT: Compare this more carefully with STAT L286 and on.
+    n_features = pca.components_.shape[1]
+    S = pca.components_.T[:, : emulator_settings.n_pc]
+    emulator_cov_reconstructed_scaled = np.zeros((n_samples, n_features, n_features))
+    for i_sample in range(n_samples):
+        emulator_cov_reconstructed_scaled[i_sample] = S.dot(emulator_cov[i_sample].dot(S.T))
+    assert emulator_cov_reconstructed_scaled.shape == (n_samples, n_features, n_features)
+
+    # Include predictive variance due to truncated PCs.
+    # See comments in mcmc.py for further details.
+    for i_sample in range(n_samples):
+        emulator_cov_reconstructed_scaled[i_sample] += emulator_cov_unexplained / n_samples
+
+    # Propagate uncertainty: inverse preprocessing
+    # We only need to undo the unit variance scaling, since the shift does not affect the covariance matrix.
+    # We can do this by computing an outer product (i.e. product of each pairwise scaling),
+    #   and multiplying each element of the covariance matrix by this.
+    scale_factors = scaler.scale_
+    emulator_cov_reconstructed = emulator_cov_reconstructed_scaled * np.outer(scale_factors, scale_factors)
+
+    # Return the stacked matrices:
+    #   Central values: (n_samples, n_features)
+    #   Covariances: (n_samples, n_features, n_features)
+    emulator_predictions = {}
+    emulator_predictions["central_value"] = emulator_central_value_reconstructed
+    emulator_predictions["cov"] = emulator_cov_reconstructed
+
+    return emulator_predictions
+
+
+def compute_additional_covariance_contributions(
+    emulator_settings: EmulatorSettings, emulator_result: dict[str, Any]
+) -> npt.NDArray[np.float64]:
+    """Compute additional contributions to the covariance.
+
+    Args:
+        emulator_settings: Emulator settings.
+        emulator_result: Emulator training results.
+    Returns:
+        Unexplained covariance
+    """
+    return compute_emulator_cov_unexplained(emulator_settings=emulator_settings, emulator_result=emulator_result)
+
+
+def compute_emulator_cov_unexplained(
+    emulator_settings: EmulatorSettings, emulator_result: dict[str, Any]
+) -> npt.NDArray[np.float64]:
+    """Compute the predictive variance due to PC truncation, for a given emulator.
+
+    We can do this by decomposing the original covariance in feature space:
+      C_Y = S D^2 S^T
+          = S_{<=n_pc} D^2_{<=n_pc} S_{<=n_pc}^T + S_{>n_pc} D^2_{>n_pc} S_{>n_pc}^T
+    In general, we want to estimate the covariance as a function of theta.
+    We can do this for the first term by estimating it with the emulator covariance constructed above,
+      as a function of theta.
+    We can't do this with the second term, since we didn't emulate it -- so we estimate it,
+      treating it as independent of theta, and add it to the emulator covariance:
+        Sigma_unexplained = 1/n_samples * S_{>n_pc} D^2_{>n_pc} S_{>n_pc}^T,
+      where we will include the 1/n_samples factor to account for the fact that we are estimating the covariance from a set of samples.
+    See eqs 21-22 of https://arxiv.org/pdf/2102.11337.pdf
+    TODO: double check this (and compare to https://github.com/jdmulligan/STAT/blob/master/src/emulator.py#L145)
+
+    We will generally pre-compute this once in the MC sampling to save time, although we define this function
+    here to allow us to re-compute it as needed if it is not pre-computed (e.g. when plotting).
+
+    NOTE:
+        This is fairly generic functionality for PCA, so it could be ported to other PCA methods.
+
+    Args:
+        emulator_settings: Emulator settings.
+        emulator_result: Emulator training results.
+    Returns:
+        Unexplained covariance
+    """
+    # TODO: NOTE-STAT: Compare this more carefully with STAT L145 and on.
+    pca: sklearn_decomposition.PCA = emulator_result["PCA"]["pca"]
+    S_unexplained = pca.components_.T[:, emulator_settings.n_pc :]
+    D_unexplained = np.diag(pca.explained_variance_[emulator_settings.n_pc :])
+    emulator_cov_unexplained = S_unexplained.dot(D_unexplained.dot(S_unexplained.T))
+
+    # NOTE-STAT: bayesian-inference does not include a small term for numerical stability
+    return emulator_cov_unexplained  # type: ignore[no-any-return] # noqa: RET504
 
 
 @attrs.define

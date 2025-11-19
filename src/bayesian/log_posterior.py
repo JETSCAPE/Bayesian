@@ -41,6 +41,11 @@ def initialize_pool_variables(local_min, local_max, local_emulation_config, loca
     - Store in global variable for efficient reuse during MCMC
     """
 
+    # Add this at the very beginning
+    logger.info("=== INITIALIZE_POOL_VARIABLES CALLED ===")
+    logger.info(f"Experimental results keys: {list(local_experimental_results.keys())}")
+    logger.info(f"Has external_covariance: {'external_covariance' in local_experimental_results}")
+
     global g_min  # noqa: PLW0603
     global g_max  # noqa: PLW0603
     global g_emulation_config  # noqa: PLW0603
@@ -57,7 +62,25 @@ def initialize_pool_variables(local_min, local_max, local_emulation_config, loca
 
     # NEW: Calculate systematic covariance matrix once during initialization
     # This is efficient because systematic covariance doesn't depend on parameter values
-    if 'correlation_manager' in g_experimental_results:
+
+    # Check for external covariance first (expert mode)
+    if 'external_covariance' in g_experimental_results:
+        logger.info("External covariance mode: skipping systematic covariance construction")
+        g_systematic_covariance = None  # Not used in external mode
+
+        # DEBUG: Check external covariance properties
+        ext_cov = g_experimental_results['external_covariance']
+        logger.info(f"External covariance shape: {ext_cov.shape}")
+        logger.info(f"External covariance trace: {np.trace(ext_cov):.6e}")
+        logger.info(f"External covariance min/max: {np.min(ext_cov):.6e} / {np.max(ext_cov):.6e}")
+        
+        # Check if positive definite
+        eigenvals = np.linalg.eigvals(ext_cov)
+        logger.info(f"External covariance eigenvalues: min={np.min(eigenvals):.6e}, max={np.max(eigenvals):.6e}")
+        if np.min(eigenvals) <= 0:
+            logger.error("External covariance is NOT positive definite!")
+        
+    elif 'correlation_manager' in g_experimental_results:
         logger.info("Calculating systematic covariance matrix for MCMC...")
         correlation_manager = g_experimental_results['correlation_manager']
         systematic_uncertainties = g_experimental_results['y_err_syst']
@@ -68,6 +91,7 @@ def initialize_pool_variables(local_min, local_max, local_emulation_config, loca
             systematic_uncertainties, systematic_names, n_features
         )
         logger.info(f"Systematic covariance matrix shape: {g_systematic_covariance.shape}")
+        
     else:
         logger.info("No correlation manager found - using diagonal systematic uncertainties")
         # Fallback: create diagonal systematic covariance if available
@@ -82,11 +106,6 @@ def initialize_pool_variables(local_min, local_max, local_emulation_config, loca
             # No systematic uncertainties
             n_features = len(g_experimental_results['y'])
             g_systematic_covariance = np.zeros((n_features, n_features))
-
-    logger.info(f"Experimental results keys: {list(g_experimental_results.keys())}")
-    logger.info(f"Has correlation manager: {'correlation_manager' in g_experimental_results}")
-    if 'y_err_syst' in g_experimental_results:
-        logger.info(f"Systematic uncertainties shape: {g_experimental_results['y_err_syst'].shape}")
 
 
 #---------------------------------------------------------------
@@ -146,12 +165,23 @@ def log_posterior(X, *, set_to_infinite_outside_bounds: bool = True) -> npt.NDAr
         # Construct the covariance matrix
         # NOTE-STAT TODO: include full experimental data covariance matrix -- currently we only include uncorrelated data uncertainty
         #-------------------------
+        # Construct the covariance matrix
         covariance_matrix = np.zeros((n_samples, n_features, n_features))
         covariance_matrix += emulator_predictions['cov']
-        covariance_matrix += np.diag(data_y_err**2)
 
-        # NEW: Add systematic covariance matrix (same for all parameter points)
-        covariance_matrix += g_systematic_covariance[np.newaxis, :, :]
+        # Add experimental uncertainty based on mode
+        if 'external_covariance' in g_experimental_results:
+            # MODE 1: External covariance (expert mode)
+            covariance_matrix += g_experimental_results['external_covariance'][np.newaxis, :, :]
+
+            if np.any(~np.isfinite(covariance_matrix)):
+                logger.error("Non-finite values in covariance matrix!")
+        else:
+            # MODE 2 & 3: Standard mode (stat + sys)
+            covariance_matrix += np.diag(data_y_err**2)
+            # Add systematic covariance matrix (same for all parameter points)
+            if g_systematic_covariance is not None:
+                covariance_matrix += g_systematic_covariance[np.newaxis, :, :]
         
         # Compute log likelihood at each point in the sample
         # We take constant priors, so the log-likelihood is just the log-posterior

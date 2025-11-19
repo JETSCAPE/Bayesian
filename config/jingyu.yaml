@@ -2,13 +2,13 @@
 #-------------------------------------------
 # General parameters
 
-output_dir: '/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/20230116_20251106_sum/'
+output_dir: '/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/20230116_20251106_external/'
 
 initialize_observables: True
 preprocess_input_data: True
 fit_emulators: True
 run_mcmc: True
-run_closure_tests: True
+run_closure_tests: False
 
 plot:
   input_data: True
@@ -16,8 +16,8 @@ plot:
   mcmc: True
   covariance: True
   qhat: True
-  closure_tests: True
-  across_analyses: True
+  closure_tests: False
+  across_analyses: False
 
 debug_level: 0
 
@@ -165,9 +165,9 @@ analysis_hadron_base: &analysis_hadron
   <<: *model_base
   plot_panel_shapes: [[3,3], [3,3]]
 
-
 analyses:
   analysis_jet:
+    external_covariance_file: 'Data/external_covariance_test.txt'
     parameters:
       preprocessing:
         <<: *default_preprocessing_parameters
@@ -178,10 +178,10 @@ analyses:
           n_pc: 5
           observable_list:
             - observable: '5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10'
-              sys_data: ['sum']
+              #sys_data: ['sum:9999:1']
               #sys_data: ['sys_jec:alice', 'sys_taa:5020']
             - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.2__0-10'
-              sys_data: ['sum']
+              #sys_data: ['sum:9999:1']
               #sys_data: ['sys_jec:cms', 'sys_taa:5020']
       mcmc:
         <<: *default_mcmc_parameters

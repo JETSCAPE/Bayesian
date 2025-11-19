@@ -165,11 +165,30 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
     # Read experimental data
     data_dir = os.path.join(table_dir, 'Data')
 
-    parsed_observables, correlation_manager = _parse_config_observables(analysis_config)
+    parsed_observables, correlation_manager, external_cov_file = _parse_config_observables(analysis_config)
+    logger.info(f"DEBUG: _parse_config_observables returned external_cov_file = {external_cov_file}")
 
     systematic_config_map = {}
     for obs_name, sys_data_list, sys_theory_list in parsed_observables:
         systematic_config_map[obs_name] = (sys_data_list, sys_theory_list)
+
+    if external_cov_file:
+        logger.info(f"DEBUG: external_cov_file = {external_cov_file}")
+        external_cov_path = os.path.join(table_dir, external_cov_file)
+        logger.info(f"DEBUG: external_cov_path = {external_cov_path}")
+        external_cov = _read_external_covariance(external_cov_path)
+        logger.info(f"DEBUG: external_cov is None? {external_cov is None}")
+        
+        if external_cov is not None:
+            logger.info(f"DEBUG: About to add external covariance to observables dict")
+            logger.info(f"DEBUG: external_cov shape: {external_cov.shape}")
+            observables['external_covariance'] = external_cov
+            logger.info(f"DEBUG: Added! Keys in observables: {list(observables.keys())}")
+            logger.info(f"Loaded external covariance: shape {external_cov.shape}")
+        else:
+            raise ValueError(f"Failed to load external covariance from {external_cov_path}")
+    else:
+        logger.info("DEBUG: external_cov_file is None or False!")
 
     if correlation_manager.get_all_systematic_names():
         logger.info(f"Adding correlation manager with {len(correlation_manager.get_all_systematic_names())} systematics")
@@ -178,6 +197,11 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
         logger.info("No systematic correlations found in config")
 
     for filename in os.listdir(data_dir):
+        # Skip files that don't match the expected Data file pattern
+        if not filename.startswith('Data__'):
+            logger.debug(f"Skipping non-data file in Data directory: {filename}")
+            continue
+
         if _accept_observable(analysis_config, filename):
 
             # ORIGINAL: Read standard data
@@ -363,7 +387,7 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
     [logger.info(f'Accepted observable {s}') for s in sorted_observable_list_from_dict(observables['Prediction'])]
 
     try:
-        parsed_observables, correlation_manager = _parse_config_observables(analysis_config)
+        parsed_observables, correlation_manager, external_cov_file = _parse_config_observables(analysis_config)
         
         if correlation_manager.get_all_systematic_names():
             logger.info(f"Adding correlation manager with {len(correlation_manager.get_all_systematic_names())} systematics")
@@ -375,7 +399,7 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
     except Exception as e:
         logger.warning(f"Could not create correlation manager: {e}")
         logger.info("Proceeding without systematic correlations")
-    
+
     return observables
 
 ####################################################################################################################
@@ -1052,6 +1076,42 @@ def _parse_data_systematic_header(filepath):
 
     return systematic_columns
 
+def _read_external_covariance(filepath):
+    """
+    Read external covariance matrix from file.
+    
+    Expert feature - minimal validation, user is responsible for correctness.
+    
+    :param str filepath: Path to covariance matrix file
+    :return: np.ndarray or None
+    """
+    try:
+        logger.info(f"Reading external covariance from {filepath}")
+        cov = np.loadtxt(filepath)
+        
+        # Basic validation
+        if cov.ndim != 2:
+            raise ValueError(f"Covariance must be 2D, got shape {cov.shape}")
+        
+        if cov.shape[0] != cov.shape[1]:
+            raise ValueError(f"Covariance must be square, got shape {cov.shape}")
+        
+        # Optional warnings (not errors - expert feature)
+        if not np.allclose(cov, cov.T, rtol=1e-5):
+            logger.warning("External covariance is not symmetric")
+        
+        eigenvals = np.linalg.eigvalsh(cov)
+        if np.any(eigenvals < -1e-8):
+            logger.warning(f"External covariance has negative eigenvalues: min={np.min(eigenvals):.2e}")
+        
+        logger.info(f"External covariance loaded: shape={cov.shape}, trace={np.trace(cov):.2e}")
+        
+        return cov
+        
+    except Exception as e:
+        logger.error(f"Failed to read external covariance: {e}")
+        return None
+
 
 def _read_data_systematics(filepath, systematic_columns):
     """
@@ -1114,15 +1174,22 @@ def _read_theory_systematics(table_dir, model, observable_name, theory_systemati
 
 def _parse_config_observables(analysis_config):
     """
-    NEW FUNCTION: Parse observable configuration for systematic support.
-    Handles both old and new formats.
+    Parse observable configuration for systematic support.
+    Handles both old and new formats, and detects external covariance mode.
     
     :param analysis_config: Analysis configuration dictionary
-    :return: Tuple of (parsed_observables_list, correlation_manager)
+    :return: Tuple of (parsed_observables_list, correlation_manager, external_cov_file)
     """
     correlation_manager = SystematicCorrelationManager()
     
-    # Parse observables similar to existing _parse_config_observables
+    # Check for external covariance file
+    external_cov_file = analysis_config.get('external_covariance_file', None)
+    
+    if external_cov_file:
+        logger.info(f"External covariance mode enabled: {external_cov_file}")
+        logger.info("Systematic uncertainties (sys_data) will be ignored")
+    
+    # Parse observables similar to existing implementation
     parsed_observables = []
     
     try:
@@ -1136,7 +1203,8 @@ def _parse_config_observables(analysis_config):
                 elif isinstance(obs_config, dict) and 'observable' in obs_config:
                     # New format with correlation tags
                     obs_name = obs_config['observable']
-                    sys_data = obs_config.get('sys_data', [])
+                    # Ignore sys_data if external covariance is used
+                    sys_data = [] if external_cov_file else obs_config.get('sys_data', [])
                     sys_theory = obs_config.get('sys_theory', [])
                     parsed_observables.append((obs_name, sys_data, sys_theory))
                 else:
@@ -1145,15 +1213,17 @@ def _parse_config_observables(analysis_config):
     except KeyError as e:
         logger.error(f"Config structure issue: {e}")
         logger.error("Expected structure: analysis_config['parameters']['emulators'][group]['observable_list']")
-        return parsed_observables, correlation_manager  # Return empty correlation manager
+        return parsed_observables, correlation_manager, None
     
-    # Parse the correlation configuration
-    correlation_manager.parse_configuration(parsed_observables)
+    # Parse the correlation configuration (only if no external covariance)
+    if not external_cov_file:
+        correlation_manager.parse_configuration(parsed_observables)
+        logger.info(f"Created correlation manager with {len(correlation_manager.get_all_systematic_names())} systematics")
+    else:
+        logger.info("Skipping systematic correlation parsing (external covariance mode)")
     
-    logger.info(f"Created correlation manager with {len(correlation_manager.get_all_systematic_names())} systematics")
-    
-    # Return BOTH the parsed observables list (for existing code) AND the correlation manager
-    return parsed_observables, correlation_manager
+    # Return BOTH the parsed observables list, correlation manager, AND external_cov_file
+    return parsed_observables, correlation_manager, external_cov_file
 
 
 def _filter_systematics_by_config(systematic_data, config_systematics):
@@ -1222,6 +1292,78 @@ def _sum_systematics_quadrature(systematics_dict: Dict[str, np.ndarray]) -> np.n
     
     return summed
 
+def _data_array_from_h5_external_cov(observables, external_cov, pseudodata_index, observable_filter):
+    """
+    Load data array when using external covariance matrix (expert mode).
+    
+    :param observables: Observables dictionary from h5 file
+    :param external_cov: External covariance matrix
+    :param pseudodata_index: Index for closure test (-1 for experimental data)
+    :param observable_filter: Optional filter
+    :return: Data structure with external covariance
+    """
+    # Sort observables
+    sorted_observable_list = sorted_observable_list_from_dict(observables, observable_filter=observable_filter)
+    
+    if not sorted_observable_list:
+        logger.warning("No observables passed the filter.")
+        return {'y': np.array([]), 'y_err_stat': np.array([]), 'external_covariance': np.array([[]])}
+    
+    # Get data dictionary
+    if pseudodata_index < 0:
+        data_dict = observables['Data']
+    else:
+        # Handle closure test data (if needed)
+        data_dict = observables['Prediction_validation']
+        logger.warning("External covariance with closure test not fully tested")
+    
+    # Initialize data structure
+    data = {
+        'y': [],
+        'y_err_stat': [],  # Placeholder (not used with external cov)
+        'y_err_syst': np.array([]).reshape(0, 0),  # Empty
+        'systematic_names': [],  # Empty
+        'observable_ranges': [],
+        'external_covariance': external_cov
+    }
+    
+    current_feature_index = 0
+    
+    # Process each observable
+    for observable_label in sorted_observable_list:
+        y_values = data_dict[observable_label]['y']
+        n_bins = len(y_values)
+        
+        # Track feature range
+        start_idx = current_feature_index
+        end_idx = current_feature_index + n_bins
+        data['observable_ranges'].append((start_idx, end_idx, observable_label))
+        
+        # Append central values
+        data['y'].extend(y_values)
+        data['y_err_stat'].extend([0.0] * n_bins)  # Placeholder
+        
+        current_feature_index = end_idx
+    
+    # Convert to numpy arrays
+    data['y'] = np.array(data['y'])
+    data['y_err_stat'] = np.array(data['y_err_stat'])
+    
+    # Validate external covariance dimensions
+    n_features = len(data['y'])
+    if external_cov.shape != (n_features, n_features):
+        raise ValueError(
+            f"External covariance shape {external_cov.shape} doesn't match "
+            f"n_features={n_features} from observables"
+        )
+    
+    logger.info(f"Data loading complete (external covariance mode):")
+    logger.info(f"  Features: {n_features}")
+    logger.info(f"  Observables: {len(data['observable_ranges'])}")
+    logger.info(f"  External covariance: {external_cov.shape}")
+    
+    return data
+
 def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1, 
                                observable_filter=None):
     """
@@ -1232,6 +1374,15 @@ def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1,
     
     # Load observables dict (which should contain correlation manager if available)
     observables = read_dict_from_h5(output_dir, filename, verbose=False)
+
+    # CHECK FOR EXTERNAL COVARIANCE FIRST (expert mode)
+    external_cov = observables.get('external_covariance', None)
+    
+    if external_cov is not None:
+        logger.info("External covariance mode: building data without systematics")
+        return _data_array_from_h5_external_cov(observables, external_cov, pseudodata_index, observable_filter)
+
+    # Check for correlation manager (standard mode with systematics)    
     correlation_manager_data = observables.get('_correlation_manager', None)
     
     # Deserialize correlation manager if it exists
@@ -1324,6 +1475,10 @@ def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1,
                 base_sys_name, _ = sys_full_name.split(':', 1)
             else:
                 base_sys_name = sys_full_name
+
+            # For summed systematics, base name is always 'sum'
+            if base_sys_name.startswith('sum_'):
+                base_sys_name = 'sum'
             
             # Find this systematic in the global list
             if sys_full_name in all_systematic_names:
@@ -1368,4 +1523,8 @@ def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1,
     for warning in warnings:
         logger.warning(f"  Correlation validation: {warning}")
     
+    if external_cov is not None:
+        data['external_covariance'] = external_cov
+        logger.info("Added external covariance to experimental data")
+
     return data

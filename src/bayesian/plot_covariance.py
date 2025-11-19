@@ -119,52 +119,57 @@ def plot_all_covariance_components(
     
     logger.info(f"Covariance plots saved to {plot_dir}")
 
-
 def _extract_covariance_components(
     experimental_data: Dict,
     emulator_predictions: Dict
 ) -> Dict[str, np.ndarray]:
-    """
-    Extract and compute all covariance matrix components.
-    
-    :param experimental_data: Experimental data dictionary from data_array_from_h5
-    :param emulator_predictions: Emulator predictions dictionary
-    :return: Dictionary of covariance matrices
-    """
     
     n_features = len(experimental_data['y'])
     cov_components = {}
     
-    # 1. Statistical uncertainty covariance (diagonal)
-    stat_errors = np.array(experimental_data['y_err_stat'])
-    cov_components['statistical'] = np.diag(stat_errors**2)
-    logger.info(f"Statistical covariance: {cov_components['statistical'].shape}, diagonal with {np.sum(stat_errors**2):.2e} total variance")
-    
-    # 2. Systematic uncertainty covariances by group
-    if 'correlation_manager' in experimental_data:
-        correlation_manager = experimental_data['correlation_manager']
-        systematic_uncertainties = experimental_data['y_err_syst']
-        systematic_names = experimental_data['systematic_names']
+    # Check if using external covariance (expert mode)
+    if 'external_covariance' in experimental_data:
+        logger.info("Using external covariance for plotting")
+        cov_components['external'] = experimental_data['external_covariance']
+        logger.info(f"External covariance: shape={cov_components['external'].shape}, "
+                   f"total variance {np.trace(cov_components['external']):.2e}")
         
-        # Total systematic covariance
-        cov_components['systematic_total'] = correlation_manager.create_systematic_covariance_matrix(
-            systematic_uncertainties, systematic_names, n_features
-        )
-        
-        # Individual systematic group covariances
-        cov_components.update(_compute_systematic_group_covariances(
-            correlation_manager, systematic_uncertainties, systematic_names, n_features
-        ))
-        
-        logger.info(f"Systematic total covariance: {cov_components['systematic_total'].shape}, "
-                   f"total variance {np.trace(cov_components['systematic_total']):.2e}")
-    else:
-        logger.warning("No correlation manager found - creating zero systematic covariance")
+        # In external mode, don't compute stat/sys separately
+        cov_components['statistical'] = np.zeros((n_features, n_features))
         cov_components['systematic_total'] = np.zeros((n_features, n_features))
+        
+    else:
+        # Standard mode: stat + sys
+        # 1. Statistical uncertainty covariance (diagonal)
+        stat_errors = np.array(experimental_data['y_err_stat'])
+        cov_components['statistical'] = np.diag(stat_errors**2)
+        logger.info(f"Statistical covariance: {cov_components['statistical'].shape}, "
+                   f"diagonal with {np.sum(stat_errors**2):.2e} total variance")
+        
+        # 2. Systematic uncertainty covariances by group
+        if 'correlation_manager' in experimental_data:
+            correlation_manager = experimental_data['correlation_manager']
+            systematic_uncertainties = experimental_data['y_err_syst']
+            systematic_names = experimental_data['systematic_names']
+            
+            # Total systematic covariance
+            cov_components['systematic_total'] = correlation_manager.create_systematic_covariance_matrix(
+                systematic_uncertainties, systematic_names, n_features
+            )
+            
+            # Individual systematic group covariances
+            cov_components.update(_compute_systematic_group_covariances(
+                correlation_manager, systematic_uncertainties, systematic_names, n_features
+            ))
+            
+            logger.info(f"Systematic total covariance: {cov_components['systematic_total'].shape}, "
+                       f"total variance {np.trace(cov_components['systematic_total']):.2e}")
+        else:
+            logger.warning("No correlation manager found - creating zero systematic covariance")
+            cov_components['systematic_total'] = np.zeros((n_features, n_features))
     
-    # 3. Emulator uncertainty covariance
+    # 3. Emulator uncertainty covariance (always computed)
     if emulator_predictions and 'cov' in emulator_predictions:
-        # Take the first sample's covariance (since we evaluated at single point)
         cov_components['emulator'] = emulator_predictions['cov'][0]
         logger.info(f"Emulator covariance: {cov_components['emulator'].shape}, "
                    f"total variance {np.trace(cov_components['emulator']):.2e}")
@@ -173,17 +178,24 @@ def _extract_covariance_components(
         cov_components['emulator'] = np.zeros((n_features, n_features))
     
     # 4. Total combined covariance
-    cov_components['total'] = (
-        cov_components['statistical'] + 
-        cov_components['systematic_total'] + 
-        cov_components['emulator']
-    )
+    if 'external_covariance' in experimental_data:
+        # External mode: external + emulator
+        cov_components['total'] = (
+            cov_components['external'] + 
+            cov_components['emulator']
+        )
+    else:
+        # Standard mode: stat + sys + emulator
+        cov_components['total'] = (
+            cov_components['statistical'] + 
+            cov_components['systematic_total'] + 
+            cov_components['emulator']
+        )
     
     logger.info(f"Total covariance: {cov_components['total'].shape}, "
                f"total variance {np.trace(cov_components['total']):.2e}")
     
     return cov_components
-
 
 def _compute_systematic_group_covariances(
     correlation_manager: SystematicCorrelationManager,

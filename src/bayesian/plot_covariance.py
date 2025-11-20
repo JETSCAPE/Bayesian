@@ -624,35 +624,20 @@ def _get_emulator_predictions(config: mcmc.MCMCConfig, parameter_point: np.ndarr
     try:
         from bayesian.emulation import base
         
-        print("DEBUG: Starting emulator predictions")
-        print(f"DEBUG: Parameter point shape: {parameter_point.shape}")
-        print(f"DEBUG: Parameter point values: {parameter_point}")
-        
         # Step 1: Try to create emulation config
-        print("DEBUG: Creating emulation config...")
         emulation_config = base.EmulatorOrganizationConfig.from_config_file(
             analysis_name=config.analysis_name,
             parameterization=config.parameterization,
             config_file=config.config_file,
             analysis_config=config.analysis_config
         )
-        print(f"DEBUG: Emulation config created with {len(emulation_config.emulation_groups_config)} groups")
-        print(f"DEBUG: Groups: {list(emulation_config.emulation_groups_config.keys())}")
         
         # Step 2: Try to load emulation results
-        print("DEBUG: Loading emulation results...")
         emulation_results = emulation_config.read_all_emulator_groups()
-        print(f"DEBUG: Loaded emulation results for: {list(emulation_results.keys())}")
-        
-        if not emulation_results:
-            print("DEBUG: ERROR - No emulation results loaded!")
-            return {}
         
         # Step 3: Try prediction
-        print("DEBUG: Making prediction...")
         if parameter_point.ndim == 1:
             parameter_point = parameter_point.reshape(1, -1)
-        print(f"DEBUG: Reshaped parameter point: {parameter_point.shape}")
         
         predictions = base.predict(
             parameter_point, 
@@ -660,23 +645,9 @@ def _get_emulator_predictions(config: mcmc.MCMCConfig, parameter_point: np.ndarr
             emulation_group_results=emulation_results
         )
         
-        print(f"DEBUG: Predictions type: {type(predictions)}")
-        print(f"DEBUG: Predictions keys: {predictions.keys() if predictions else 'None/Empty'}")
-        
-        if predictions and 'cov' in predictions:
-            print(f"DEBUG: Covariance shape: {predictions['cov'].shape}")
-            print(f"DEBUG: Covariance max: {np.max(np.abs(predictions['cov'])):.6e}")
-            print(f"DEBUG: Covariance trace: {np.trace(predictions['cov'][0]):.6e}")
-        else:
-            print("DEBUG: ERROR - No covariance in predictions!")
-            print(f"DEBUG: Available keys: {list(predictions.keys()) if predictions else 'No predictions'}")
-        
         return predictions
         
     except Exception as e:
-        print(f"DEBUG: EXCEPTION in emulator predictions: {e}")
-        import traceback
-        print(f"DEBUG: TRACEBACK: {traceback.format_exc()}")
         return {}
 
 def _save_covariance_matrices(cov_components: Dict[str, np.ndarray], plot_dir: Path) -> None:

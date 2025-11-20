@@ -14,37 +14,98 @@ The main functionalities are:
  - observable_label_to_keys() -- convert observable string label to list of subobservables strings
  - sorted_observable_list_from_dict() -- get sorted list of observable_label keys, using fixed ordering convention that we enforce
 
-authors: J.Mulligan, R.Ehlers
+codeauthor: J.Mulligan
+codeauthor: R.Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
 
-SYSTEMATIC UNCERTAINTY INCLUSION (August 2025):
-================================================================================
-The following add systematic uncertainty support with correlation structure:
+SYSTEMATIC UNCERTAINTY SUPPORT (August - November 2025, Jingyu Zhang):
+==============================================================================
+This module now supports multiple approaches to systematic uncertainties:
 
-1. Enhanced data structure for systematic uncertainties:
-   - Renamed 'y_err' -> 'y_err_stat' for clarity between statistical and systematic uncertainties
-   - Added 'systematics' dict to both Data and Prediction structures
-   - Structure: observables['Data'][obs]['systematics']['jec'] = [uncertainty_values]
+FOUR OPERATIONAL MODES:
 
-2. Configuration parsing for systematic correlations:
-   - Support for new config format: {'observable': name, 'sys_data': ['jec:alice', 'taa:5020']}
-   - Correlation tags (e.g., 'alice', '5020') define how systematics correlate across observables
-   - Backward compatible with old config format (simple observable name strings)
+1. **Fallback Mode - No Systematics**
+   - Code path: data_array_from_h5_nosys()
+   - Only statistical uncertainties (diagonal covariance)
+   - Physics: Incorrect - completely ignores systematic uncertainties
+   - Status: Kept only for backward compatibility
+   - When active: No correlation manager or systematic config present
 
-3. Data file reading enhancements:
-   - Parse systematic columns from Data files (s_jec, s_taa, etc.)
-   - Filter systematics based on configuration requirements
-   - Maintain consistency between config expectations and data file contents
+2. **Legacy Mode - Summed Systematics** (Original STAT repo approach)
+   - Configuration: sum:cor_length:cor_strength
+   - Sums multiple systematic sources in quadrature: √(σ₁² + σ₂² + ... + σₙ²)
+   - Applies exponential decay correlation within observable only
+   - Correlation parameters:
+     * cor_length: Correlation length in bins (-1 = fully correlated within observable)
+     * cor_strength: Correlation strength [0, 1]
+   - Recommended for global analyses
+   - When active: Config uses 'sum:...' format
 
-4. Integration with SystematicCorrelationManager:
-   - Store correlation manager in observables dict for later use
-   - Preserve correlation information through preprocessing steps
+3. **Advanced Mode - Individual Systematics with Group Tags** (Recommended)
+   - Configuration: name:group_tag (e.g., 'jec:alice', 'taa:global', 'tracking:uncor')
+   - Tracks individual systematic sources separately
+   - Group tags define cross-observable correlation structure:
+     * Same tag → fully correlated across observables
+     * Different tags → uncorrelated
+     * Special tag 'uncor' → diagonal (uncorrelated) contribution
+   - Physics: Correct treatment for precision measurements
+   - Enables proper handling of global systematics (TAA, luminosity, etc.)
+   - Flexible: User defines correlation structure via configuration tags
+   - Recommended for all new precision analyses
+   - When active: Config uses 'name:tag' format (detected automatically)
 
-5. Robustness improvements:
-   - Apply cuts to systematic uncertainties along with other data
-   - Copy xmin/xmax from Data to Prediction for consistency
-   - Maintain empty systematics dict for backward compatibility
+4. **Expert Mode - External Covariance Matrix**
+   - Configuration: external_covariance: 'path/to/matrix.txt'
+   - User provides complete covariance matrix from external source
+   - Replaces both statistical and systematic experimental uncertainties
+   - Emulator covariance added on top
+   - Physics: User responsibility
+   - Status: Expert feature with minimal validation
+   - When active: external_covariance file specified in config
 
-authors: Jingyu Zhang <jingyu.zhang@cern.ch>, Vanderbilt 
+DESIGN PHILOSOPHY:
+- Fallback Mode: Kept only for backward compatibility
+- Legacy Mode: Kept for compatibility with original STAT repo analyses
+- Advanced Mode: Recommended for all new precision measurements
+- Expert Mode: For special cases with pre-computed covariances
+
+MODE SELECTION (automatic based on configuration):
+- If external_covariance file → Expert Mode
+- Else if correlation_manager with 'name:tag' format → Advanced Mode
+- Else if 'sum:...' format → Legacy Mode  
+- Else → Fallback Mode
+
+CONFIGURATION EXAMPLES:
+
+Fallback Mode (no systematics config):
+  observable_list:
+    - observable: 'jet_pt_alice'
+      # No sys_data specified
+
+Legacy Mode (summed with correlation parameters):
+  observable_list:
+    - observable: 'jet_pt_alice'
+      sys_data: ['sum:10:0.8']  # cor_length=10 bins, cor_strength=0.8
+
+Advanced Mode (individual with group tags):
+  observable_list:
+    - observable: 'jet_pt_alice'
+      sys_data: ['jec:alice', 'taa:global']  # JEC specific to ALICE, TAA global
+    - observable: 'jet_pt_cms'
+      sys_data: ['jec:cms', 'taa:global']    # TAA correlated with ALICE via 'global' tag
+
+Expert Mode (external covariance):
+  observable_list:
+    - external_covariance: 'path/to/covariance_matrix.txt'
+
+CLOSURE TEST SUPPORT:
+- Generate pseudodata from validation design points for closure tests
+- Proper shape handling and validation across all operational modes
+- Systematic uncertainties copied from experimental data for closure tests
+
+For detailed information on systematic correlation structure, see systematic_correlation.py
+For covariance matrix visualization, see plot_covariance.py
+
+.. codeauthor:: Jingyu Zhang <jingyu.zhang@cern.ch>, Vanderbilt
 '''
 
 from __future__ import annotations
@@ -166,29 +227,20 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
     data_dir = os.path.join(table_dir, 'Data')
 
     parsed_observables, correlation_manager, external_cov_file = _parse_config_observables(analysis_config)
-    logger.info(f"DEBUG: _parse_config_observables returned external_cov_file = {external_cov_file}")
 
     systematic_config_map = {}
     for obs_name, sys_data_list, sys_theory_list in parsed_observables:
         systematic_config_map[obs_name] = (sys_data_list, sys_theory_list)
 
     if external_cov_file:
-        logger.info(f"DEBUG: external_cov_file = {external_cov_file}")
         external_cov_path = os.path.join(table_dir, external_cov_file)
-        logger.info(f"DEBUG: external_cov_path = {external_cov_path}")
         external_cov = _read_external_covariance(external_cov_path)
-        logger.info(f"DEBUG: external_cov is None? {external_cov is None}")
         
         if external_cov is not None:
-            logger.info(f"DEBUG: About to add external covariance to observables dict")
-            logger.info(f"DEBUG: external_cov shape: {external_cov.shape}")
             observables['external_covariance'] = external_cov
-            logger.info(f"DEBUG: Added! Keys in observables: {list(observables.keys())}")
             logger.info(f"Loaded external covariance: shape {external_cov.shape}")
         else:
             raise ValueError(f"Failed to load external covariance from {external_cov_path}")
-    else:
-        logger.info("DEBUG: external_cov_file is None or False!")
 
     if correlation_manager.get_all_systematic_names():
         logger.info(f"Adding correlation manager with {len(correlation_manager.get_all_systematic_names())} systematics")
@@ -1218,6 +1270,13 @@ def _parse_config_observables(analysis_config):
     # Parse the correlation configuration (only if no external covariance)
     if not external_cov_file:
         correlation_manager.parse_configuration(parsed_observables)
+
+        # Parse correlation_groups section
+        correlation_groups_params = analysis_config.get('correlation_groups', {})
+        if correlation_groups_params:
+            logger.info(f"Found correlation_groups with {len(correlation_groups_params)} groups")
+            correlation_manager.set_correlation_parameters(correlation_groups_params)
+
         logger.info(f"Created correlation manager with {len(correlation_manager.get_all_systematic_names())} systematics")
     else:
         logger.info("Skipping systematic correlation parsing (external covariance mode)")
@@ -1312,10 +1371,51 @@ def _data_array_from_h5_external_cov(observables, external_cov, pseudodata_index
     # Get data dictionary
     if pseudodata_index < 0:
         data_dict = observables['Data']
+        logger.info("Loading experimental data (external covariance mode)")
     else:
-        # Handle closure test data (if needed)
+        # *** FIX: Generate pseudodata properly ***
+        logger.info(f"Generating pseudodata from validation design point {pseudodata_index} (external covariance mode)")
         data_dict = observables['Prediction_validation']
-        logger.warning("External covariance with closure test not fully tested")
+        exp_data_dict = observables['Data']
+        
+        # Generate pseudodata for each observable
+        for observable_label in sorted_observable_list:
+            exp_uncertainty = exp_data_dict[observable_label]['y_err_stat']
+            prediction_data = data_dict[observable_label]['y']
+            
+            # Validate prediction_data shape
+            if prediction_data.ndim != 2:
+                raise ValueError(
+                    f"Prediction_validation data for {observable_label} has unexpected shape: {prediction_data.shape}. "
+                    f"Expected 2D array (n_bins, n_design_points)"
+                )
+            
+            if prediction_data.shape[1] <= pseudodata_index:
+                raise ValueError(
+                    f"Validation prediction data not available for observable {observable_label}. "
+                    f"Available design points: {prediction_data.shape[1]}, "
+                    f"Requested index: {pseudodata_index}"
+                )
+            
+            # Extract prediction for this design point (converts to 1D)
+            prediction_central_value = prediction_data[:, pseudodata_index]
+            
+            # Generate pseudodata by adding noise (1D array)
+            pseudodata = prediction_central_value + np.random.normal(loc=0., scale=exp_uncertainty)
+            
+            # Validate pseudodata is 1D
+            if pseudodata.ndim != 1:
+                raise ValueError(
+                    f"Generated pseudodata for {observable_label} has unexpected shape: {pseudodata.shape}. "
+                    f"Expected 1D array."
+                )
+            
+            # Replace prediction data with pseudodata (now 1D)
+            data_dict[observable_label]['y'] = pseudodata
+            data_dict[observable_label]['y_err_stat'] = exp_uncertainty
+            
+            logger.debug(f"  {observable_label}: pseudodata shape = {pseudodata.shape}, "
+                        f"y_err_stat shape = {exp_uncertainty.shape}")
     
     # Initialize data structure
     data = {
@@ -1423,11 +1523,29 @@ def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1,
                 raise ValueError(f"Validation prediction data not available for observable {observable_label}. "
                                  f"Available design points: {prediction_data.shape[1]}, "
                                  f"Requested index: {pseudodata_index}")
+
+            # Extract prediction for this design point (shape: n_bins)
             prediction_central_value = data_dict[observable_label]['y'][:,pseudodata_index]
-            data_dict[observable_label]['y'] = prediction_central_value + np.random.normal(loc=0., scale=exp_uncertainty)
+            
+            # Generate pseudodata by adding noise (shape: n_bins)
+            pseudodata = prediction_central_value + np.random.normal(loc=0., scale=exp_uncertainty)
+            
+            # *** FIX: Validate pseudodata shape ***
+            if pseudodata.ndim != 1:
+                raise ValueError(
+                    f"Generated pseudodata for {observable_label} has unexpected shape: {pseudodata.shape}. "
+                    f"Expected 1D array."
+                )
+            
+            # Replace prediction data with pseudodata
+            data_dict[observable_label]['y'] = pseudodata
             data_dict[observable_label]['y_err_stat'] = exp_uncertainty
+            
             # Copy systematics from experimental data for closure tests
             data_dict[observable_label]['systematics'] = exp_data_dict[observable_label]['systematics']
+            
+            logger.debug(f"  {observable_label}: pseudodata shape = {pseudodata.shape}, "
+                        f"y_err_stat shape = {exp_uncertainty.shape}")
 
     # Get systematic names from correlation manager
     all_systematic_names = correlation_manager.get_all_systematic_names()
@@ -1450,7 +1568,38 @@ def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1,
         # Get central values and statistical uncertainties
         y_values = data_dict[observable_label]['y']
         y_err_stat_values = data_dict[observable_label]['y_err_stat']
+
+        if y_values.ndim == 2:
+            if y_values.shape[0] == 1 or y_values.shape[1] == 1:
+                # Row or column vector -> flatten to (n_bins,)
+                y_values = y_values.flatten()
+                logger.warning(f"{observable_label}: Converted y_values from 2D to 1D, final shape: {y_values.shape}")
+            else:
+                # Unexpected 2D array
+                raise ValueError(
+                    f"{observable_label}: y_values has unexpected 2D shape {y_values.shape}. "
+                    f"Expected 1D array (n_bins,) after pseudodata generation."
+                )
+        elif y_values.ndim != 1:
+            raise ValueError(
+                f"{observable_label}: y_values has unexpected shape {y_values.shape}. "
+                f"Expected 1D array (n_bins,)."
+            )
         
+        # Same for y_err_stat_values
+        if y_err_stat_values.ndim == 2:
+            if y_err_stat_values.shape[0] == 1 or y_err_stat_values.shape[1] == 1:
+                y_err_stat_values = y_err_stat_values.flatten()
+                logger.warning(f"{observable_label}: Converted y_err_stat_values to 1D")
+            else:
+                raise ValueError(
+                    f"{observable_label}: y_err_stat_values has unexpected 2D shape {y_err_stat_values.shape}"
+                )
+        elif y_err_stat_values.ndim != 1:
+            raise ValueError(
+                f"{observable_label}: y_err_stat_values has unexpected shape {y_err_stat_values.shape}"
+            )
+
         n_bins = len(y_values)
         
         # Track feature range for this observable
@@ -1503,7 +1652,17 @@ def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1,
     
     # Stack systematic uncertainties
     if systematic_uncertainty_list:
-        data['y_err_syst'] = np.vstack(systematic_uncertainty_list)
+        logger.debug(f"Stacking {len(systematic_uncertainty_list)} systematic matrices:")
+        for i, mat in enumerate(systematic_uncertainty_list):
+            logger.debug(f"  Matrix {i}: shape = {mat.shape}")
+        
+        try:
+            data['y_err_syst'] = np.vstack(systematic_uncertainty_list)
+        except ValueError as e:
+            logger.error("Failed to vstack systematic uncertainties. Shapes of matrices:")
+            for i, mat in enumerate(systematic_uncertainty_list):
+                logger.error(f"  Matrix {i}: {mat.shape}")
+            raise ValueError(f"Shape mismatch in systematic uncertainty stacking: {e}")
     else:
         data['y_err_syst'] = np.array([]).reshape(len(data['y']), 0)
     

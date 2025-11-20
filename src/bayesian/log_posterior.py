@@ -7,11 +7,64 @@ For the initial concept, see: https://emcee.readthedocs.io/en/stable/tutorials/p
 .. codeauthor:: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
 .. codeauthor:: James Mulligan
 
-CHANGES (August 2025):
-- Updated to use correlation-aware experimental data structure
-- Includes systematic covariance matrix in likelihood calculation
+SYSTEMATIC UNCERTAINTY SUPPORT (August - November 2025, Jingyu Zhang)::
+================================
+Updated to use correlation-aware experimental data structure and systematic covariance matrices.
 
-.. codeauthor:: Jingyu Zhang <jingyu.zhang@cern.ch>, Vanderbilt 
+COVARIANCE MATRIX CONSTRUCTION:
+================================
+Four operational modes are supported:
+
+1. **Fallback Mode - No Systematics**
+   - Only statistical uncertainties (diagonal)
+   - Covariance = Emulator + Diagonal(stat errors)
+   - Physics: Incorrect - ignores systematic uncertainties
+   - Status: Kept only for backward compatibility
+
+2. **Legacy Mode - Summed Systematics** (Original STAT repo)
+   - Sum systematics in quadrature: √(σ₁² + σ₂² + ... + σₙ²)
+   - Apply intra-observable correlation (exponential decay)
+   - Cannot handle cross-observable correlations
+   - Covariance = Emulator + Diagonal(stat) + Correlated_within_obs(summed_sys)
+   - Status: Kept for compatibility with original STAT repository
+
+3. **Advanced Mode - Individual Systematics** (Recommended)
+   - Track individual systematic sources
+   - Cross-observable correlations via group tags
+   - Proper treatment of global systematics (TAA, luminosity, etc.)
+   - Physics: Correct for precision measurements
+   - Covariance = Emulator + Diagonal(stat) + Correlated_cross_obs(individual_sys)
+   - Status: Recommended for all new precision analyses
+
+4. **Expert Mode - External Covariance**
+   - User-provided covariance matrix
+   - Replaces stat + sys experimental uncertainties
+   - Covariance = Emulator + External
+   - Status: Expert feature with minimal validation
+
+CORRELATION STRUCTURE:
+- Fallback: No systematic correlations
+- Legacy: Exponential decay within observable only (cor_length, cor_strength parameters)
+- Advanced: Group tags define cross-observable correlation structure
+  * Same group tag → fully correlated across observables
+  * Different tags → uncorrelated
+  * Special tag 'uncor' → diagonal (uncorrelated)
+- Expert: User-defined correlation structure in external matrix
+
+MODE COMPARISON:
++------------------+-------------------+------------------------+------------------+
+| Mode             | Intra-Observable  | Cross-Observable       | Global Sys       |
++------------------+-------------------+------------------------+------------------+
+| Fallback         | No                | No                     | Ignored          |
+| Legacy (STAT)    | Yes (exp. decay)  | No                     | Cannot handle    |
+| Advanced (New)   | Yes (full)        | Yes (via tags)         | Proper           |
+| Expert           | User-defined      | User-defined           | User-defined     |
++------------------+-------------------+------------------------+------------------+
+
+For detailed information on systematic correlation structure, see systematic_correlation.py
+For covariance matrix visualization, see plot_covariance.py
+
+.. codeauthor:: Jingyu Zhang <jingyu.zhang@cern.ch>, Vanderbilt
 """
 
 import logging

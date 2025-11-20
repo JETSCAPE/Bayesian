@@ -15,19 +15,53 @@ KEY FEATURES:
 - Create correlation-aware covariance matrices for likelihood calculations
 - Validation and debugging tools for correlation structure
 
-CORRELATION MODEL:
-- Systematics with same correlation tag are fully correlated
-- Systematics with different correlation tags are uncorrelated
-- Special tag 'uncor' creates diagonal (uncorrelated) contributions
-- Flexible: correlation tags can be experiment names, energy scales, or arbitrary user-defined groups
+TWO SYSTEMATIC UNCERTAINTY APPROACHES:
+========================================
 
-USAGE EXAMPLE:
+**LEGACY MODE** (from original STAT repository):
+- Configuration: 'sum:cor_length:cor_strength'
+- Sums all systematic sources in quadrature
+- Applies exponential decay correlation WITHIN observable only
+- Parameters:
+  * cor_length: Correlation length in bins (-1 = full correlation within observable)
+  * cor_strength: Correlation strength [0, 1]
+- Use case: Compatibility with original STAT repo, and for global analyses
+
+**ADVANCED MODE** (recommended for new precision measurement):
+- Configuration: 'name:group_tag' (e.g., 'jec:alice', 'taa:global', 'tracking:uncor')
+- Tracks each systematic source separately
+- Group tags define cross-observable correlation structure:
+  * Same tag → fully correlated across observables
+  * Different tags → uncorrelated
+  * Special tag 'uncor' → diagonal (no correlation)
+- **Advantage:** Proper treatment of global systematics via shared tags
+- **Example:** 'taa:global' in multiple observables → TAA correlated across all
+- Use case: Recommended for all precision measurements
+
+CORRELATION MODEL:
+- Legacy: Exponential decay with cor_length and cor_strength, applies ONLY within observable
+- Advanced: Full correlation within groups defined by tags, applies across observables
+- Both: Individual systematic always fully correlated within its own observable
+
+KEY DIFFERENCES:
++------------------+-------------------------+---------------------------+
+| Aspect           | Legacy Mode (STAT)      | Advanced Mode             |
++------------------+-------------------------+---------------------------+
+| Config format    | sum:length:strength     | name:tag                  |
+| Intra-obs corr   | Exponential decay       | Full correlation          |
+| Cross-obs corr   | Not possible            | Via group tags            |
+| Global sys       | Cannot handle           | Proper treatment          |
+| Parameters       | cor_length, cor_strength| Group tags                |
+| Use case         | STAT repo compatibility | Precision measurements    |
++------------------+-------------------------+---------------------------+
+
+USAGE EXAMPLE (Advanced Mode):
     # Config file specifies correlation structure
     observable_list:
       - observable: 'jet_pt_alice'
-        sys_data: ['jec:alice', 'taa:global']
+        sys_data: ['jec:alice', 'taa:global']      # JEC only for ALICE, TAA global
       - observable: 'jet_pt_cms' 
-        sys_data: ['jec:cms', 'taa:global']
+        sys_data: ['jec:cms', 'taa:global']        # JEC only for CMS, TAA shared via 'global' tag
     
     # Create and use correlation manager
     correlation_manager = SystematicCorrelationManager()
@@ -38,7 +72,14 @@ USAGE EXAMPLE:
     systematic_cov = correlation_manager.create_systematic_covariance_matrix(
         systematic_uncertainties, systematic_names, n_features
     )
-authors: Jingyu Zhang (2025)
+
+DESIGN PRINCIPLE:
+- Keep both approaches for flexibility and backward compatibility
+- Legacy: Adequate for exploratory analyses, STAT repo compatibility
+- Advanced: Required for publication-quality precision measurements
+- User chooses via configuration format (automatic detection)
+
+.. codeauthor:: Jingyu Zhang <jingyu.zhang@cern.ch>, Vanderbilt
 '''
 import logging
 import numpy as np
@@ -294,6 +335,69 @@ class SystematicCorrelationManager:
         if n_unresolved > 0:
             logger.info(f"  Summed systematics with unresolved cor_length: {n_unresolved} (will resolve after data load)")
 
+    def set_correlation_parameters(self, correlation_groups_params: Dict[str, str]):
+        """
+        Set correlation parameters for individual systematic groups from config.
+        
+        Args:
+            correlation_groups_params: Dict like {'alice': '10:0.9', 'cms': '5:0.95'}
+        """
+        logger.info("Setting correlation parameters from correlation_groups config...")
+        
+        # Track which tags are configured vs used
+        configured_tags = set(correlation_groups_params.keys())
+        used_tags = set(self.correlation_groups.keys())
+        
+        # Warn about unused configurations
+        unused_tags = configured_tags - used_tags
+        if unused_tags:
+            logger.warning(f"Correlation groups configured but not used: {sorted(unused_tags)}")
+        
+        # Parse and apply correlation parameters
+        for group_tag, param_string in correlation_groups_params.items():
+            if group_tag not in self.correlation_groups:
+                continue
+            
+            # Parse "cor_length:cor_strength" format
+            try:
+                parts = param_string.split(':')
+                if len(parts) != 2:
+                    raise ValueError(f"Expected 'length:strength', got '{param_string}'")
+                
+                cor_length = int(parts[0])
+                cor_strength = float(parts[1])
+                
+                # Validate
+                if cor_length < -1 or cor_length == 0:
+                    logger.warning(f"Invalid cor_length={cor_length}, using -1")
+                    cor_length = -1
+                if cor_strength < 0.0 or cor_strength > 1.0:
+                    logger.warning(f"cor_strength={cor_strength} outside [0,1], clipping")
+                    cor_strength = np.clip(cor_strength, 0.0, 1.0)
+                
+            except (ValueError, IndexError) as e:
+                logger.error(f"Failed to parse '{group_tag}': {param_string} - {e}")
+                continue
+            
+            # Find all systematics in this group
+            group_systematics = set()
+            for obs_name, start, end, sys_full_name in self.correlation_groups[group_tag]:
+                group_systematics.add(sys_full_name)
+            
+            # Update each systematic
+            n_updated = 0
+            for sys_full_name in group_systematics:
+                if sys_full_name in self.systematic_info:
+                    sys_info = self.systematic_info[sys_full_name]
+                    if not sys_info.is_summed:
+                        sys_info.cor_length = cor_length
+                        sys_info.cor_strength = cor_strength
+                        n_updated += 1
+            
+            logger.info(f"  Group '{group_tag}': Updated {n_updated} systematic(s) with length={cor_length}, strength={cor_strength}")
+        
+        logger.info("Correlation parameter configuration complete")
+
     def register_observable_ranges(self, observable_ranges: List[Tuple[int, int, str]]):
         """
         Register which features belong to which observables and build correlation groups.
@@ -499,30 +603,62 @@ class SystematicCorrelationManager:
             
             # Build covariance for all members in this group
             # group_members is: [(obs_label, start_idx, end_idx, systematic_full_name), ...]
-            for obs1_label, start1, end1, sys1_name in group_members:
-                if sys1_name not in systematic_names:
-                    logger.warning(f"Systematic '{sys1_name}' not found in systematic_names")
+            # Get unique systematics in this group
+            unique_systematics = list(set([sys_name for _, _, _, sys_name in group_members]))
+            
+            # Process each unique systematic
+            for sys_full_name in unique_systematics:
+                if sys_full_name not in systematic_names:
+                    logger.warning(f"Systematic '{sys_full_name}' not found in systematic_names")
                     continue
                 
-                sys1_idx = systematic_names.index(sys1_name)
-                sys1_uncertainties = systematic_uncertainties[start1:end1, sys1_idx]
+                sys_idx = systematic_names.index(sys_full_name)
+                sys_info = self.systematic_info.get(sys_full_name)
+                if not sys_info:
+                    continue
                 
-                for obs2_label, start2, end2, sys2_name in group_members:
-                    if sys2_name not in systematic_names:
-                        continue
-                    
-                    sys2_idx = systematic_names.index(sys2_name)
-                    sys2_uncertainties = systematic_uncertainties[start2:end2, sys2_idx]
-                    
-                    # Fully correlated: outer product
-                    # This handles both intra-observable (obs1 == obs2) and cross-observable (obs1 != obs2)
-                    cov_block = np.outer(sys1_uncertainties, sys2_uncertainties)
-                    total_cov[start1:end1, start2:end2] += cov_block
-                    
-                    if obs1_label == obs2_label and sys1_name == sys2_name:
-                        logger.debug(f"  Added intra-observable: {sys1_name} on {obs1_label}")
-                    else:
-                        logger.debug(f"  Added cross-observable: {sys1_name} ({obs1_label}) ↔ {sys2_name} ({obs2_label})")
+                # Get all bins where this systematic appears (group-local indexing)
+                group_global_indices = []
+                for obs_label, start, end, sys_name in group_members:
+                    if sys_name == sys_full_name:
+                        group_global_indices.extend(range(start, end))
+                
+                # Build group-local mapping (ignores gaps)
+                global_to_group_local = {}
+                for group_local_idx, global_idx in enumerate(group_global_indices):
+                    global_to_group_local[global_idx] = group_local_idx
+                
+                # Get correlation parameters
+                cor_length = sys_info.cor_length
+                cor_strength = sys_info.cor_strength
+                uncertainties = systematic_uncertainties[:, sys_idx]
+
+                logger.info(f"DEBUG: {sys_full_name} - cor_length={cor_length}, cor_strength={cor_strength}")
+                logger.info(f"DEBUG: {sys_full_name} - n_bins in group={len(group_global_indices)}")
+                logger.info(f"DEBUG: Will use {'FULL correlation' if cor_length == -1 else 'EXPONENTIAL decay'}")
+                
+                # Apply correlation
+                if cor_length == -1:
+                    # Full correlation (default)
+                    for global_i in group_global_indices:
+                        for global_j in group_global_indices:
+                            total_cov[global_i, global_j] += uncertainties[global_i] * uncertainties[global_j]
+                else:
+                    # Exponential decay using group-local distance
+                    for global_i in group_global_indices:
+                        for global_j in group_global_indices:
+                            if global_i == global_j:
+                                correlation = 1.0
+                            else:
+                                # Distance in group space (ignoring gaps)
+                                group_local_i = global_to_group_local[global_i]
+                                group_local_j = global_to_group_local[global_j]
+                                distance = abs(group_local_i - group_local_j)
+                                correlation = cor_strength * np.exp(-distance / cor_length)
+                            if global_i != global_j and global_i < 5 and global_j >= 7:  # Cross-observable example
+                                logger.info(f"DEBUG CROSS: Adding {sys_full_name} correlation between bins {global_i} and {global_j}")
+                            
+                            total_cov[global_i, global_j] += correlation * uncertainties[global_i] * uncertainties[global_j]
         
         # PATH 2: Process summed systematics (independent per observable)
         for sys_full_name, sys_info in self.systematic_info.items():

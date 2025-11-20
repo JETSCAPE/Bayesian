@@ -1,14 +1,54 @@
 """ Functionality for identifying outliers and smoothing them.
 
-.. codeauthor:: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
+DESIGN POINT FILTERING (Phase 1):
+===================================
+Filter out problematic design points (entire rows) based on:
+- Relative statistical errors across observables
+- Identified via FilteringConfig and filter_problematic_design_points()
+- Removes design points showing statistical instabilities
+- Applies to both training and validation sets separately
 
-Extension to outliers_smoothing.py for DESIGN POINT filtering only
+OUTLIER SMOOTHING (Phase 2):
+==============================
+Identify and smooth outliers in individual bins (specific entries):
+- Large statistical uncertainty outliers
+- Large central value deviation outliers
+- Uses interpolation (linear or cubic spline) to smooth
+- Applied after filtering, on a per-observable basis
 
-FUNCTIONALITY:
-=============
-- Filter DESIGN POINTS (remove rows from prediction matrix)
+KEY CLASSES:
+- OutliersConfig: Configuration for Phase 2 (outlier identification thresholds)
+- FilteringConfig: Configuration for Phase 1 (design point filtering)
 
-AUTHORS: Jingyu Zhang (2025)
+KEY FUNCTIONS:
+Phase 1 (Design Point Filtering):
+- filter_problematic_design_points(): Main entry point for design point filtering
+- apply_design_point_filtering(): Apply filtering to prediction matrix
+- identify_problematic_design_points(): Identify which design points to remove
+
+Phase 2 (Outlier Smoothing):
+- find_and_smooth_outliers_standalone(): Main entry point for outlier smoothing
+- find_large_statistical_uncertainty_points(): Identify bins with large uncertainties
+- find_outliers_based_on_central_values(): Identify bins with unusual values
+- smooth_outliers(): Interpolate to smooth identified outliers
+
+DESIGN PHILOSOPHY:
+- Phase 1 is conservative: only removes severely problematic design points
+- Phase 2 is targeted: only smooths individual problematic bins
+- Both phases preserve physics validity while improving emulator training
+
+USAGE:
+    # Phase 1: Filter design points
+    filtered_observables, filtered_points = filter_problematic_design_points(
+        observables, filtering_config, prediction_key='Prediction'
+    )
+    
+    # Phase 2: Smooth remaining outliers
+    smoothed_values, smoothed_errors, removed_outliers = find_and_smooth_outliers_standalone(
+        observable_key, bin_centers, values, y_err, outliers_config
+    )
+
+.. codeauthor:: Jingyu Zhang <jingyu.zhang@cern.ch>, Vanderbilt
 """
 
 from __future__ import annotations

@@ -105,19 +105,9 @@ class SteerAnalysis(common_base.CommonBase):
                     output_dir = os.path.join(self.output_dir, f'{analysis_name}_{parameterization}')
                     experimental_data = data_IO.data_array_from_h5(output_dir, 'observables.h5')
 
-                    print("\n=== EXTERNAL COVARIANCE DEBUG ===")
-                    print(f"Keys in experimental_data: {list(experimental_data.keys())}")
-                    print(f"Has 'external_covariance': {'external_covariance' in experimental_data}")
-
                     if 'external_covariance' in experimental_data:
                         ext_cov = experimental_data['external_covariance']
-                        print(f"External covariance shape: {ext_cov.shape}")
-                        print(f"External covariance trace: {np.trace(ext_cov):.6e}")
-                        print(f"External covariance max: {np.max(ext_cov):.6e}")
-                        print(f"External covariance min: {np.min(ext_cov):.6e}")
                     else:
-                        print("External covariance NOT found in experimental_data!")
-                        print("\nCheck observables.h5 file:")
                         import h5py
                         with h5py.File(os.path.join(output_dir, 'observables.h5'), 'r') as f:
                             print(f"Top-level keys: {list(f.keys())}")

@@ -62,28 +62,41 @@ class SteerAnalysis(common_base.CommonBase):
         self.plot = config['plot']
 
         # Configuration of different analyses
-        self.analyses = config['analyses']
+        all_analyses_config = config['analyses']
+        self.correlation_groups = all_analyses_config.pop('correlation_groups', {})
+        self.analyses = all_analyses_config  # Now only contains actual analyses
+
+        if self.correlation_groups:
+            logger.info(f"Loaded correlation_groups with {len(self.correlation_groups)} group tags")
 
     #---------------------------------------------------------------
     # Main function
     #---------------------------------------------------------------
     def run_analysis(self):
-        # Add logging to file
-        _root_log = logging.getLogger()
-        _root_log.addHandler(logging.FileHandler(os.path.join(self.output_dir, 'steer_analysis.log'), 'w'))
-
-        # Also write analysis config to shared directory
-        shutil.copy(self.config_file, Path(self.output_dir) / "steer_analysis_config.yaml")
 
         # Loop through each analysis
         with helpers.progress_bar() as progress:
-            analysis_task = progress.add_task("[deep_sky_blue1]Running analysis...", total=len(self.analyses))
+            analysis_task = progress.add_task("[deep_sky_blue1]Running analysis...", 
+                                            total=len(self.analyses))
+            
+            for analysis_name, analysis_config in self.analyses.items():
+                # Now you don't need the skip check anymore!
+                
+                # Loop through the parameterizations
+                parameterization_task = progress.add_task(
+                    "[deep_sky_blue2]parameterization", 
+                    total=len(analysis_config.get('parameterizations', ['default']))
+                )
 
             for analysis_name, analysis_config in self.analyses.items():
 
+                if analysis_name == 'correlation_groups':  # Skip special config keys
+                    continue    
+
                 # Loop through the parameterizations
-                parameterization_task = progress.add_task("[deep_sky_blue2]parameterization", total=len(analysis_config['parameterizations']))
-                for parameterization in analysis_config['parameterizations']:
+                parameterization_task = progress.add_task("[deep_sky_blue2]parameterization", total=len(analysis_config.get('parameterizations', ['default'])))
+
+                for parameterization in analysis_config.get('parameterizations', ['default']):
 
                     # Initialize design points, predictions, data, and uncertainties
                     # We store them in a dict and write/read it to HDF5
@@ -94,9 +107,11 @@ class SteerAnalysis(common_base.CommonBase):
                         logger.info("")
                         logger.info('========================================================================')
                         logger.info(f'Initializing model: {analysis_name} ({parameterization} parameterization)...')
+
                         observables = data_IO.initialize_observables_dict_from_tables(self.observable_table_dir,
-                                                                                    analysis_config,
-                                                                                    parameterization)
+                                                                                        analysis_config,
+                                                                                        parameterization,
+                                                                                        correlation_groups=self.correlation_groups)
                         data_IO.write_dict_to_h5(observables,
                                                 os.path.join(self.output_dir, f'{analysis_name}_{parameterization}'),
                                                 filename='observables.h5')
@@ -107,14 +122,6 @@ class SteerAnalysis(common_base.CommonBase):
 
                     if 'external_covariance' in experimental_data:
                         ext_cov = experimental_data['external_covariance']
-                    else:
-                        import h5py
-                        with h5py.File(os.path.join(output_dir, 'observables.h5'), 'r') as f:
-                            print(f"Top-level keys: {list(f.keys())}")
-                            if 'external_covariance' in f:
-                                print(f"  external_covariance shape: {f['external_covariance'].shape}")
-                            else:
-                                print("  external_covariance NOT in h5 file!")
 
                     if self.preprocess_input_data:
                         # Just indicate that it's working
@@ -207,7 +214,7 @@ class SteerAnalysis(common_base.CommonBase):
 
         # Plots for individual analysis
         for analysis_name,analysis_config in self.analyses.items():
-            for parameterization in analysis_config['parameterizations']:
+            for parameterization in analysis_config.get('parameterizations', ['default']):
 
                 if any(self.plot.values()):
                     logger.info('========================================================================')

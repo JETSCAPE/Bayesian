@@ -94,11 +94,6 @@ def initialize_pool_variables(local_min, local_max, local_emulation_config, loca
     - Store in global variable for efficient reuse during MCMC
     """
 
-    # Add this at the very beginning
-    logger.info("=== INITIALIZE_POOL_VARIABLES CALLED ===")
-    logger.info(f"Experimental results keys: {list(local_experimental_results.keys())}")
-    logger.info(f"Has external_covariance: {'external_covariance' in local_experimental_results}")
-
     global g_min  # noqa: PLW0603
     global g_max  # noqa: PLW0603
     global g_emulation_config  # noqa: PLW0603
@@ -121,11 +116,7 @@ def initialize_pool_variables(local_min, local_max, local_emulation_config, loca
         logger.info("External covariance mode: skipping systematic covariance construction")
         g_systematic_covariance = None  # Not used in external mode
 
-        # DEBUG: Check external covariance properties
         ext_cov = g_experimental_results['external_covariance']
-        logger.info(f"External covariance shape: {ext_cov.shape}")
-        logger.info(f"External covariance trace: {np.trace(ext_cov):.6e}")
-        logger.info(f"External covariance min/max: {np.min(ext_cov):.6e} / {np.max(ext_cov):.6e}")
         
         # Check if positive definite
         eigenvals = np.linalg.eigvals(ext_cov)
@@ -143,7 +134,6 @@ def initialize_pool_variables(local_min, local_max, local_emulation_config, loca
         g_systematic_covariance = correlation_manager.create_systematic_covariance_matrix(
             systematic_uncertainties, systematic_names, n_features
         )
-        logger.info(f"Systematic covariance matrix shape: {g_systematic_covariance.shape}")
         
     else:
         logger.info("No correlation manager found - using diagonal systematic uncertainties")
@@ -160,6 +150,21 @@ def initialize_pool_variables(local_min, local_max, local_emulation_config, loca
             n_features = len(g_experimental_results['y'])
             g_systematic_covariance = np.zeros((n_features, n_features))
 
+        # SAVE covariance matrices for plotting
+    covariance_matrices = {
+        'statistical': np.diag(g_experimental_results['y_err_stat']**2), # external_cov mode will ignore this
+        'systematic_total': g_systematic_covariance,
+        'emulator': None,  # Will be filled with emulator predictions
+    }
+    
+    # Save to a separate file for plotting
+    import pickle
+    from pathlib import Path
+    output_dir = Path(g_emulation_config.output_dir)
+    output_file = output_dir / 'covariance_matrices.pkl'
+    with open(output_file, 'wb') as f:
+        pickle.dump(covariance_matrices, f)
+    logger.info(f"Saved covariance matrices to {output_file}")
 
 #---------------------------------------------------------------
 def log_posterior(X, *, set_to_infinite_outside_bounds: bool = True) -> npt.NDArray[np.float64]:

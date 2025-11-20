@@ -137,8 +137,8 @@ def parse_systematic_config(sys_config_string: str) -> Dict:
        - No cross-observable correlation
     
     DISABLED FORMATS (will raise ValueError):
-    ❌ 'sum:group_tag:...'              - sum cannot have group tags
-    ❌ 'name:tag:cor_length:cor_strength' - individual systematics cannot have correlation params
+     'sum:group_tag:...'              - sum cannot have group tags
+     'name:tag:cor_length:cor_strength' - individual systematics cannot have correlation params
     
     Args:
         sys_config_string: Configuration string from config file
@@ -235,6 +235,8 @@ class SystematicCorrelationManager:
 
         # Store observable ranges for covariance calculation
         self._observable_ranges: List[Tuple[int, int, str]] = []
+
+        self._pending_correlation_params = {}
 
     def parse_configuration(self, parsed_observables: List[Tuple[str, List[str], List[str]]]):
         """
@@ -336,6 +338,12 @@ class SystematicCorrelationManager:
             logger.info(f"  Summed systematics with unresolved cor_length: {n_unresolved} (will resolve after data load)")
 
     def set_correlation_parameters(self, correlation_groups_params: Dict[str, str]):
+        """Store correlation parameters to be applied after correlation groups are built."""
+        logger.info("Storing correlation parameters for later application...")
+        self._pending_correlation_params = correlation_groups_params
+        logger.info(f"Stored parameters for {len(correlation_groups_params)} group tags")
+
+    def _apply_correlation_parameters(self, correlation_groups_params: Dict[str, str]):
         """
         Set correlation parameters for individual systematic groups from config.
         
@@ -431,6 +439,10 @@ class SystematicCorrelationManager:
             logger.info(f"  Group '{group_tag}': {len(group_members)} entries")
             for obs_label, start, end, sys_name in group_members:
                 logger.debug(f"    {sys_name} on {obs_label} (features {start}:{end})")
+
+        # Apply pending correlation parameters now that groups are built
+        if self._pending_correlation_params:
+            self._apply_correlation_parameters(self._pending_correlation_params)
 
     def resolve_bin_counts(self, observable_ranges: List[Tuple[int, int, str]]):
         """
@@ -588,6 +600,7 @@ class SystematicCorrelationManager:
             Covariance matrix of shape (n_features, n_features)
         """
         logger.info("Creating systematic covariance matrix...")
+
         logger.debug(f"  Input shape: {systematic_uncertainties.shape}")
         logger.debug(f"  n_features: {n_features}, n_systematics: {len(systematic_names)}")
         
@@ -819,6 +832,7 @@ class SystematicCorrelationManager:
             },
             'observable_systematics': dict(self.observable_systematics),
             'all_systematic_names': self.all_systematic_names,
+            '_pending_correlation_params': self._pending_correlation_params,
             'class_name': 'SystematicCorrelationManager'  # For validation during loading
         }
     
@@ -906,5 +920,14 @@ class SystematicCorrelationManager:
             str(item.item()) if isinstance(item, np.ndarray) else str(item) 
             for item in data['all_systematic_names']
         ]
+
+        # Restore pending correlation params (convert numpy arrays to strings)
+        pending_params = data.get('_pending_correlation_params', {})
+        manager._pending_correlation_params = {}
+        for tag, param_string in pending_params.items():
+            # Convert numpy arrays to strings
+            tag_str = str(tag.item()) if isinstance(tag, np.ndarray) else str(tag)
+            param_str = str(param_string.item()) if isinstance(param_string, np.ndarray) else str(param_string)
+            manager._pending_correlation_params[tag_str] = param_str
         
         return manager

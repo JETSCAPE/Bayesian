@@ -128,7 +128,7 @@ logger = logging.getLogger(__name__)
 
 
 ####################################################################################################################
-def initialize_observables_dict_from_tables(table_dir, analysis_config, parameterization):
+def initialize_observables_dict_from_tables(table_dir, analysis_config, parameterization, correlation_groups=None):
     '''
     Initialize observables dictionary from .dat files with systematic uncertainty support.
     CORE FUNCTIONALITY:
@@ -174,7 +174,7 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
     observables['Design_validation'][parameterization] -- design points for validation set  
     observables['Design_indices_validation'][parameterization] -- indices of validation design points
     
-    observables['_correlation_manager'] -- SystematicCorrelationManager instance (NEW)
+    observables['correlation_manager'] -- SystematicCorrelationManager instance (NEW)
                                         -- Contains correlation structure from config parsing
                                         -- Used for correlation-aware covariance calculations
     
@@ -226,7 +226,10 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
     # Read experimental data
     data_dir = os.path.join(table_dir, 'Data')
 
-    parsed_observables, correlation_manager, external_cov_file = _parse_config_observables(analysis_config)
+    parsed_observables, correlation_manager, external_cov_file = _parse_config_observables(
+                                            analysis_config,
+                                            correlation_groups=correlation_groups
+    )
 
     systematic_config_map = {}
     for obs_name, sys_data_list, sys_theory_list in parsed_observables:
@@ -243,8 +246,9 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
             raise ValueError(f"Failed to load external covariance from {external_cov_path}")
 
     if correlation_manager.get_all_systematic_names():
+
         logger.info(f"Adding correlation manager with {len(correlation_manager.get_all_systematic_names())} systematics")
-        observables['_correlation_manager'] = correlation_manager.to_dict()
+        observables['correlation_manager'] = correlation_manager.to_dict()
     else:
         logger.info("No systematic correlations found in config")
 
@@ -439,12 +443,12 @@ def initialize_observables_dict_from_tables(table_dir, analysis_config, paramete
     [logger.info(f'Accepted observable {s}') for s in sorted_observable_list_from_dict(observables['Prediction'])]
 
     try:
-        parsed_observables, correlation_manager, external_cov_file = _parse_config_observables(analysis_config)
+        parsed_observables, correlation_manager, external_cov_file = _parse_config_observables(analysis_config, correlation_groups=correlation_groups)
         
         if correlation_manager.get_all_systematic_names():
             logger.info(f"Adding correlation manager with {len(correlation_manager.get_all_systematic_names())} systematics")
             # Convert to serializable format for HDF5 storage
-            observables['_correlation_manager'] = correlation_manager.to_dict()
+            observables['correlation_manager'] = correlation_manager.to_dict()
         else:
             logger.info("No systematic correlations found in config")
             
@@ -761,7 +765,7 @@ def sorted_observable_list_from_dict(observables, observable_filter: ObservableF
 
     # PHASE 2 FIX: Filter out special keys that are not observables
     # The correlation manager and other metadata should not be treated as observables
-    special_keys = ['_correlation_manager', 'Design', 'Design_validation', 'Prediction', 'Prediction_validation', 'Data']
+    special_keys = ['correlation_manager', 'Design', 'Design_validation', 'Prediction', 'Prediction_validation', 'Data']
     observable_keys = [k for k in observable_keys if k not in special_keys]
 
     if observable_filter is not None:
@@ -1224,7 +1228,7 @@ def _read_theory_systematics(table_dir, model, observable_name, theory_systemati
     return theory_syst_data
 
 
-def _parse_config_observables(analysis_config):
+def _parse_config_observables(analysis_config, correlation_groups=None):
     """
     Parse observable configuration for systematic support.
     Handles both old and new formats, and detects external covariance mode.
@@ -1272,10 +1276,11 @@ def _parse_config_observables(analysis_config):
         correlation_manager.parse_configuration(parsed_observables)
 
         # Parse correlation_groups section
-        correlation_groups_params = analysis_config.get('correlation_groups', {})
-        if correlation_groups_params:
-            logger.info(f"Found correlation_groups with {len(correlation_groups_params)} groups")
-            correlation_manager.set_correlation_parameters(correlation_groups_params)
+        if correlation_groups:
+            logger.info(f"Found correlation_groups with {len(correlation_groups)} group tags")
+            correlation_manager.set_correlation_parameters(correlation_groups)
+        else:
+            logger.warning("No correlation_groups provided (using default full correlation)")
 
         logger.info(f"Created correlation manager with {len(correlation_manager.get_all_systematic_names())} systematics")
     else:
@@ -1483,7 +1488,7 @@ def data_array_from_h5(output_dir, filename, pseudodata_index: int = -1,
         return _data_array_from_h5_external_cov(observables, external_cov, pseudodata_index, observable_filter)
 
     # Check for correlation manager (standard mode with systematics)    
-    correlation_manager_data = observables.get('_correlation_manager', None)
+    correlation_manager_data = observables.get('correlation_manager', None)
     
     # Deserialize correlation manager if it exists
     if correlation_manager_data is not None:

@@ -96,7 +96,7 @@ def plot_all_covariance_components(
     emulator_predictions = _get_emulator_predictions(config, parameter_point.reshape(1, -1))
     
     # Extract covariance components
-    cov_components = _extract_covariance_components(experimental_data, emulator_predictions)
+    cov_components = _extract_covariance_components(experimental_data, emulator_predictions, config)
     
     # Create main comparison plot
     _plot_covariance_comparison(cov_components, plot_dir, figsize, cmap)
@@ -121,79 +121,65 @@ def plot_all_covariance_components(
 
 def _extract_covariance_components(
     experimental_data: Dict,
-    emulator_predictions: Dict
+    emulator_predictions: Dict,
+    config: mcmc.MCMCConfig  # ADD config parameter
 ) -> Dict[str, np.ndarray]:
     
     n_features = len(experimental_data['y'])
     cov_components = {}
     
-    # Check if using external covariance (expert mode)
-    if 'external_covariance' in experimental_data:
-        logger.info("Using external covariance for plotting")
-        cov_components['external'] = experimental_data['external_covariance']
-        logger.info(f"External covariance: shape={cov_components['external'].shape}, "
-                   f"total variance {np.trace(cov_components['external']):.2e}")
+    # Try to load saved covariance matrices from MCMC
+    saved_cov_file = config.output_dir / 'covariance_matrices.pkl'
+    if saved_cov_file.exists():
+        logger.info(f"Loading saved covariance matrices from {saved_cov_file}")
+        import pickle
+        with open(saved_cov_file, 'rb') as f:
+            saved_matrices = pickle.load(f)
         
-        # In external mode, don't compute stat/sys separately
-        cov_components['statistical'] = np.zeros((n_features, n_features))
-        cov_components['systematic_total'] = np.zeros((n_features, n_features))
-        
+        cov_components['statistical'] = saved_matrices['statistical']
+        cov_components['systematic_total'] = saved_matrices['systematic_total']
+        logger.info("✓ Loaded statistical and systematic covariances from MCMC")
     else:
-        # Standard mode: stat + sys
-        # 1. Statistical uncertainty covariance (diagonal)
+        logger.warning(f"Saved covariance file not found: {saved_cov_file}")
+        logger.info("Falling back to recalculation...")
+        
+        # Fallback: calculate like before
         stat_errors = np.array(experimental_data['y_err_stat'])
         cov_components['statistical'] = np.diag(stat_errors**2)
-        logger.info(f"Statistical covariance: {cov_components['statistical'].shape}, "
-                   f"diagonal with {np.sum(stat_errors**2):.2e} total variance")
         
-        # 2. Systematic uncertainty covariances by group
         if 'correlation_manager' in experimental_data:
             correlation_manager = experimental_data['correlation_manager']
             systematic_uncertainties = experimental_data['y_err_syst']
             systematic_names = experimental_data['systematic_names']
             
-            # Total systematic covariance
             cov_components['systematic_total'] = correlation_manager.create_systematic_covariance_matrix(
                 systematic_uncertainties, systematic_names, n_features
             )
-            
-            # Individual systematic group covariances
-            cov_components.update(_compute_systematic_group_covariances(
-                correlation_manager, systematic_uncertainties, systematic_names, n_features
-            ))
-            
-            logger.info(f"Systematic total covariance: {cov_components['systematic_total'].shape}, "
-                       f"total variance {np.trace(cov_components['systematic_total']):.2e}")
-        else:
-            logger.warning("No correlation manager found - creating zero systematic covariance")
-            cov_components['systematic_total'] = np.zeros((n_features, n_features))
     
-    # 3. Emulator uncertainty covariance (always computed)
+    # Recalculate individual group covariances (fixed version)
+    if 'correlation_manager' in experimental_data:
+        cov_components.update(_compute_systematic_group_covariances(
+            experimental_data['correlation_manager'],
+            experimental_data['y_err_syst'],
+            experimental_data['systematic_names'],
+            n_features
+        ))
+        
+        # VERIFY: sum of groups equals total
+        _verify_systematic_covariance_consistency(cov_components)
+    
+    # Emulator covariance (always calculated fresh)
     if emulator_predictions and 'cov' in emulator_predictions:
         cov_components['emulator'] = emulator_predictions['cov'][0]
-        logger.info(f"Emulator covariance: {cov_components['emulator'].shape}, "
-                   f"total variance {np.trace(cov_components['emulator']):.2e}")
     else:
-        logger.warning("No emulator covariance available - creating zero matrix")
         cov_components['emulator'] = np.zeros((n_features, n_features))
     
-    # 4. Total combined covariance
-    if 'external_covariance' in experimental_data:
-        # External mode: external + emulator
-        cov_components['total'] = (
-            cov_components['external'] + 
-            cov_components['emulator']
-        )
-    else:
-        # Standard mode: stat + sys + emulator
-        cov_components['total'] = (
-            cov_components['statistical'] + 
-            cov_components['systematic_total'] + 
-            cov_components['emulator']
-        )
-    
-    logger.info(f"Total covariance: {cov_components['total'].shape}, "
-               f"total variance {np.trace(cov_components['total']):.2e}")
+    # Total covariance
+    cov_components['total'] = (
+        cov_components['statistical'] + 
+        cov_components['systematic_total'] + 
+        cov_components['emulator']
+    )
     
     return cov_components
 
@@ -204,60 +190,88 @@ def _compute_systematic_group_covariances(
     n_features: int
 ) -> Dict[str, np.ndarray]:
     """
-    Compute covariance matrix for each systematic uncertainty group separately.
+    Compute individual group covariances using the SAME logic as create_systematic_covariance_matrix.
     """
-    
     group_covariances = {}
     
-    # Get correlation groups from the manager
-    correlation_groups = correlation_manager.correlation_groups
-    
-    for group_tag, group_members in correlation_groups.items():
-        # Create covariance matrix for this group only
+    for group_tag, group_members in correlation_manager.correlation_groups.items():
         group_cov = np.zeros((n_features, n_features))
         
-        # Find which systematics belong to this group
-        group_systematics = set()
-        for obs_label, start_idx, end_idx, sys_full_name in group_members:
-            group_systematics.add(sys_full_name)
+        # Get unique systematics in this group
+        unique_systematics = list(set([sys_name for _, _, _, sys_name in group_members]))
         
-        # Add contribution from each systematic in this group
-        for sys_idx, sys_name in enumerate(systematic_names):
-            if sys_name in group_systematics:
-                sys_uncertainty = systematic_uncertainties[:, sys_idx]
-                
-                # Find correlated feature indices for this systematic
-                correlated_indices = []
-                for obs_label, start_idx, end_idx, group_sys_name in group_members:
-                    if group_sys_name == sys_name:
-                        correlated_indices.extend(range(start_idx, end_idx))
-                
-                if correlated_indices:
-                    correlated_indices = sorted(set(correlated_indices))
-                    
-                    # Create correlation submatrix
-                    for i in correlated_indices:
-                        for j in correlated_indices:
-                            if i < n_features and j < n_features:
-                                group_cov[i, j] += sys_uncertainty[i] * sys_uncertainty[j]
+        for sys_full_name in unique_systematics:
+            if sys_full_name not in systematic_names:
+                continue
+            
+            sys_idx = systematic_names.index(sys_full_name)
+            sys_info = correlation_manager.systematic_info.get(sys_full_name)
+            if not sys_info:
+                continue
+            
+            # Get all bins where this systematic appears
+            group_global_indices = []
+            for obs_label, start, end, sys_name in group_members:
+                if sys_name == sys_full_name:
+                    group_global_indices.extend(range(start, end))
+            
+            # Build group-local mapping
+            global_to_group_local = {global_idx: local_idx 
+                                    for local_idx, global_idx in enumerate(group_global_indices)}
+            
+            cor_length = sys_info.cor_length
+            cor_strength = sys_info.cor_strength
+            uncertainties = systematic_uncertainties[:, sys_idx]
+            
+            # Apply correlation (SAME LOGIC as in create_systematic_covariance_matrix)
+            if cor_length == -1:
+                # Full correlation
+                for global_i in group_global_indices:
+                    for global_j in group_global_indices:
+                        group_cov[global_i, global_j] += uncertainties[global_i] * uncertainties[global_j]
+            else:
+                # Exponential decay
+                for global_i in group_global_indices:
+                    for global_j in group_global_indices:
+                        if global_i == global_j:
+                            correlation = 1.0
+                        else:
+                            local_i = global_to_group_local[global_i]
+                            local_j = global_to_group_local[global_j]
+                            distance = abs(local_i - local_j)
+                            correlation = cor_strength * np.exp(-distance / cor_length)
+                        
+                        group_cov[global_i, global_j] += correlation * uncertainties[global_i] * uncertainties[global_j]
         
         group_covariances[f'systematic_group_{group_tag}'] = group_cov
         logger.info(f"Systematic group '{group_tag}': variance {np.trace(group_cov):.2e}")
     
-    # Also add uncorrelated systematics as a separate component
-    uncorr_cov = np.zeros((n_features, n_features))
-    for sys_idx, sys_name in enumerate(systematic_names):
-        sys_info = correlation_manager.systematic_info.get(sys_name)
-        if sys_info and sys_info.is_uncorrelated:
-            sys_uncertainty = systematic_uncertainties[:, sys_idx]
-            uncorr_cov += np.diag(sys_uncertainty**2)
-    
-    if np.trace(uncorr_cov) > 0:
-        group_covariances['systematic_group_uncorrelated'] = uncorr_cov
-        logger.info(f"Uncorrelated systematics: variance {np.trace(uncorr_cov):.2e}")
-    
     return group_covariances
 
+def _verify_systematic_covariance_consistency(cov_components: Dict[str, np.ndarray]):
+    """Verify that sum of individual groups equals total systematic covariance."""
+    
+    # Sum all individual group covariances
+    total_from_groups = None
+    group_names = []
+    
+    for comp_name, cov_matrix in cov_components.items():
+        if comp_name.startswith('systematic_group_'):
+            group_names.append(comp_name.replace('systematic_group_', ''))
+            if total_from_groups is None:
+                total_from_groups = cov_matrix.copy()
+            else:
+                total_from_groups += cov_matrix
+    
+    if total_from_groups is not None and 'systematic_total' in cov_components:
+        diff = np.abs(total_from_groups - cov_components['systematic_total'])
+        max_diff = np.max(diff)
+        
+        if max_diff < 1e-10:
+            logger.info(f"✓ VERIFIED: Sum of {len(group_names)} groups matches total systematic covariance")
+        else:
+            logger.warning(f"✗ MISMATCH: Max difference = {max_diff:.2e}")
+            logger.warning(f"  Groups: {group_names}")
 
 def _plot_covariance_comparison(
     cov_components: Dict[str, np.ndarray],

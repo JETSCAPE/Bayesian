@@ -12,12 +12,12 @@ run_closure_tests: True
 
 plot:
   input_data: True
-  emulators: True
-  mcmc: True
   covariance: True
-  qhat: True
-  closure_tests: True
-  across_analyses: True
+  emulators: False
+  mcmc: False
+  qhat: False
+  closure_tests: False
+  across_analyses: False
 
 debug_level: 0
 
@@ -145,27 +145,11 @@ analysis_base: &model_base
       max: [0.5, 10, 10, 10, 100, 100, 1.5]
   alpha: 0.2
   validation_indices: [200, 202] # For exp parameterization, these are the same for all sqrts (i.e. all points 200-229 inclusive)
-  design_points_to_exclude: [55, 65]
-
-# Define base config for hadron analysis, since we will re-run with different pt cuts
-analysis_hadron_base: &analysis_hadron
-  parameters:
-    preprocessing:
-      <<: *default_preprocessing_parameters
-    emulators:
-      default_group:
-        <<: *default_emulator_parameters
-
-        observable_list:
-          - 'hadron__pt_'
-    mcmc:
-      <<: *default_mcmc_parameters
-    closure:
-      <<: *default_closure_parameters
-  <<: *model_base
-  plot_panel_shapes: [[3,3], [3,3]]
 
 analyses:
+  correlation_groups:
+    alice: "2:0.3"
+    cms: "5:0.95"
   analysis_jet:
     #external_covariance_file: 'Data/external_covariance_test.txt'
     parameters:
@@ -179,11 +163,10 @@ analyses:
           observable_list:
             - observable: '5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10'
               sys_data: ['sys_jec:alice', 'sys_taa:5020']
+              #sys_data: ['sum:5:0.9']
             - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.2__0-10'
               sys_data: ['sys_jec:cms', 'sys_taa:5020']
-          #correlation_groups:
-          #  alice: "10:0.9"
-          #  cms: "5:0.95"
+              #sys_data: ['sum:5:0.8']
       mcmc:
         <<: *default_mcmc_parameters
         n_walkers: 20

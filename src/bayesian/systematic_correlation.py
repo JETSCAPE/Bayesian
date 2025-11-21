@@ -2,82 +2,123 @@
 '''
 Systematic uncertainty correlation management for Bayesian inference
 
-This module provides functionality to handle systematic uncertainty correlations based on 
-user-defined correlation tags in configuration files.
+OVERVIEW:
+=========
+Manages correlation structure for systematic uncertainties in likelihood calculations.
+Supports two independent systematic uncertainty systems that cannot be mixed:
+
+1. LEGACY SYSTEM: Summed systematics with exponential decay (intra-observable only)
+2. ADVANCED SYSTEM: Individual systematics with group tags (cross-observable capable)
+
+Design principle: Simple, user-controlled correlation structure via configuration tags.
+No physics assumptions about systematic sources - user defines correlations explicitly.
 
 MAIN CLASSES:
-- SystematicInfo: Data structure for individual systematic uncertainty information
-- SystematicCorrelationManager: Core class managing correlation groups and covariance calculation
+=============
+SystematicInfo: Data structure for individual systematic uncertainty information
+SystematicCorrelationManager: Core class managing correlation groups and covariance calculation
 
 KEY FEATURES:
-- Parse correlation tags from config (e.g., 'jec:alice', 'taa:global', 'tracking:uncor')
-- Build correlation groups based on user-defined tags (no assumptions about tag meanings)
+=============
+- Parse correlation specifications from configuration (e.g., 'jec:alice', 'taa:global')
+- Build correlation groups based on user-defined tags (agnostic to tag meanings)
 - Create correlation-aware covariance matrices for likelihood calculations
 - Validation and debugging tools for correlation structure
 
 TWO SYSTEMATIC UNCERTAINTY APPROACHES:
-========================================
+======================================
 
-**LEGACY MODE** (from original STAT repository):
-- Configuration: 'sum:cor_length:cor_strength'
-- Sums all systematic sources in quadrature
-- Applies exponential decay correlation WITHIN observable only
-- Parameters:
-  * cor_length: Correlation length in bins (-1 = full correlation within observable)
-  * cor_strength: Correlation strength [0, 1]
-- Use case: Compatibility with original STAT repo, and for global analyses
+LEGACY MODE:
+---------------------------------------------
+Config format: 'sum:cor_length:cor_strength'
+Algorithm:
+  1. Sum all systematic sources in quadrature: σ_total = √(Σ σᵢ²)
+  2. Apply exponential decay correlation within observable:
+     ρ(i,j) = cor_strength × exp(-|i-j|/cor_length)
+  3. No cross-observable correlation possible
 
-**ADVANCED MODE** (recommended for new precision measurement):
-- Configuration: 'name:group_tag' (e.g., 'jec:alice', 'taa:global', 'tracking:uncor')
-- Tracks each systematic source separately
-- Group tags define cross-observable correlation structure:
-  * Same tag → fully correlated across observables
-  * Different tags → uncorrelated
-  * Special tag 'uncor' → diagonal (no correlation)
-- **Advantage:** Proper treatment of global systematics via shared tags
-- **Example:** 'taa:global' in multiple observables → TAA correlated across all
-- Use case: Recommended for all precision measurements
+Parameters:
+  cor_length: Correlation length in bins
+    -1 = fully correlated within observable
+    >0 = exponential decay over cor_length bins
+  cor_strength: Overall correlation strength [0, 1]
+    0 = uncorrelated, 1 = fully correlated
 
-CORRELATION MODEL:
-- Legacy: Exponential decay with cor_length and cor_strength, applies ONLY within observable
-- Advanced: Full correlation within groups defined by tags, applies across observables
-- Both: Individual systematic always fully correlated within its own observable
+Correlation structure:
+  Block-diagonal: Each observable independent
+  Intra-observable: Exponential decay based on bin separation
+  
+Use case: 
+  - Compatibility with original STAT repository
+  - Global analyses where cross-observable correlations are negligible
+  - Exploratory studies
 
-KEY DIFFERENCES:
-+------------------+-------------------------+---------------------------+
-| Aspect           | Legacy Mode (STAT)      | Advanced Mode             |
-+------------------+-------------------------+---------------------------+
-| Config format    | sum:length:strength     | name:tag                  |
-| Intra-obs corr   | Exponential decay       | Full correlation          |
-| Cross-obs corr   | Not possible            | Via group tags            |
-| Global sys       | Cannot handle           | Proper treatment          |
-| Parameters       | cor_length, cor_strength| Group tags                |
-| Use case         | STAT repo compatibility | Precision measurements    |
-+------------------+-------------------------+---------------------------+
+ADVANCED MODE (recommended for precision measurements):
+-------------------------------------------------------
+Config format: 'name:group_tag' (e.g., 'jec:alice', 'taa:global', 'tracking:uncor')
+Algorithm:
+  1. Track each systematic source separately
+  2. Group systematics by correlation tag
+  3. Apply full correlation within groups across all observables
+
+Group tags define correlation:
+  Same tag → fully correlated across all observables
+  Different tags → completely uncorrelated
+  Special tag 'uncor' → diagonal (no correlation even within observable)
+
+Examples:
+  'jec:alice' + 'jec:cms' → JEC uncorrelated between experiments
+  'taa:global' in all obs → TAA fully correlated everywhere
+  'tracking:uncor' → no correlation at all
+
+Advantage: Proper treatment of global systematics (TAA, luminosity, trigger efficiency)
+  Global systematic can affect multiple observables with correct correlation
+
+Use case:
+  - Precision physics measurements for publication
+  - Analyses with known global systematics
+  - Multi-experiment combinations
 
 USAGE EXAMPLE (Advanced Mode):
-    # Config file specifies correlation structure
-    observable_list:
-      - observable: 'jet_pt_alice'
-        sys_data: ['jec:alice', 'taa:global']      # JEC only for ALICE, TAA global
-      - observable: 'jet_pt_cms' 
-        sys_data: ['jec:cms', 'taa:global']        # JEC only for CMS, TAA shared via 'global' tag
-    
-    # Create and use correlation manager
-    correlation_manager = SystematicCorrelationManager()
-    correlation_manager.parse_configuration(parsed_observables)
-    correlation_manager.register_observable_ranges(observable_ranges)
-    
-    # Calculate correlation-aware covariance matrix
-    systematic_cov = correlation_manager.create_systematic_covariance_matrix(
-        systematic_uncertainties, systematic_names, n_features
-    )
+===============================
 
-DESIGN PRINCIPLE:
-- Keep both approaches for flexibility and backward compatibility
-- Legacy: Adequate for exploratory analyses, STAT repo compatibility
-- Advanced: Required for publication-quality precision measurements
-- User chooses via configuration format (automatic detection)
+# 1. Configuration specifies correlation structure
+observable_list:
+  - observable: 'jet_pt_alice'
+    sys_data: ['jec:alice', 'taa:global']      # JEC specific to ALICE, TAA global
+  - observable: 'jet_pt_cms' 
+    sys_data: ['jec:cms', 'taa:global']        # Different JEC, same TAA
+
+# 2. Create and configure correlation manager
+from systematic_correlation import SystematicCorrelationManager
+
+correlation_manager = SystematicCorrelationManager()
+correlation_manager.parse_configuration(parsed_observables)
+correlation_manager.register_observable_ranges(observable_ranges)
+
+# 3. Calculate correlation-aware covariance matrix
+systematic_cov = correlation_manager.create_systematic_covariance_matrix(
+    systematic_uncertainties,  # shape: (n_features, n_systematics)
+    systematic_names,          # list of 'name:tag' strings
+    n_features                 # total bins across all observables
+)
+
+# Result: systematic_cov shape (n_features, n_features)
+# - Diagonal blocks: individual systematic contributions within observables
+# - Off-diagonal: cross-observable correlations from shared tags
+
+IMPLEMENTATION NOTES:
+=====================
+- SystematicInfo stores metadata for each systematic source
+- Correlation groups built during parse_configuration()
+- Covariance matrix construction happens during MCMC initialization
+- Exponential decay only applies to summed systematics
+- Individual systematics always fully correlated within their observable
+- Serialization/deserialization supported for HDF5 storage
+
+For data loading and integration, see data_IO.py
+For likelihood calculation, see log_posterior.py
+For visualization, see plot_covariance.py
 
 .. codeauthor:: Jingyu Zhang <jingyu.zhang@cern.ch>, Vanderbilt
 '''
@@ -114,12 +155,33 @@ class SystematicInfo:
     cor_strength: float = 1.0   # Only applies to sum
     
     def __post_init__(self):
+        """Validate systematic info after initialization."""
         self.is_uncorrelated = (self.correlation_tag.lower() == 'uncor')
         
         # Validation: individual systematics should not have correlation parameters
         if not self.is_summed:
             if self.cor_length != -1 or self.cor_strength != 1.0:
-                logger.warning(f"Individual systematic {self.full_name} has cor_length/cor_strength - these are ignored")
+                logger.warning(
+                    f"Individual systematic {self.full_name} has cor_length/cor_strength "
+                    f"(length={self.cor_length}, strength={self.cor_strength}). "
+                    f"These parameters are ignored - individual systematics use full correlation "
+                    f"within observable and group tags for cross-observable correlation."
+                )
+        
+        # Validation: summed systematics should not be uncorrelated
+        if self.is_summed and self.is_uncorrelated:
+            raise ValueError(
+                f"Summed systematic {self.full_name} cannot be uncorrelated. "
+                f"Sum systematics combine multiple sources - use individual systematics with 'uncor' tag instead."
+            )
+        
+        # Validation: correlation strength bounds
+        if self.cor_strength < 0.0 or self.cor_strength > 1.0:
+            logger.warning(
+                f"Correlation strength {self.cor_strength} for {self.full_name} outside [0,1]. "
+                f"Clipping to valid range."
+            )
+            self.cor_strength = np.clip(self.cor_strength, 0.0, 1.0)
 
 def parse_systematic_config(sys_config_string: str) -> Dict:
     """
@@ -248,7 +310,7 @@ class SystematicCorrelationManager:
             - Cross-observable correlation via group tags
             - Clean physics interpretation
         
-        System 2 - Summed systematics (LEGACY):
+        System 2 - Summed systematics:
             Format: 'sum:cor_length:cor_strength' or 'sum'
             - Intra-observable correlation via cor_length/cor_strength
             - NO cross-observable correlation
@@ -267,22 +329,14 @@ class SystematicCorrelationManager:
         for obs_name, sys_data_list, sys_theory_list in parsed_observables:
             self.observable_systematics[obs_name] = []
             
-            # Check for mixing (not allowed)
-            has_individual = False
-            has_sum = False
-            
-            for sys_config_string in sys_data_list:
-                config = parse_systematic_config(sys_config_string)
-                
-                if config['type'] == 'sum':
-                    has_sum = True
-                else:
-                    has_individual = True
-            
-            if has_individual and has_sum:
+            # Check for mixing (not allowed) - collect types first
+            sys_types = {parse_systematic_config(s)['type'] for s in sys_data_list}
+
+            if len(sys_types) > 1:
                 raise ValueError(
-                    f"Observable '{obs_name}' mixes individual and sum systematics. "
-                    f"You must use EITHER individual systematics OR sum, not both."
+                    f"Observable '{obs_name}' mixes different systematic types: {sys_types}. "
+                    f"You must use EITHER individual systematics ('name:tag') "
+                    f"OR summed systematics ('sum:...'), not both."
                 )
             
             # Now process systematics
@@ -343,12 +397,26 @@ class SystematicCorrelationManager:
         self._pending_correlation_params = correlation_groups_params
         logger.info(f"Stored parameters for {len(correlation_groups_params)} group tags")
 
-    def _apply_correlation_parameters(self, correlation_groups_params: Dict[str, str]):
+    def _apply_correlation_parameters(self, correlation_groups_params: Dict[str, str]) -> None:
         """
-        Set correlation parameters for individual systematic groups from config.
+        Apply correlation parameters to individual systematic groups from config.
+        
+        This is the internal method that actually updates SystematicInfo objects.
+        Called by set_correlation_parameters() after groups are registered.
+        
+        For each correlation group tag, updates all individual systematics in that
+        group with the specified cor_length and cor_strength parameters.
+        
+        NOTE: Only applies to individual systematics, not summed systematics.
+        NOTE: This is called automatically during covariance matrix construction.
         
         Args:
             correlation_groups_params: Dict like {'alice': '10:0.9', 'cms': '5:0.95'}
+                                    Keys are group tags, values are 'length:strength'
+            
+        Example:
+            >>> manager._apply_correlation_parameters({'alice': '10:0.8'})
+            # Updates all systematics in 'alice' group with length=10, strength=0.8
         """
         logger.info("Setting correlation parameters from correlation_groups config...")
         
@@ -406,7 +474,7 @@ class SystematicCorrelationManager:
         
         logger.info("Correlation parameter configuration complete")
 
-    def register_observable_ranges(self, observable_ranges: List[Tuple[int, int, str]]):
+    def register_observable_ranges(self, observable_ranges: List[Tuple[int, int, str]]) -> None:
         """
         Register which features belong to which observables and build correlation groups.
         
@@ -444,7 +512,7 @@ class SystematicCorrelationManager:
         if self._pending_correlation_params:
             self._apply_correlation_parameters(self._pending_correlation_params)
 
-    def resolve_bin_counts(self, observable_ranges: List[Tuple[int, int, str]]):
+    def resolve_bin_counts(self, observable_ranges: List[Tuple[int, int, str]]) -> None:
         """
         Resolve cor_length=-1 to actual bin counts for SUMMED systematics only.
         

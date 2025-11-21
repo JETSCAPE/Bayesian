@@ -15,7 +15,7 @@ Key features:
 - Component-wise breakdown of uncertainty sources
 - Diagnostic plots for validation
 
-Authors: Jingyu Zhang (2025)
+.. codeauthor:: Jingyu Zhang <jingyu.zhang@cern.ch>, Vanderbilt
 """
 
 import logging

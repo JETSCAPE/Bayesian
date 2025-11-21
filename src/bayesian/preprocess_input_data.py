@@ -102,7 +102,7 @@ def smooth_statistical_outliers_in_predictions(
     # Setup for observables
     all_observables = data_IO.read_dict_from_h5(preprocessing_config.output_dir, 'observables.h5')
 
-    # Stage 1: Filter design points (NEW)
+    # Stage 1: Filter design points 
     logger.info("Filtering outliers in predictions...")
     filtering_config_dict = preprocessing_config.analysis_config['parameters']['preprocessing'].get('filtering', {})
     if filtering_config_dict.get('enable', False):

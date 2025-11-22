@@ -32,7 +32,7 @@ the following functionality to interoperate with this package:
       emulator_settings: EmulatorSettings,
       additional_covariance: npt.NDArray[np.float64] | None = None,
   ) -> dict[str, npt.NDArray[np.float64]]:
-      '''Fit the emulator to the data.  # ruff: noqa
+      '''Fit the emulator to the data.  # fmt: skip
 
       Args:
         parameters: Array of parameter values (e.g. [tau0, c1, c2, ...]), with shape (n_samples, n_parameters).
@@ -42,7 +42,7 @@ the following functionality to interoperate with this package:
 
       Returns:
           emulator_predictions: dictionary containing matrices of central values and covariance
-      '''  # ruff: noqa
+      '''  # fmt: skip
       ...
   ```
 - predict(...): Function to predict forward model values and covariance given a set of parameters.
@@ -53,7 +53,7 @@ the following functionality to interoperate with this package:
       emulator_settings: EmulatorSettings,
       additional_covariance: npt.NDArray[np.float64] | None = None,
   ) -> dict[str, npt.NDArray[np.float64]]:
-      '''Predict the values at the given parameters by calculating their expected value via the emulator.  # ruff: noqa
+      '''Predict the values at the given parameters by calculating their expected value via the emulator.  # fmt: skip
 
       Args:
         parameters: Array of parameter values (e.g. [tau0, c1, c2, ...]), with shape (n_samples, n_parameters).
@@ -63,7 +63,7 @@ the following functionality to interoperate with this package:
 
       Returns:
           emulator_predictions: dictionary containing matrices of central values and covariance
-      '''  # ruff: noqa
+      '''  # fmt: skip
       ...
   ```
 - Additional covariance: Optional function to compute additional covariance terms, such as
@@ -72,14 +72,14 @@ the following functionality to interoperate with this package:
   def compute_additional_covariance_contributions(
       emulator_settings: EmulatorSettings, emulator_result: dict[str, Any]
   ) -> npt.NDArray[np.float64]:
-      '''Compute additional covariance contributions.  # ruff: noqa
+      '''Compute additional covariance contributions.  # fmt: skip
 
       Args:
           emulator_settings: Emulator settings.
           emulator_result: Emulator training results.
       Returns:
           Unexplained covariance
-      '''  # ruff: noqa
+      '''  # fmt: skip
       ...
   ```
 - EmulatorSettings: Class which provides the settings for the emulator. Must implement

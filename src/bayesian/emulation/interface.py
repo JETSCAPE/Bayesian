@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from types import ModuleType
-from typing import Any
+from typing import Any, TypeVar
 
 import attrs
 import numpy as np
@@ -93,15 +93,15 @@ def fit_emulators(emulation_config: EmulationConfig, analysis_settings: analysis
     #       it doesn't appear to be at the moment (August 2023), so we leave as is.
 
 
-def predict_from_emulator(
-    parameters: npt.NDArray[np.float64],
-    emulation_config: EmulationConfig,
-    merge_predictions_over_groups: bool = True,
-    emulation_group_results: dict[str, dict[str, Any]] | None = None,
-    emulator_cov_unexplained: dict[str, dict[str, Any]] | None = None,
-) -> dict[str, npt.NDArray[np.float64]]:
-    # Called from MCMC
-    ...
+# def predict_from_emulator(
+#     parameters: npt.NDArray[np.float64],
+#     emulation_config: EmulationConfig,
+#     merge_predictions_over_groups: bool = True,
+#     emulation_group_results: dict[str, dict[str, Any]] | None = None,
+#     emulator_cov_unexplained: dict[str, dict[str, Any]] | None = None,
+# ) -> dict[str, npt.NDArray[np.float64]]:
+#     # Called from MCMC
+#     ...
 
 
 def predict(
@@ -158,16 +158,17 @@ def predict(
         # include the unexplained variance due to PC truncation for an emulator.
         if emulator_additional_covariance:
             additional_covariance = emulator_additional_covariance[emulator_name]
-        else:
-            # TODO(RJE): This is specific to PCA emulators... How can I handle this generically?
-            # TODO(RJE): Add an additional covariance option to the method?
-            additional_covariance = emulator.compute_additional_covariance_contributions(emulator_settings, emulator_result)
+        elif hasattr(emulator, "compute_additional_covariance_contributions"):
+            additional_covariance = emulator.compute_additional_covariance_contributions(
+                emulator_settings=emulator_settings,
+                emulator_result=emulator_result,
+            )
 
         predict_output[emulator_name] = emulator.predict(
             parameters,
             emulator_result,
             emulator_settings,
-            emulator_group_cov_unexplained=additional_covariance,
+            additional_covariance=additional_covariance,
         )
 
     # Allow the option to return immediately to allow the study of performance per emulation group
@@ -340,14 +341,16 @@ class SortEmulationGroupObservables:
     ) -> dict[str, npt.NDArray[np.float64]]:
         """Convert a matrix to match the sorted observables.
 
-        :param group_matrices: Matrixes to convert by emulation group. eg:
-            {"group_1": {"central_value": np.array, "cov": [...]}, "group_2": np.array}
-        :return: Converted matrix for each available value type.
+        Args:
+            group_matrices: Matrixes to convert by emulation group. eg:
+                {"group_1": {"central_value": np.array, "cov": [...]}, "group_2": np.array}.
+        Returns:
+            Converted matrix for each available value type.
         """
         if self._available_value_types is None:
             self._available_value_types = set([value_type for group in group_matrices.values() for value_type in group])  # noqa: C403
 
-        output = {}
+        output: dict[str, npt.NDArray[np.float64]] = {}
         # Requires special handling since we're adding matrices (ie. 3d rather than 2d)
         if "cov" in self._available_value_types:
             # Setup
@@ -357,7 +360,7 @@ class SortEmulationGroupObservables:
             # However, it's not quite as trivial to just insert them (as we do for the central values),
             # so we'll use the output matrix slice as the key to sort by below.
             inputs_for_block_diag = {}
-            for observable_name, (
+            for observable_name, (  # noqa: B007
                 emulation_group_name,
                 slice_in_output_matrix,
                 slice_in_emulation_group_matrix,
@@ -390,14 +393,13 @@ class SortEmulationGroupObservables:
             # Since the number of design points that we want to predict varies, we can't define the output
             # until we can extract it from one group output. So we wait to initialize the output matrix until
             # we have the first group output.
-            output[value_type] = None
-            for observable_name, (
+            for observable_name, (  # noqa: B007
                 emulation_group_name,
                 slice_in_output_matrix,
                 slice_in_emulation_group_matrix,
             ) in self.emulation_group_to_observable_matrix.items():
                 emulation_group_matrix = group_matrices[emulation_group_name]
-                if output[value_type] is None:
+                if value_type not in output:
                     output[value_type] = np.zeros((emulation_group_matrix[value_type].shape[0], *self.shape[1:]))
                 output[value_type][:, slice_in_output_matrix] = emulation_group_matrix[value_type][
                     :, slice_in_emulation_group_matrix
@@ -406,7 +408,11 @@ class SortEmulationGroupObservables:
         return output
 
 
-def nd_block_diag(arrays: list[npt.NDArray[np.float32 | np.float64]]) -> npt.NDArray[np.float32 | np.float64]:
+# Define a type variable that can be any floating point type
+T = TypeVar("T", np.float32, np.float64)
+
+
+def nd_block_diag(arrays: list[npt.NDArray[T]]) -> npt.NDArray[T]:
     """Add 2D matrices into a block diagonal matrix in n-dimensions.
 
     See: https://stackoverflow.com/q/62384509
@@ -418,7 +424,9 @@ def nd_block_diag(arrays: list[npt.NDArray[np.float32 | np.float64]]) -> npt.NDA
     """
     shapes = np.array([i.shape for i in arrays])
 
-    out = np.zeros(np.append(np.amax(shapes[:, :-2], axis=0), [shapes[:, -2].sum(), shapes[:, -1].sum()]))
+    out = np.zeros(
+        np.append(np.amax(shapes[:, :-2], axis=0), [shapes[:, -2].sum(), shapes[:, -1].sum()]), dtype=arrays[0].dtype
+    )
     r, c = 0, 0
     for i, (rr, cc) in enumerate(shapes[:, -2:]):
         out[..., r : r + rr, c : c + cc] = arrays[i]
@@ -428,22 +436,22 @@ def nd_block_diag(arrays: list[npt.NDArray[np.float32 | np.float64]]) -> npt.NDA
     return out
 
 
-def compute_emulator_cov_unexplained(
-    emulation_config: EmulationConfig, emulation_results, analysis_settings: analysis.AnalysisSettings
-) -> dict:
-    """
-    Compute the predictive variance due to PC truncation, for all emulator groups.
-    See further details in compute_emulator_group_cov_unexplained().
-    """
-    emulator_cov_unexplained = {}
-    if not emulation_results:
-        emulation_results = emulation_config.read_all_emulator_groups(analysis_settings)
-    for emulator_name, emulator_settings in emulation_config.emulation_settings.items():
-        emulation_group_result = emulation_results.get(emulator_name)
-        emulator_cov_unexplained[emulator_name] = compute_emulator_group_cov_unexplained(
-            emulator_settings, emulation_group_result
-        )
-    return emulator_cov_unexplained
+# def compute_emulator_cov_unexplained(
+#     emulation_config: EmulationConfig, emulation_results, analysis_settings: analysis.AnalysisSettings
+# ) -> dict:
+#     """
+#     Compute the predictive variance due to PC truncation, for all emulator groups.
+#     See further details in compute_emulator_group_cov_unexplained().
+#     """
+#     emulator_cov_unexplained = {}
+#     if not emulation_results:
+#         emulation_results = emulation_config.read_all_emulator_groups(analysis_settings)
+#     for emulator_name, emulator_settings in emulation_config.emulation_settings.items():
+#         emulation_group_result = emulation_results.get(emulator_name)
+#         emulator_cov_unexplained[emulator_name] = compute_emulator_group_cov_unexplained(
+#             emulator_settings, emulation_group_result
+#         )
+#     return emulator_cov_unexplained
 
 
 # Actually perform the discovery and registration of the emulators

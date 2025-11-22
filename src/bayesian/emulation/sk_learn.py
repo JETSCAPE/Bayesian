@@ -197,7 +197,7 @@ def predict(
     parameters: npt.NDArray[np.float64],
     results: dict[str, Any],
     emulator_settings: EmulatorSettings,
-    emulator_cov_unexplained: npt.NDArray[np.float64] | None = None,
+    additional_covariance: npt.NDArray[np.float64] | None = None,
 ) -> dict[str, npt.NDArray[np.float64]]:
     """Construct dictionary of emulator predictions for each observable in an emulation group.
 
@@ -229,8 +229,13 @@ def predict(
     # The emulators are stored as a list (one for each PC)
     emulators = results["emulators"]
 
-    if emulator_cov_unexplained is None:
-        emulator_cov_unexplained = compute_emulator_cov_unexplained(emulator_settings, results)
+    if additional_covariance is None:
+        # Here, this corresponds to the unexplained covariance due to truncated the PCA.
+        # See this function for additional details.
+        additional_covariance = compute_additional_covariance_contributions(
+            emulator_settings=emulator_settings,
+            emulator_result=results,
+        )
 
     # Get predictions (in PC space) from each emulator and concatenate them into a numpy array with shape (n_samples, n_PCs)
     # Note: we just get the std rather than cov, since we are interested in the predictive uncertainty
@@ -277,7 +282,7 @@ def predict(
     # Include predictive variance due to truncated PCs.
     # See comments in mcmc.py for further details.
     for i_sample in range(n_samples):
-        emulator_cov_reconstructed_scaled[i_sample] += emulator_cov_unexplained / n_samples
+        emulator_cov_reconstructed_scaled[i_sample] += additional_covariance / n_samples
 
     # Propagate uncertainty: inverse preprocessing
     # We only need to undo the unit variance scaling, since the shift does not affect the covariance matrix.
@@ -307,6 +312,7 @@ def compute_additional_covariance_contributions(
     Returns:
         Unexplained covariance
     """
+    # In the case of sk-learn, all we need to handle is the unexplained variance due to PCA truncation.
     return compute_emulator_cov_unexplained(emulator_settings=emulator_settings, emulator_result=emulator_result)
 
 

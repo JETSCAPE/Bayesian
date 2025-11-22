@@ -1,14 +1,101 @@
-"""
-Module related to emulators, with functionality to train and call emulators for a given analysis run
+"""Defines the interface for interacting with emulators.
 
-The main functionalities are:
- - fit_emulators() performs PCA, fits an emulator to each PC, and writes the emulator to file
- - predict() construct mean, std of emulator for a given set of parameter values
+# Users interested in emulating expensive forward models
 
-A configuration class EmulationConfig provides simple access to emulation settings
+Emulation is handled through the `EmulationConfig` class. The concept is that
+you can configure one or more emulators to provide emulation of the expensive
+forward model. You use multiple emulators if you want:
+- Different emulators for different observables. e.g. one devoted to hadron RAA,
+  and another devoted to jet RAA.
+- You want to use different packages to perform emulation.
+You can mix and max these options as desired![^1]
+
+Using the EmulationConfig, there are two main functionalities:
+ - fit_emulator(), which trains the emulator(s) on the provided data.
+ - predict() construct mean, std dev of emulator(s) for a given set of parameter values.
+
+This code is based in part on JETSCAPE/STAT codebase.
+
+[^1]: The impact of using different emulators for different observables at the same time
+      hasn't been tested as of Nov 2025, so it should be used with care!
+
+# Developers interested in implementing new emulation packages
+
+If you're interested in implementing your own emulation package, you need to implement
+the following functionality to interoperate with this package:
+
+- fit_emulator(...): Function to train the emulator given some data:
+  ```python
+  def fit_emulator(
+      parameters: npt.NDArray[np.float64],
+      results: dict[str, Any],
+      emulator_settings: EmulatorSettings,
+      additional_covariance: npt.NDArray[np.float64] | None = None,
+  ) -> dict[str, npt.NDArray[np.float64]]:
+      '''Fit the emulator to the data.  # ruff: noqa
+
+      Args:
+        parameters: Array of parameter values (e.g. [tau0, c1, c2, ...]), with shape (n_samples, n_parameters).
+        results: Dictionary that stores output from the emulator.
+        emulator_settings: Emulator settings.
+        additional_covariance: Addition to the covariance due to the emulator.
+
+      Returns:
+          emulator_predictions: dictionary containing matrices of central values and covariance
+      '''  # ruff: noqa
+      ...
+  ```
+- predict(...): Function to predict forward model values and covariance given a set of parameters.
+  ```python
+  def predict(
+      parameters: npt.NDArray[np.float64],
+      results: dict[str, Any],
+      emulator_settings: EmulatorSettings,
+      additional_covariance: npt.NDArray[np.float64] | None = None,
+  ) -> dict[str, npt.NDArray[np.float64]]:
+      '''Predict the values at the given parameters by calculating their expected value via the emulator.  # ruff: noqa
+
+      Args:
+        parameters: Array of parameter values (e.g. [tau0, c1, c2, ...]), with shape (n_samples, n_parameters).
+        results: Dictionary that stores output from the emulator.
+        emulator_settings: Emulator settings.
+        additional_covariance: Addition to the covariance due to the emulator.
+
+      Returns:
+          emulator_predictions: dictionary containing matrices of central values and covariance
+      '''  # ruff: noqa
+      ...
+  ```
+- Additional covariance: Optional function to compute additional covariance terms, such as
+  the additional covariance due to PCA truncation.
+  ```python
+  def compute_additional_covariance_contributions(
+      emulator_settings: EmulatorSettings, emulator_result: dict[str, Any]
+  ) -> npt.NDArray[np.float64]:
+      '''Compute additional covariance contributions.  # ruff: noqa
+
+      Args:
+          emulator_settings: Emulator settings.
+          emulator_result: Emulator training results.
+      Returns:
+          Unexplained covariance
+      '''  # ruff: noqa
+      ...
+  ```
+- EmulatorSettings: Class which provides the settings for the emulator. Must implement
+  the emulation.base.EmulatorSettings Protocol! This settings class will be passed to
+  the fit_emulator() and predict() functions. See the Protocol definition for further
+  information.
+- _register_name: Name under which the emulator will be registered. The framework
+  will automatically register all modules in the `emulation` directory.
+
+The `emulation.base` module contains functionality which helps implement emulators.
+See it for further information.
+
+The sk_learn module contains the canonical implementation as of Nov 2025, so if this
+specification is unclear, it's often best to consult there.
 
 .. codeauthor:: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
-Based in part on JETSCAPE/STAT code.
 """
 
 from __future__ import annotations
@@ -30,16 +117,7 @@ _emulators: dict[str, ModuleType] = {}
 
 
 def _validate_emulator(name: str, module: ModuleType) -> None:
-    """
-    Validate that an emulator module follows the expected interface.
-    """
-    # Required functions
-    required_functions = ["fit_emulator", "predict"]
-    for function_name in required_functions:
-        if not hasattr(module, function_name):
-            msg = f"Emulator module {name} does not have a required '{function_name}' method"
-            raise ValueError(msg)
-
+    """Validate that an emulator module follows the expected interface."""
     # Optional: This check is just for information!
     optional_functions = ["compute_additional_covariance_contributions"]
     found_optional_functions = []
@@ -54,7 +132,7 @@ def _validate_emulator(name: str, module: ModuleType) -> None:
 
 
 def fit_emulators(emulation_config: EmulationConfig, analysis_settings: analysis.AnalysisSettings) -> None:
-    """Do PCA, fit emulators, and write to file.
+    """Fit the emulator(s) to the data included in the analysis, and write to file.
 
     Args:
         emulation_config: Overall emulation configuration.
@@ -408,7 +486,7 @@ class SortEmulationGroupObservables:
         return output
 
 
-# Define a type variable that can be any floating point type
+# Any float32 or float64 type, which we will use to pair input and output values.
 T = TypeVar("T", np.float32, np.float64)
 
 
@@ -459,7 +537,19 @@ if not _emulators:
     _emulators.update(
         register_modules.discover_and_register_modules(
             calling_module_name=__name__,
-            required_attributes=["EmulatorSettings"],
+            # Explanation of required attributes:
+            # Classes:
+            #  - EmulatorSettings is the required class
+            #    NOTE: We cannot trivially check that the EmulatorSettings class satisfies
+            #          the protocol since we would have to instantiate the class, which
+            #          isn't so trivial at this point. But we'll leave it as a separate block
+            #          in case we get a better idea in the future.
+            # Functions:
+            #  - "fit_emulator"
+            #  - "predict"
+            #  - "compute_additional_covariance_contributions": Optional, so we
+            #    check in the separate validation function.
+            required_attributes=["EmulatorSettings", "fit_emulator", "predict"],
             validation_function=_validate_emulator,
         )
     )

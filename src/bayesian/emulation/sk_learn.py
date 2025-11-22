@@ -1,15 +1,15 @@
-"""
-Module related to emulators, with functionality to train and call emulators for a given analysis run
+"""Gaussian Process Emulator from scikit-learn.
 
-The main functionalities are:
- - fit_emulator() performs PCA, fits an emulator to each PC, and writes the emulator to file
- - predict() construct mean, std of emulator for a given set of parameter values
+This emulator does a PCA on the data and truncates at some number of components
+before fitting to reduce the dimensionality of the training. As of Nov 2025,
+this is common in heavy-ions, and seems to provide reasonable performance.
+Note that this truncation leads to some additional covariance term, which we
+track and propagate.
 
-A configuration class EmulationConfig provides simple access to emulation settings
-
-.. codeauthor: James Mulligan, LBL/UCB
-.. codeauthor: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
 Based in part on JETSCAPE/STAT code.
+
+.. codeauthor: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
+.. codeauthor: James Mulligan, LBL/UCB
 """
 
 from __future__ import annotations
@@ -26,17 +26,17 @@ import sklearn.gaussian_process as sklearn_gaussian_process
 import sklearn.preprocessing as sklearn_preprocessing
 import yaml
 
-from bayesian import analysis, common_base, data_IO
+from bayesian import analysis, data_IO
 from bayesian.emulation import base as emulation_base
 
 logger = logging.getLogger(__name__)
 
+# Name under which the module is registered.
 _register_name = "sk_learn"
 
 
 def fit_emulator(config: SKLearnEmulatorSettings, analysis_settings: analysis.AnalysisSettings) -> dict[str, Any]:
-    """
-    Do PCA, fit emulators, and write to file for an individual emulation.
+    """Do PCA and fit the emulator.
 
     The first config.n_pc principal components (PCs) are emulated by independent Gaussian processes (GPs)
     The emulators map design points to PCs; the output will need to be inverted from PCA space to physical space.
@@ -172,13 +172,13 @@ def fit_emulator(config: SKLearnEmulatorSettings, analysis_settings: analysis.An
         for y in Y_pca_truncated.T
     ]
 
-    # Print hyperparameters
+    # Print hyperparameters.
     logger.info("")
     logger.info("Kernel hyperparameters:")
     [logger.info(f"  {emulator.kernel_}") for emulator in emulators]  # type: ignore[func-returns-value]
     logger.info("")
 
-    # Write all info we want to file
+    # Write all info we want to the output dictionary.
     output_dict: dict[str, Any] = {}
     output_dict["PCA"] = {}
     output_dict["PCA"]["Y"] = Y
@@ -199,7 +199,7 @@ def predict(
     emulator_settings: EmulatorSettings,
     additional_covariance: npt.NDArray[np.float64] | None = None,
 ) -> dict[str, npt.NDArray[np.float64]]:
-    """Construct dictionary of emulator predictions for each observable in an emulation group.
+    """Predict the values at the given parameters by calculating their expected value via the emulator.
 
     This function generally implements predict for a set of emulators where we do PCA beforehand.
     However, enough of the details are specific to the sk_learn implementation, such that we can't
@@ -220,7 +220,9 @@ def predict(
 
     Args:
         parameters: Array of parameter values (e.g. [tau0, c1, c2, ...]), with shape (n_samples, n_parameters).
-        results: Dictionary that stores emulator
+        results: Dictionary that stores output from the emulator.
+        emulator_settings: Emulator settings.
+        additional_covariance: Addition to the covariance due to the emulator.
 
     Returns:
         emulator_predictions: dictionary containing matrices of central values and covariance
@@ -253,8 +255,8 @@ def predict(
 
     # Reconstruct the physical space from the PCs, and invert preprocessing.
     # Note we use array broadcasting to calculate over all samples.
-    pca = results["PCA"]["pca"]
-    scaler = results["PCA"]["scaler"]
+    pca: sklearn_decomposition.PCA = results["PCA"]["pca"]
+    scaler: sklearn_preprocessing.StandardScaler = results["PCA"]["scaler"]
     emulator_central_value_reconstructed_scaled = emulator_central_value.dot(
         pca.components_[: emulator_settings.n_pc, :]
     )
@@ -357,7 +359,7 @@ def compute_emulator_cov_unexplained(
 
 
 @attrs.define
-class SKLearnEmulatorSettings(common_base.CommonBase):
+class SKLearnEmulatorSettings:
     emulator_name: ClassVar[str] = "sk_learn"
     base_settings: emulation_base.BaseEmulatorSettings
     # PCA settings

@@ -98,7 +98,7 @@ def predict_from_emulator(
     emulation_config: EmulationConfig,
     merge_predictions_over_groups: bool = True,
     emulation_group_results: dict[str, dict[str, Any]] | None = None,
-    emulator_cov_unexplained: dict | None = None,
+    emulator_cov_unexplained: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, npt.NDArray[np.float64]]:
     # Called from MCMC
     ...
@@ -110,8 +110,8 @@ def predict(
     *,
     analysis_settings: analysis.AnalysisSettings,
     merge_predictions_over_groups: bool = True,
-    emulators_results: dict[str, Any] | None = None,
-    emulator_cov_unexplained: dict[str, Any] | None = None,
+    emulator_results: dict[str, Any] | None = None,
+    emulator_additional_covariance: dict[str, Any] | None = None,
 ) -> dict[str, npt.NDArray[np.float64]]:
     """Construct dictionary of emulator predictions for each observable
 
@@ -121,21 +121,22 @@ def predict(
         analysis_settings: Analysis settings.
         merge_predictions_over_groups: If True, merge predictions over emulators. If false, return a dictionary
             of predictions for each emulator. Default: True
-        emulators_results: Dictionary containing results from each emulator. If None, read from file. Default: None.
-        emulator_cov_unexplained: Dictionary containing the unexplained variance due to PC truncation for each
-            emulator. Generally we will precompute this in the MC sampling to save time, but if it is not precomputed
-            (e.g. when plotting), we will automatically compute it here.
+        emulator_results: Dictionary containing results from each emulator. If None, read from file. Default: None.
+        emulator_additional_covariance: Dictionary containing the additional covariance for each emulator. The source
+            depends on the emulator (e.g. for PCA, this is the unexplained variance from the PCA). Generally we will
+            precompute this in the MC sampling to save time, but if it is not precomputed (e.g. when plotting), we will
+            automatically compute it here. If None, will be calculated. Default: None.
         emulator_predictions: Dictionary containing matrices of central values and covariance
     """
-    if emulators_results is None:
-        emulators_results = {}
-    if emulator_cov_unexplained is None:
-        emulator_cov_unexplained = {}
+    if emulator_results is None:
+        emulator_results = {}
+    if emulator_additional_covariance is None:
+        emulator_additional_covariance = {}
 
     predict_output = {}
     for emulator_name, emulator_settings in emulation_config.emulation_settings.items():
-        emulator_result = emulators_results.get(emulator_name)
-        # Only load the emulator group directly from file if needed. If called frequently
+        emulator_result = emulator_results.get(emulator_name)
+        # Only load the emulator directly from file if needed. If called frequently
         # (eg. in the MCMC), it's probably better to load it once and pass it in.
         # NOTE: I know that get() can provide a second argument as the default, but a quick check showed that
         #       `read_emulators` was executing far more than expected (maybe trying to determine some default value?).
@@ -145,14 +146,7 @@ def predict(
                 emulator_settings=emulator_settings, analysis_settings=analysis_settings
             )
 
-        # Compute unexplained variance due to PC truncation for this emulator group, if not already precomputed
-        if emulator_cov_unexplained:
-            emulator_group_cov_unexplained = emulator_cov_unexplained[emulator_name]
-        else:
-            # TODO(RJE): This is specific to PCA emulators... How can I handle this generically?
-            # TODO(RJE): Add an additional covariance option to the method?
-            emulator_group_cov_unexplained = compute_emulator_group_cov_unexplained(emulator_settings, emulator_result)
-
+        # We need the emulator module to proceed further
         try:
             # The emulator name specifies the emulator package
             emulator = _emulators[emulator_settings.emulator_name]
@@ -160,11 +154,20 @@ def predict(
             msg = f"Emulator backend '{emulator_settings.emulator_name}' not registered or available"
             raise KeyError(msg) from e
 
+        # Compute additional covariance due to the emulator, if not precomputed. For example, this could
+        # include the unexplained variance due to PC truncation for an emulator.
+        if emulator_additional_covariance:
+            additional_covariance = emulator_additional_covariance[emulator_name]
+        else:
+            # TODO(RJE): This is specific to PCA emulators... How can I handle this generically?
+            # TODO(RJE): Add an additional covariance option to the method?
+            additional_covariance = emulator.compute_additional_covariance_contributions(emulator_settings, emulator_result)
+
         predict_output[emulator_name] = emulator.predict(
             parameters,
             emulator_result,
             emulator_settings,
-            emulator_group_cov_unexplained=emulator_group_cov_unexplained,
+            emulator_group_cov_unexplained=additional_covariance,
         )
 
     # Allow the option to return immediately to allow the study of performance per emulation group
@@ -238,8 +241,8 @@ class EmulationConfig:
             for emulator_config in self.emulation_settings.values():
                 group_filter = emulator_config.base_settings.observable_filter
                 if group_filter:
-                    include_list.extend(group_filter.include_list)  # type: ignore[union-attr]
-                    exclude_list.extend(group_filter.exclude_list)  # type: ignore[union-attr]
+                    include_list.extend(group_filter.include_list)
+                    exclude_list.extend(group_filter.exclude_list)
 
             self._observable_filter = data_IO.ObservableFilter(
                 include_list=include_list,

@@ -16,7 +16,6 @@ import numpy.typing as npt
 import yaml
 
 from bayesian import common_base, data_IO, outliers_smoothing
-
 from bayesian.outliers_smoothing import (
     FilteringConfig,
     filter_problematic_design_points,
@@ -89,8 +88,7 @@ def _find_physics_motivated_outliers(
             logger.info(f"{res=}")
             logger.info(observables[prediction_key][observable_key]["y"][:, res[1]])
 
-
-    print(i_design_point_to_exclude)
+    logger.debug(f"{i_design_point_to_exclude=}")
     # TODO: Probably should return the values rather than just print them...
     logger.warning(f"ad-hoc points to exclude: {sorted(i_design_point_to_exclude)}")
 
@@ -98,39 +96,37 @@ def _find_physics_motivated_outliers(
 def smooth_statistical_outliers_in_predictions(
     preprocessing_config: PreprocessingConfig,
 ) -> dict[str, Any]:
-    """ Steer smoothing of statistical outliers in predictions. """
+    """Steer smoothing of statistical outliers in predictions."""
     # Setup for observables
-    all_observables = data_IO.read_dict_from_h5(preprocessing_config.output_dir, 'observables.h5')
+    all_observables = data_IO.read_dict_from_h5(preprocessing_config.output_dir, "observables.h5")
 
     # Stage 1: Filter design points
     logger.info("Filtering outliers in predictions...")
-    filtering_config_dict = preprocessing_config.analysis_config['parameters']['preprocessing'].get('filtering', {})
-    if filtering_config_dict.get('enable', False):
-        from bayesian.outliers_smoothing import FilteringConfig, filter_problematic_design_points
-
+    filtering_config_dict = preprocessing_config.analysis_config["parameters"]["preprocessing"].get("filtering", {})
+    if filtering_config_dict.get("enable", False):
         filtering_config = FilteringConfig(
-            method=filtering_config_dict.get('method', 'relative_statistical_error'),
-            threshold=filtering_config_dict.get('threshold', 0.7),
-            min_design_points=filtering_config_dict.get('min_design_points', 50),
-            max_filtered_fraction=filtering_config_dict.get('max_filtered_fraction', 0.2),
-            problem_fraction_threshold=filtering_config_dict.get('problem_fraction_threshold', 0.3),
+            method=filtering_config_dict.get("method", "relative_statistical_error"),
+            threshold=filtering_config_dict.get("threshold", 0.7),
+            min_design_points=filtering_config_dict.get("min_design_points", 50),
+            max_filtered_fraction=filtering_config_dict.get("max_filtered_fraction", 0.2),
+            problem_fraction_threshold=filtering_config_dict.get("problem_fraction_threshold", 0.3),
         )
 
         # Filter training set
         logger.info("Filtering training set (Prediction)...")
-        all_observables, filtered_train = filter_problematic_design_points(
+        all_observables, filtered_train = filter_problematic_design_points(  # noqa: RUF059
             all_observables,
             filtering_config,
-            prediction_key='Prediction'  # ← Training set
+            prediction_key="Prediction",  # ← Training set
         )
 
         # Filter validation set SEPARATELY
-        if 'Prediction_validation' in all_observables:
+        if "Prediction_validation" in all_observables:
             logger.info("Filtering validation set (Prediction_validation)...")
-            all_observables, filtered_val = filter_problematic_design_points(
+            all_observables, filtered_val = filter_problematic_design_points(  # noqa: RUF059
                 all_observables,
                 filtering_config,
-                prediction_key='Prediction_validation'  # ← Validation set
+                prediction_key="Prediction_validation",  # ← Validation set
             )
 
         logger.info("✓ Filtering stage complete")
@@ -139,8 +135,8 @@ def smooth_statistical_outliers_in_predictions(
 
     # Stage 2: Smoothing design points
     logger.info("Smoothing outliers in predictions...")
-    smoothing_config_dict = preprocessing_config.analysis_config['parameters']['preprocessing'].get('smoothing', {})
-    if smoothing_config_dict.get('enable', True):  # Default: True for backward compatibility
+    smoothing_config_dict = preprocessing_config.analysis_config["parameters"]["preprocessing"].get("smoothing", {})
+    if smoothing_config_dict.get("enable", True):  # Default: True for backward compatibility
         # Continue with existing smoothing code
         new_observables = {}
 
@@ -187,11 +183,9 @@ def smooth_statistical_outliers_in_predictions(
 
         logger.info("✓ Smoothing stage complete")
         return new_observables
-    else:
-        logger.info("⊗ Smoothing disabled (enable: false)")
-        return all_observables
 
-    return new_observables
+    logger.info("⊗ Smoothing disabled (enable: false)")
+    return all_observables
 
 
 def _smooth_statistical_outliers_in_predictions(  # noqa: C901

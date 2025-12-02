@@ -122,16 +122,18 @@ For visualization, see plot_covariance.py
 .. codeauthor:: Jingyu Zhang <jingyu.zhang@cern.ch>, Vanderbilt
 """
 
+from __future__ import annotations
+
 import logging
 from collections import defaultdict
-from dataclasses import dataclass
 
+import attrs
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@attrs.define
 class SystematicInfo:
     """
     Store information about a systematic uncertainty.
@@ -149,14 +151,16 @@ class SystematicInfo:
     base_name: str  # e.g., 'jec', 'taa', 'sum'
     correlation_tag: str  # e.g., 'alice', '5020' (empty string for sum)
     full_name: str  # e.g., 'jec:alice' or 'sum_observable_name'
-    is_summed: bool = False  # True if this is a summed systematic
-    is_uncorrelated: bool = False  # True if tag is 'uncor'
+    is_summed: bool = attrs.field(default=False)  # True if this is a summed systematic
 
     # Correlation parameters (ONLY used for summed systematics)
-    cor_length: int = -1  # -1 means all bins (only applies to sum)
-    cor_strength: float = 1.0  # Only applies to sum
+    cor_length: int = attrs.field(default=-1)  # -1 means all bins (only applies to sum)
+    cor_strength: float = attrs.field(default=1.0)  # Only applies to sum
 
-    def __post_init__(self):
+    # Derived properties. Initialized based on the other arguments - see below.
+    is_uncorrelated: bool = attrs.field(init=False)  # True if tag is 'uncor'
+
+    def __attrs_post_init__(self):
         """Validate systematic info after initialization."""
         self.is_uncorrelated = self.correlation_tag.lower() == "uncor"
 
@@ -279,32 +283,32 @@ def parse_systematic_config(sys_config_string: str) -> dict:
     return config
 
 
+@attrs.define
 class SystematicCorrelationManager:
     """
     Manages systematic uncertainty correlations based on user configuration.
     Makes no assumptions about the meaning of correlation tags.
     """
 
-    def __init__(self):
-        # Map correlation tags to lists of (observable, feature_range, systematic)
-        self.correlation_groups: dict[str, list[tuple[str, int, int, str]]] = defaultdict(list)
-        # Structure: correlation_tag -> [(observable_label, start_idx, end_idx, systematic_full_name), ...]
+    # Map correlation tags to lists of (observable, feature_range, systematic)
+    correlation_groups: dict[str, list[tuple[str, int, int, str]]] = attrs.field(default=defaultdict(list))
+    # Structure: correlation_tag -> [(observable_label, start_idx, end_idx, systematic_full_name), ...]
 
-        # Map systematic full names to their info
-        self.systematic_info: dict[str, SystematicInfo] = {}
-        # Structure: systematic_full_name -> SystematicInfo
+    # Map systematic full names to their info
+    systematic_info: dict[str, SystematicInfo] = attrs.field(factory=dict)
+    # Structure: systematic_full_name -> SystematicInfo
 
-        # Map observables to their expected systematics
-        self.observable_systematics: dict[str, list[str]] = {}
-        # Structure: observable_label -> [systematic_full_names]
+    # Map observables to their expected systematics
+    observable_systematics: dict[str, list[str]] = attrs.field(factory=dict)
+    # Structure: observable_label -> [systematic_full_names]
 
-        # Store all unique systematic full names for consistent ordering
-        self.all_systematic_names: list[str] = []
+    # Store all unique systematic full names for consistent ordering
+    all_systematic_names: list[str] = attrs.field(factory=list)
 
-        # Store observable ranges for covariance calculation
-        self._observable_ranges: list[tuple[int, int, str]] = []
+    # Store observable ranges for covariance calculation
+    _observable_ranges: list[tuple[int, int, str]] = attrs.field(factory=list)
 
-        self._pending_correlation_params = {}
+    _pending_correlation_params: dict[str, str] = attrs.field(factory=dict, init=False)
 
     def parse_configuration(self, parsed_observables: list[tuple[str, list[str], list[str]]]):
         """
@@ -917,7 +921,7 @@ class SystematicCorrelationManager:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "SystematicCorrelationManager":
+    def from_dict(cls, data: dict) -> SystematicCorrelationManager:
         """
         Reconstruct SystematicCorrelationManager from serialized dictionary.
 
@@ -977,7 +981,7 @@ class SystematicCorrelationManager:
                 if isinstance(info_dict["full_name"], np.ndarray)
                 else str(info_dict["full_name"])
             )
-            is_uncorrelated = (
+            _is_uncorrelated = (
                 bool(info_dict["is_uncorrelated"].item())
                 if isinstance(info_dict["is_uncorrelated"], np.ndarray)
                 else bool(info_dict["is_uncorrelated"])
@@ -1000,7 +1004,6 @@ class SystematicCorrelationManager:
                 correlation_tag=correlation_tag,
                 full_name=full_name_from_dict,
                 is_summed=is_summed,
-                is_uncorrelated=is_uncorrelated,
                 cor_length=cor_length,
                 cor_strength=cor_strength,
             )

@@ -1,0 +1,178 @@
+# Configuration for STAT analysis
+#-------------------------------------------
+# General parameters
+
+output_dir: '/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/20230116_20251106/'
+
+initialize_observables: True
+preprocess_input_data: True
+fit_emulators: True
+run_mcmc: True
+run_closure_tests: True
+
+plot:
+  input_data: True
+  covariance: True
+  emulators: False
+  mcmc: False
+  qhat: False
+  closure_tests: False
+  across_analyses: False
+
+debug_level: 0
+
+#-------------------------------------------
+# The design points, predictions, and experimental data are located in tables produced by the aggregation machinery
+observable_table_dir: '/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/data/20230116/tables'
+
+# We make use of some info in the JETSCAPE-analysis config that was used to aggregate/plot observables
+observable_config_dir: '/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/config'
+
+# Filename of the observables file that we will use. This could be the standard one, or it could
+# have some predictions preprocessing applied to it.
+# Change to 'observables_preprocessed.h5' to use preprocessed data
+observables_filename: "observables.h5"
+# observables_filename: "observables_preprocessed.h5"
+
+#-------------------------------------------
+# Default parameter settings
+parameters:
+  #-------------------------------------------
+  # Preprocessing parameters
+  preprocessing_parameters: &default_preprocessing_parameters
+    # Stage 1: Filter design points (NEW 2025)
+    filtering:
+      enable: true
+      method: 'relative_statistical_error'
+      threshold: 0.03    
+      problem_fraction_threshold: 0.                  
+      min_design_points: 50               # Keep at least 50
+      max_filtered_fraction: 0.6
+    smoothing:
+      enable: false
+      outlier_n_RMS: 5.
+      # NOTE: As of 28 August 2023, there seems to be something wrong with the cubic spline, such that it will
+      #       interpolate down to negative values. For now, better to just use the linear approach.
+      interpolation_method: "linear" # "linear" or "cubic_spline
+      #max_n_feature_outliers_to_interpolate: 1
+      max_n_feature_outliers_to_interpolate: 2
+
+  #-------------------------------------------
+  # Emulator parameters
+  emulator_parameters: &default_emulator_parameters
+    force_retrain: True
+
+    # Specify which kernels to include in the 'active' list -- can include multiple
+    # Must have exactly one of: matern, rbf
+    kernels:
+      active: ['matern', 'noise']
+
+      matern:
+        nu: 1.5
+        length_scale_bounds_factor: [0.01, 100]
+
+      rbf:
+        length_scale_bounds_factor: [0.01, 100]
+
+      constant:
+        constant_value: 1.
+        constant_value_bounds: [0.001, 10]
+
+      noise:
+        type: "white"
+        args:
+          # NOTE: Can't raise to power in yaml, so you have to evaluate them by hand
+          noise_level: 0.25  # 0.5**2
+          noise_level_bounds: [0.0001, 1]  # [0.01**2, 1**2]
+
+    # Gaussian Process Regressor
+    GPR:
+      n_restarts: 50
+      alpha: 1.e-10
+
+    # Validation
+    # We want to support the following:
+    #  - k-fold cross-validation
+    #  - validation dataset
+
+    # TODO: Cross-validation
+    cross_validation: False
+    cross_validation_k: 5
+
+    # Independent validation dataset
+    independent_validation: True
+
+  #-------------------------------------------
+  # MCMC parameters
+  mcmc_parameters: &default_mcmc_parameters
+    n_walkers: 100
+    n_burn_steps: 1000
+    n_sampling_steps: 5000
+    n_logging_steps: 10
+
+  #-------------------------------------------
+  # Closure test parameters
+  closure: &default_closure_parameters
+    confidence: 0.9
+
+#-------------------------------------------
+# Specify observables
+# We want to allow to configure the analysis to only use various subsets of observables
+#   (e.g. jet/hadron/substructure observables, sqrts, centrality, ...)
+# We will do this by looping over the specified models below:
+#   - We will loop through the parameterizations and run a separate analysis for each
+#   - We will start by using all observables in the table directory for that parameterization
+#   - We will then filter by the sqrts, centrality specified
+#   - Finally, we select any observables whose filename contains a string from observable_list
+
+# Set general share parameters
+analysis_base: &model_base
+  model_name: 'MATTER+LBT'
+  parameterizations: ['exponential']
+  sqrts_list: [200, 2760, 5020]
+  centrality_range: [0,10]
+  # Can also be a list of centrality ranges. eg:
+  #centrality_range: [[0, 10], [30, 50]]
+  recoil_scheme: 'negative_recominber'
+  parameterization:
+    exponential:
+      names: ['$\alpha_S^{\rm{fix}}$', '$Q_0$', '$c_1$', '$c_2$', '$\tau_0$', '$c_3$']
+      min: [0.1, 1, 0.006737946999085467, 0.006737946999085467, 0, 0.049787068367863944]
+      max: [0.5, 10, 10, 10, 1.5, 100]
+    binomial:
+      names: ['$\alpha_S^{\rm{fix}}$', '$Q_0$', '$c_1$', '$c_2$', '$a$', '$b$', '$\tau_0$']
+      min: [0.1, 1, 0.006737946999085467, 0.006737946999085467, -10, -10, 0]
+      max: [0.5, 10, 10, 10, 100, 100, 1.5]
+  alpha: 0.2
+  validation_indices: [200, 202] # For exp parameterization, these are the same for all sqrts (i.e. all points 200-229 inclusive)
+
+analyses:
+  correlation_groups:
+    alice: "2:0.3"
+    cms: "5:0.95"
+  analysis_jet:
+    #external_covariance_file: 'Data/external_covariance_test.txt'
+    parameters:
+      preprocessing:
+        <<: *default_preprocessing_parameters
+      emulators:
+        default_group:
+          <<: *default_emulator_parameters
+          emulator_name: sk_learn
+          n_pc: 5
+          observable_list:
+            - observable: '5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10'
+              sys_data: ['sys_jec:alice', 'sys_taa:5020']
+              #sys_data: ['sum:5:0.9']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.2__0-10'
+              sys_data: ['sys_jec:cms', 'sys_taa:5020']
+              #sys_data: ['sum:5:0.8']
+      mcmc:
+        <<: *default_mcmc_parameters
+        n_walkers: 20
+        n_burn_steps: 100
+        n_sampling_steps: 500
+      closure:
+        <<: *default_closure_parameters
+    <<: *model_base
+    plot_panel_shapes: [[3,3], [3,3], [3,3]]

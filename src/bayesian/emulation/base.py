@@ -26,10 +26,9 @@ import yaml
 
 from bayesian import common_base, data_IO, register_modules
 
-logger = logging.getLogger(__name__)
-
 _emulators: dict[str, ModuleType] = {}
 
+logger = logging.getLogger(__name__)
 
 def _validate_emulator(name: str, module: Any) -> None:
     """
@@ -59,8 +58,6 @@ def fit_emulators(emulation_config: EmulatorOrganizationConfig) -> None:
             emulator = _emulators[emulator_name]
         except KeyError as e:
             raise KeyError(f"Emulator backend '{emulator_name}' not registered or available") from e
-
-        logger.info(f"Fitting emulator for group '{emulation_group_name}' using backend '{emulator_name}'")
 
         emulator_groups_output[emulation_group_name] = emulator.fit_emulator(emulation_group_config)
         # NOTE: If it returns early because an emulator already exists, then we don't want to overwrite it!
@@ -166,13 +163,30 @@ def predict_emulation_group(parameters, results, emulation_group_config, emulato
     #       of a given point, not the correlation between different sample points.
     n_samples = parameters.shape[0]
     emulator_central_value = np.zeros((n_samples, emulation_group_config.n_pc))
-    emulator_variance = np.zeros((n_samples, emulation_group_config.n_pc))
-    for i,emulator in enumerate(emulators):
-        y_central_value, y_std = emulator.predict(parameters, return_std=True) # Alternately: return_cov=True
-        emulator_central_value[:,i] = y_central_value
-        emulator_variance[:,i] = y_std**2
-    # Construct (diagonal) covariance matrix from the variances, for use in uncertainty propagation
-    emulator_cov = np.apply_along_axis(np.diagflat, 1, emulator_variance)
+    emulator_cov = np.zeros((n_samples, emulation_group_config.n_pc, emulation_group_config.n_pc))
+    
+    for i, emulator in enumerate(emulators):
+        try:
+            # Try to get full covariance matrix
+            y_central_value, y_cov = emulator.predict(parameters, return_cov=True)
+            emulator_central_value[:, i] = y_central_value
+            
+            # y_cov should be shape (n_samples, n_samples) for the covariance between different parameter points
+            # We want the diagonal elements which give the variance for each parameter point
+            if y_cov.ndim == 2 and y_cov.shape[0] == n_samples and y_cov.shape[1] == n_samples:
+                # Extract diagonal variance for each sample
+                emulator_cov[:, i, i] = np.diag(y_cov)
+            else:
+                logger.warning(f"Unexpected covariance shape from emulator {i}: {y_cov.shape}")
+                emulator_cov[:, i, i] = np.diag(y_cov) if y_cov.ndim == 2 else y_cov
+                    
+        except (TypeError, ValueError) as e:
+            # Fallback to standard deviation approach if return_cov fails
+            logger.warning(f"Failed to get covariance from emulator {i}, falling back to std: {e}")
+            y_central_value, y_std = emulator.predict(parameters, return_std=True)
+            emulator_central_value[:, i] = y_central_value
+            emulator_cov[:, i, i] = y_std**2    
+    
     assert emulator_cov.shape == (n_samples, emulation_group_config.n_pc, emulation_group_config.n_pc)
 
     # Reconstruct the physical space from the PCs, and invert preprocessing.
@@ -199,6 +213,7 @@ def predict_emulation_group(parameters, results, emulation_group_config, emulato
     emulator_cov_reconstructed_scaled = np.zeros((n_samples, n_features, n_features))
     for i_sample in range(n_samples):
         emulator_cov_reconstructed_scaled[i_sample] = S.dot(emulator_cov[i_sample].dot(S.T))
+        
     assert emulator_cov_reconstructed_scaled.shape == (n_samples, n_features, n_features)
 
     # Include predictive variance due to truncated PCs.
@@ -206,13 +221,14 @@ def predict_emulation_group(parameters, results, emulation_group_config, emulato
     for i_sample in range(n_samples):
         emulator_cov_reconstructed_scaled[i_sample] += emulator_group_cov_unexplained / n_samples
 
+
     # Propagate uncertainty: inverse preprocessing
     # We only need to undo the unit variance scaling, since the shift does not affect the covariance matrix.
     # We can do this by computing an outer product (i.e. product of each pairwise scaling),
     #   and multiplying each element of the covariance matrix by this.
     scale_factors = scaler.scale_
     emulator_cov_reconstructed = emulator_cov_reconstructed_scaled*np.outer(scale_factors, scale_factors)
-
+    
     # Return the stacked matrices:
     #   Central values: (n_samples, n_features)
     #   Covariances: (n_samples, n_features, n_features)

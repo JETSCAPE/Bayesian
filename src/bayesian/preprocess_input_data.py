@@ -1,6 +1,7 @@
-""" Preprocess the input data (eg. outliers removal, etc)
+""" 
+Preprocess the input data (eg. outliers removal, smoothing, etc)
 
-authors: J.Mulligan, R.Ehlers
+authors: J.Mulligan, R.Ehlers, J.Zhang
 """
 
 from __future__ import annotations
@@ -16,6 +17,11 @@ import yaml
 
 from bayesian import common_base, data_IO, outliers_smoothing
 
+from bayesian.outliers_smoothing import (
+    FilteringConfig,
+    filter_problematic_design_points,
+)
+
 logger = logging.getLogger(__name__)
 
 def preprocess(
@@ -25,11 +31,6 @@ def preprocess(
     observables = smooth_statistical_outliers_in_predictions(
         preprocessing_config=preprocessing_config,
     )
-    # Find outliers via ad-hoc measures based on physics expectations
-    #steer_find_physics_motivated_outliers(
-    #    observables=observables,
-    #    preprocessing_config=preprocessing_config,
-    #)
 
     return observables
 
@@ -79,7 +80,7 @@ def _find_physics_motivated_outliers(
                 ]
             )
             i_design_point_to_exclude.update(i_design_point)
-
+            
         # What's going on with the theta_g?
         if "tg" in x[3]:
             logger.info(f"{observable_key=}")
@@ -88,6 +89,7 @@ def _find_physics_motivated_outliers(
             logger.info(observables[prediction_key][observable_key]["y"][:, res[1]])
 
 
+    print(i_design_point_to_exclude)
     # TODO: Probably should return the values rather than just print them...
     logger.warning(f"ad-hoc points to exclude: {sorted(i_design_point_to_exclude)}")
 
@@ -95,56 +97,99 @@ def _find_physics_motivated_outliers(
 def smooth_statistical_outliers_in_predictions(
     preprocessing_config: PreprocessingConfig,
 ) -> dict[str, Any]:
-    """ Steer smoothing of statistical outliers in predictions. """
-    logger.info("Smoothing outliers in predictions...")
 
+    """ Steer smoothing of statistical outliers in predictions. """
     # Setup for observables
     all_observables = data_IO.read_dict_from_h5(preprocessing_config.output_dir, 'observables.h5')
-    new_observables = {}
-    # Adds the outputs under the "Prediction" key
-    new_observables.update(
-        _smooth_statistical_outliers_in_predictions(
-            all_observables=all_observables,
-            validation_set=False,
-            preprocessing_config=preprocessing_config,
-            outlier_identification_method="large_statistical_errors",
+
+    # Stage 1: Filter design points 
+    logger.info("Filtering outliers in predictions...")
+    filtering_config_dict = preprocessing_config.analysis_config['parameters']['preprocessing'].get('filtering', {})
+    if filtering_config_dict.get('enable', False):
+        from bayesian.outliers_smoothing import FilteringConfig, filter_problematic_design_points
+        
+        filtering_config = FilteringConfig(
+            method=filtering_config_dict.get('method', 'relative_statistical_error'),
+            threshold=filtering_config_dict.get('threshold', 0.7),
+            min_design_points=filtering_config_dict.get('min_design_points', 50),
+            max_filtered_fraction=filtering_config_dict.get('max_filtered_fraction', 0.2),
+            problem_fraction_threshold=filtering_config_dict.get('problem_fraction_threshold', 0.3),
         )
-    )
-    # Adds the outputs under the "Prediction_validation" key
-    new_observables.update(
-        _smooth_statistical_outliers_in_predictions(
-            all_observables=all_observables,
-            validation_set=True,
-            preprocessing_config=preprocessing_config,
-            outlier_identification_method="large_statistical_errors",
+        
+        # Filter training set
+        logger.info("Filtering training set (Prediction)...")
+        all_observables, filtered_train = filter_problematic_design_points(
+            all_observables, 
+            filtering_config, 
+            prediction_key='Prediction'  # ← Training set
         )
-    )
-    # Next, perform outlier removal based on large central value differences
-    # NOTE: Here, we **want** to use the new observables, such that we only find new problematic values.
-    #       There's no point in confusing the algorithm more than it needs to be.
-    # To be able use it as a drop-in replacement, we'll need to fill in the rest
-    # of the observable quantities.
-    for k in all_observables:
-        if k not in new_observables:
-            new_observables[k] = all_observables[k]
-    # Adds the outputs under the "Prediction" key
-    new_observables.update(
-        _smooth_statistical_outliers_in_predictions(
-            all_observables=new_observables,
-            validation_set=False,
-            preprocessing_config=preprocessing_config,
-            outlier_identification_method="large_central_value_difference",
+        
+        # Filter validation set SEPARATELY
+        if 'Prediction_validation' in all_observables:
+            logger.info("Filtering validation set (Prediction_validation)...")
+            all_observables, filtered_val = filter_problematic_design_points(
+                all_observables, 
+                filtering_config, 
+                prediction_key='Prediction_validation'  # ← Validation set
+            )
+        
+        logger.info("✓ Filtering stage complete")
+    else:
+        logger.info("⊗ Filtering disabled")
+
+    # Stage 2: Smoothing design points
+    logger.info("Smoothing outliers in predictions...")
+    smoothing_config_dict = preprocessing_config.analysis_config['parameters']['preprocessing'].get('smoothing', {})
+    if smoothing_config_dict.get('enable', True):  # Default: True for backward compatibility
+        # Continue with existing smoothing code
+        new_observables = {} 
+        
+        new_observables.update(
+            _smooth_statistical_outliers_in_predictions(
+                all_observables=all_observables,
+                validation_set=False,
+                preprocessing_config=preprocessing_config,
+                outlier_identification_method="large_statistical_errors",
+            )
         )
-    )
-    # Adds the outputs under the "Prediction_validation" key
-    new_observables.update(
-        _smooth_statistical_outliers_in_predictions(
-            all_observables=new_observables,
-            validation_set=True,
-            preprocessing_config=preprocessing_config,
-            outlier_identification_method="large_central_value_difference",
+        
+        new_observables.update(
+            _smooth_statistical_outliers_in_predictions(
+                all_observables=all_observables,
+                validation_set=True,
+                preprocessing_config=preprocessing_config,
+                outlier_identification_method="large_statistical_errors",
+            )
         )
-    )
+        
+        # Merge for large central value differences
+        for k in all_observables:
+            if k not in new_observables:
+                new_observables[k] = all_observables[k]
+        
+        new_observables.update(
+            _smooth_statistical_outliers_in_predictions(
+                all_observables=new_observables,
+                validation_set=False,
+                preprocessing_config=preprocessing_config,
+                outlier_identification_method="large_central_value_difference",
+            )
+        )
+        
+        new_observables.update(
+            _smooth_statistical_outliers_in_predictions(
+                all_observables=new_observables,
+                validation_set=True,
+                preprocessing_config=preprocessing_config,
+                outlier_identification_method="large_central_value_difference",
+            )
+        )
+        
+        logger.info("✓ Smoothing stage complete")
+        return new_observables
+    else:
+        logger.info("⊗ Smoothing disabled (enable: false)")
+        return all_observables
 
     return new_observables
 
@@ -182,7 +227,7 @@ def _smooth_statistical_outliers_in_predictions(
             # large statistical uncertainty points
             outliers = outliers_smoothing.find_large_statistical_uncertainty_points(
                 values=all_observables[prediction_key][observable_key]["y"],
-                y_err=all_observables[prediction_key][observable_key]["y_err"],
+                y_err=all_observables[prediction_key][observable_key]["y_err_stat"],
                 outliers_config=preprocessing_config.smoothing_outliers_config,
             )
         elif outlier_identification_method == "large_central_value_difference":
@@ -218,7 +263,7 @@ def _smooth_statistical_outliers_in_predictions(
 
         # Finally, interpolate at the selected outlier point features to find the value and error
         new_observables[prediction_key][observable_key] = {}
-        for key_type in ["y", "y_err"]:
+        for key_type in ["y", "y_err_stat"]:
             new_observables[prediction_key][observable_key][key_type] = np.array(
                 all_observables[prediction_key][observable_key][key_type], copy=True,
             )
@@ -277,7 +322,6 @@ def _smooth_statistical_outliers_in_predictions(
     logger.info(
         f"In further detail: {design_points_we_may_want_to_remove}"
     )
-
     return new_observables
 
 

@@ -11,9 +11,10 @@ import os
 import shutil
 import yaml
 from pathlib import Path
+import numpy as np
 
 from bayesian import data_IO, preprocess_input_data, mcmc
-from bayesian import plot_input_data, plot_emulation, plot_mcmc, plot_qhat, plot_closure, plot_analyses
+from bayesian import plot_input_data, plot_emulation, plot_mcmc, plot_qhat, plot_closure, plot_analyses, plot_covariance
 
 from bayesian import common_base, helpers
 from bayesian.emulation import base
@@ -61,28 +62,41 @@ class SteerAnalysis(common_base.CommonBase):
         self.plot = config['plot']
 
         # Configuration of different analyses
-        self.analyses = config['analyses']
+        all_analyses_config = config['analyses']
+        self.correlation_groups = all_analyses_config.pop('correlation_groups', {})
+        self.analyses = all_analyses_config  # Now only contains actual analyses
+
+        if self.correlation_groups:
+            logger.info(f"Loaded correlation_groups with {len(self.correlation_groups)} group tags")
 
     #---------------------------------------------------------------
     # Main function
     #---------------------------------------------------------------
     def run_analysis(self):
-        # Add logging to file
-        _root_log = logging.getLogger()
-        _root_log.addHandler(logging.FileHandler(os.path.join(self.output_dir, 'steer_analysis.log'), 'w'))
-
-        # Also write analysis config to shared directory
-        shutil.copy(self.config_file, Path(self.output_dir) / "steer_analysis_config.yaml")
 
         # Loop through each analysis
         with helpers.progress_bar() as progress:
-            analysis_task = progress.add_task("[deep_sky_blue1]Running analysis...", total=len(self.analyses))
+            analysis_task = progress.add_task("[deep_sky_blue1]Running analysis...", 
+                                            total=len(self.analyses))
+            
+            for analysis_name, analysis_config in self.analyses.items():
+                # Now you don't need the skip check anymore!
+                
+                # Loop through the parameterizations
+                parameterization_task = progress.add_task(
+                    "[deep_sky_blue2]parameterization", 
+                    total=len(analysis_config.get('parameterizations', ['default']))
+                )
 
             for analysis_name, analysis_config in self.analyses.items():
 
+                if analysis_name == 'correlation_groups':  # Skip special config keys
+                    continue    
+
                 # Loop through the parameterizations
-                parameterization_task = progress.add_task("[deep_sky_blue2]parameterization", total=len(analysis_config['parameterizations']))
-                for parameterization in analysis_config['parameterizations']:
+                parameterization_task = progress.add_task("[deep_sky_blue2]parameterization", total=len(analysis_config.get('parameterizations', ['default'])))
+
+                for parameterization in analysis_config.get('parameterizations', ['default']):
 
                     # Initialize design points, predictions, data, and uncertainties
                     # We store them in a dict and write/read it to HDF5
@@ -93,13 +107,21 @@ class SteerAnalysis(common_base.CommonBase):
                         logger.info("")
                         logger.info('========================================================================')
                         logger.info(f'Initializing model: {analysis_name} ({parameterization} parameterization)...')
+
                         observables = data_IO.initialize_observables_dict_from_tables(self.observable_table_dir,
-                                                                                    analysis_config,
-                                                                                    parameterization)
+                                                                                        analysis_config,
+                                                                                        parameterization,
+                                                                                        correlation_groups=self.correlation_groups)
                         data_IO.write_dict_to_h5(observables,
                                                 os.path.join(self.output_dir, f'{analysis_name}_{parameterization}'),
                                                 filename='observables.h5')
                         progress.update(initialization_task, advance=100, visible=False)
+
+                    output_dir = os.path.join(self.output_dir, f'{analysis_name}_{parameterization}')
+                    experimental_data = data_IO.data_array_from_h5(output_dir, 'observables.h5')
+
+                    if 'external_covariance' in experimental_data:
+                        ext_cov = experimental_data['external_covariance']
 
                     if self.preprocess_input_data:
                         # Just indicate that it's working
@@ -167,23 +189,24 @@ class SteerAnalysis(common_base.CommonBase):
                     #   - Use validation point as pseudodata
                     #   - Use emulator already trained on training points
                     if self.run_closure_tests:
-                        n_design_points = analysis_config['validation_indices'][1] - analysis_config['validation_indices'][0]
+                        validation_indices = list(range(analysis_config['validation_indices'][0], analysis_config['validation_indices'][1]))
+                        n_design_points = len(validation_indices)
                         closure_test_task = progress.add_task("[deep_sky_blue4]Running closure tests...", total=n_design_points)
                         progress.start_task(closure_test_task)
                         logger.info("")
                         logger.info('------------------------------------------------------------------------')
-                        for design_point_index in range(n_design_points):
-                            logger.info(f'Running closure tests for {analysis_name}_{parameterization}, validation_index={design_point_index}...')
+                        
+                        for i, validation_design_point in enumerate(validation_indices):
+                            logger.info(f'Running closure tests for {analysis_name}_{parameterization}, validation_design_point={validation_design_point}, validation_index={i}...')
                             mcmc_config = mcmc.MCMCConfig(analysis_name=analysis_name,
                                                           parameterization=parameterization,
                                                           analysis_config=analysis_config,
                                                           config_file=self.config_file,
-                                                          closure_index=design_point_index)
-                            mcmc.run_mcmc(mcmc_config, closure_index=design_point_index)
+                                                          closure_index=i)  # Use validation array index, not design point ID
+                            mcmc.run_mcmc(mcmc_config, closure_index=i)
                             progress.update(closure_test_task, advance=1)
-                        progress.update(closure_test_task, visible=False)
 
-                    progress.update(parameterization_task, advance=1)
+                    #progress.update(parameterization_task, advance=1)
                 # Hide once we're done!
                 progress.update(parameterization_task, visible=False)
 
@@ -191,7 +214,7 @@ class SteerAnalysis(common_base.CommonBase):
 
         # Plots for individual analysis
         for analysis_name,analysis_config in self.analyses.items():
-            for parameterization in analysis_config['parameterizations']:
+            for parameterization in analysis_config.get('parameterizations', ['default']):
 
                 if any(self.plot.values()):
                     logger.info('========================================================================')
@@ -236,6 +259,13 @@ class SteerAnalysis(common_base.CommonBase):
                     logger.info(f'Done!')
                     logger.info("")
 
+                if self.plot["covariance"]:
+                    logger.info('------------------------------------------------------------------------')
+                    logger.info(f'Plotting covariance matrices for {analysis_name}_{parameterization}...')
+                    plot_covariance.plot(analysis_name, parameterization, analysis_config, self.config_file)
+                    logger.info('Done!')
+                    logger.info("")
+                    
                 if self.plot['qhat']:
                     logger.info('------------------------------------------------------------------------')
                     logger.info(f'Plotting qhat results {analysis_name}_{parameterization}...')

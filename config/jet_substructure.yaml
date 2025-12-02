@@ -2,7 +2,7 @@
 #-------------------------------------------
 # General parameters
 
-output_dir: 'output/20230829-QM'
+output_dir: '/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/20230116/'
 
 initialize_observables: False
 preprocess_input_data: False

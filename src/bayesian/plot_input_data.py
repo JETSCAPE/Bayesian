@@ -188,40 +188,6 @@ def plot(config: base.EmulatorOrganizationConfig):
         #)
 
     #for observables_filename in ["observables.h5", "observables_preprocessed.h5"]:
-    for observables_filename in ["observables_preprocessed.h5"]:
-        for validation_set in [True, False]:
-            ## First, plot the pair correlations for each observables
-            #_plot_pairplot_correlations(
-            #    config=config,
-            #    plot_dir=plot_dir,
-            #    observable_grouping=ObservableGrouping(observable_by_observable=True),
-            #    annotate_design_points=False,
-            #    validation_set=validation_set,
-            #    observables_filename=observables_filename,
-            #)
-            # Observable-by-observable, labeling and printing problematic design points
-            identified_outliers = _plot_pairplot_correlations(
-                config=config,
-                plot_dir=plot_dir,
-                observable_grouping=ObservableGrouping(observable_by_observable=True),
-                outliers_config=outliers_smoothing.OutliersConfig(n_RMS=4.),
-                validation_set=validation_set,
-                observables_filename=observables_filename,
-            )
-            logger.info(f"{identified_outliers=}")
-            summarized_design_points = set()
-            for outlier_design_points in identified_outliers.values():
-                summarized_design_points.update(outlier_design_points)
-            logger.info(f"Summary of outlier design points ({len(summarized_design_points)=}): {summarized_design_points}")
-            # Annotate all design points observable-by-observable
-            _plot_pairplot_correlations(
-                config=config,
-                plot_dir=plot_dir,
-                observable_grouping=ObservableGrouping(observable_by_observable=True),
-                annotate_design_points=True,
-                validation_set=validation_set,
-                observables_filename=observables_filename,
-            )
             # Group by emulator groups
             #_plot_pairplot_correlations(
             #    config=config,
@@ -282,7 +248,7 @@ def _plot_predictions_for_all_design_points(
             # Plot each design point separately
             observable = all_observables[prediction_key][observable_key]["y"]
             observable_preprocessed = all_observables_preprocessed[prediction_key][observable_key]["y"]
-            for i_design_point in range(observable.shape[1]):
+            for i_design_point in range(observable_preprocessed.shape[1]):
                 for label, color, obs in zip(["standard", "preprocessed"], colors, [observable, observable_preprocessed]):
                     if label not in select_which_to_plot:
                         continue

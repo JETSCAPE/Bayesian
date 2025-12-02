@@ -137,7 +137,7 @@ unfixable = [
     "F841",     # Removes unused variables
 ]
 # Allow for characters that could be confused (per ruff)
-allowed-confusables = ["σ"]
+allowed-confusables = ["σ", "ρ", "×"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 12

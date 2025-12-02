@@ -136,6 +136,8 @@ unfixable = [
     "T20",      # flake8-print
     "F841",     # Removes unused variables
 ]
+# Allow for characters that could be confused (per ruff)
+allowed-confusables = ["σ"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 12

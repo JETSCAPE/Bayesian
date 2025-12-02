@@ -6,7 +6,7 @@ CORE FUNCTIONALITY:
 Read design/prediction/data tables (.dat files) into structured dictionary format:
  - initialize_observables_dict_from_tables() -- main entry point for loading data
  - read/write_dict_to_h5() -- HDF5 serialization for observables dictionary
- - predictions_matrix_from_h5() -- construct prediction matrix (design_points × observable_bins)
+ - predictions_matrix_from_h5() -- construct prediction matrix (design_points x observable_bins)
  - design_array_from_h5() -- extract design points
  - data_array_from_h5() -- extract experimental data with systematic correlations
  - data_dict_from_h5() -- dictionary format for experimental data

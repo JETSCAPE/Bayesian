@@ -13,7 +13,7 @@ import yaml
 from pathlib import Path
 import numpy as np
 
-from bayesian import data_IO, emulation, preprocess_input_data, mcmc
+from bayesian import analysis as ana, data_IO, emulation, preprocess_input_data, mcmc
 from bayesian import plot_input_data, plot_emulation, plot_mcmc, plot_qhat, plot_closure, plot_analyses, plot_covariance
 
 from bayesian import common_base, helpers
@@ -27,7 +27,7 @@ class SteerAnalysis(common_base.CommonBase):
     #---------------------------------------------------------------
     # Constructor
     #---------------------------------------------------------------
-    def __init__(self, config_file='', **kwargs):
+    def __init__(self, config_file: Path, **kwargs):
 
         # Initialize config file
         self.config_file = config_file
@@ -38,7 +38,7 @@ class SteerAnalysis(common_base.CommonBase):
     #---------------------------------------------------------------
     # Initialize config
     #---------------------------------------------------------------
-    def initialize(self):
+    def initialize(self) -> None:
         logger.info('Initializing class objects')
 
         with open(self.config_file, 'r') as stream:
@@ -96,6 +96,8 @@ class SteerAnalysis(common_base.CommonBase):
                 parameterization_task = progress.add_task("[deep_sky_blue2]parameterization", total=len(analysis_config.get('parameterizations', ['default'])))
 
                 for parameterization in analysis_config.get('parameterizations', ['default']):
+
+                    analysis_settings = ana.AnalysisSettings.from_config_file()
 
                     # Initialize design points, predictions, data, and uncertainties
                     # We store them in a dict and write/read it to HDF5
@@ -294,25 +296,29 @@ class SteerAnalysis(common_base.CommonBase):
             plot_analyses.plot(self.analyses, self.config_file, self.output_dir)
 
 
-####################################################################################################################
-if __name__ == '__main__':
+def main() -> None:
     helpers.setup_logging(level=logging.INFO)
 
     parser = argparse.ArgumentParser(description='Jet Bayesian Analysis')
     parser.add_argument('-c', '--configFile',
                         help='Path of config file for analysis',
-                        action='store', type=str,
-                        default='../config/jet_substructure.yaml', )
+                        action='store', type=Path,
+                        default=Path('../config/jet_substructure.yaml'))
     args = parser.parse_args()
 
     logger.info('Configuring...')
     logger.info(f'  configFile: {args.configFile}')
 
     # If invalid configFile is given, exit
-    if not os.path.exists(args.configFile):
+    config_file = Path(args.configFile)
+    if not config_file.exists():
         msg = f'File {args.configFile} does not exist! Exiting!'
         logger.info(msg)
         raise ValueError(msg)
 
-    analysis = SteerAnalysis(config_file=args.configFile)
-    analysis.run_analysis()
+    steer_analysis = SteerAnalysis(config_file=config_file)
+    steer_analysis.run_analysis()
+
+
+if __name__ == '__main__':
+    main()

@@ -13,11 +13,10 @@ import yaml
 from pathlib import Path
 import numpy as np
 
-from bayesian import data_IO, preprocess_input_data, mcmc
+from bayesian import data_IO, emulation, preprocess_input_data, mcmc
 from bayesian import plot_input_data, plot_emulation, plot_mcmc, plot_qhat, plot_closure, plot_analyses, plot_covariance
 
 from bayesian import common_base, helpers
-from bayesian.emulation import base
 
 logger = logging.getLogger(__name__)
 
@@ -76,22 +75,22 @@ class SteerAnalysis(common_base.CommonBase):
 
         # Loop through each analysis
         with helpers.progress_bar() as progress:
-            analysis_task = progress.add_task("[deep_sky_blue1]Running analysis...", 
+            analysis_task = progress.add_task("[deep_sky_blue1]Running analysis...",
                                             total=len(self.analyses))
-            
+
             for analysis_name, analysis_config in self.analyses.items():
                 # Now you don't need the skip check anymore!
-                
+
                 # Loop through the parameterizations
                 parameterization_task = progress.add_task(
-                    "[deep_sky_blue2]parameterization", 
+                    "[deep_sky_blue2]parameterization",
                     total=len(analysis_config.get('parameterizations', ['default']))
                 )
 
             for analysis_name, analysis_config in self.analyses.items():
 
                 if analysis_name == 'correlation_groups':  # Skip special config keys
-                    continue    
+                    continue
 
                 # Loop through the parameterizations
                 parameterization_task = progress.add_task("[deep_sky_blue2]parameterization", total=len(analysis_config.get('parameterizations', ['default'])))
@@ -161,13 +160,13 @@ class SteerAnalysis(common_base.CommonBase):
                         progress.start_task(emulation_task)
                         logger.info('------------------------------------------------------------------------')
                         logger.info(f'Fitting emulators for {analysis_name}_{parameterization}...')
-                        emulation_config = base.EmulatorOrganizationConfig.from_config_file(
+                        emulation_config = emulation.EmulationConfig.from_config_file(
                             analysis_name=analysis_name,
                             parameterization=parameterization,
                             analysis_config=analysis_config,
                             config_file=self.config_file,
                         )
-                        base.fit_emulators(emulation_config)
+                        emulation.fit_emulators(emulation_config)
                         progress.update(emulation_task, advance=100, visible=False)
 
                     # Run MCMC
@@ -195,7 +194,7 @@ class SteerAnalysis(common_base.CommonBase):
                         progress.start_task(closure_test_task)
                         logger.info("")
                         logger.info('------------------------------------------------------------------------')
-                        
+
                         for i, validation_design_point in enumerate(validation_indices):
                             logger.info(f'Running closure tests for {analysis_name}_{parameterization}, validation_design_point={validation_design_point}, validation_index={i}...')
                             mcmc_config = mcmc.MCMCConfig(analysis_name=analysis_name,
@@ -224,7 +223,7 @@ class SteerAnalysis(common_base.CommonBase):
                 if self.plot["input_data"]:
                     logger.info('------------------------------------------------------------------------')
                     logger.info(f'Plotting input data for {analysis_name}_{parameterization}...')
-                    emulation_config = base.EmulatorOrganizationConfig.from_config_file(
+                    emulation_config = emulation.EmulationConfig.from_config_file(
                         analysis_name=analysis_name,
                         parameterization=parameterization,
                         analysis_config=analysis_config,
@@ -238,7 +237,7 @@ class SteerAnalysis(common_base.CommonBase):
 
                     logger.info('------------------------------------------------------------------------')
                     logger.info(f'Plotting emulators for {analysis_name}_{parameterization}...')
-                    emulation_config = base.EmulatorOrganizationConfig.from_config_file(
+                    emulation_config = emulation.EmulationConfig.from_config_file(
                         analysis_name=analysis_name,
                         parameterization=parameterization,
                         analysis_config=analysis_config,
@@ -265,7 +264,7 @@ class SteerAnalysis(common_base.CommonBase):
                     plot_covariance.plot(analysis_name, parameterization, analysis_config, self.config_file)
                     logger.info('Done!')
                     logger.info("")
-                    
+
                 if self.plot['qhat']:
                     logger.info('------------------------------------------------------------------------')
                     logger.info(f'Plotting qhat results {analysis_name}_{parameterization}...')

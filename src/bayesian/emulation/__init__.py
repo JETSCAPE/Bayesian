@@ -14,7 +14,9 @@ Using the EmulationConfig, there are two main functionalities:
  - fit_emulator(), which trains the emulator(s) on the provided data.
  - predict() construct mean, std dev of emulator(s) for a given set of parameter values.
 
-For further information, see the documentation in `emulation.interface`
+Support functions for IO related to the emulator are provided in the `IO` class.
+
+For further information, see the documentation in `emulation.interface`.
 
 .. codeauthor:: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
 """

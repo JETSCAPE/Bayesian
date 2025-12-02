@@ -8,9 +8,9 @@ track and propagate.
 
 Based in part on JETSCAPE/STAT code.
 
-.. codeauthor: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
-.. codeauthor: James Mulligan, LBL/UCB
-.. codeauthor: Jingyu Zhang, Vanderbilt
+.. codeauthor:: Raymond Ehlers <raymond.ehlers@cern.ch>, LBL/UCB
+.. codeauthor:: James Mulligan, LBL/UCB
+.. codeauthor:: Jingyu Zhang <jingyu.zhang@cern.ch>, Vanderbilt
 """
 
 from __future__ import annotations

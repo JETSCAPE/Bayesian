@@ -514,10 +514,10 @@ def identify_design_points_to_filter(
     for obs_label, obs_data in observables[prediction_key].items():  # noqa: B007
         values = obs_data["y"]  # shape: (n_bins, n_design_points)
         uncertainties = obs_data["y_err_stat"]  # shape: (n_bins, n_design_points)
-        n_bins, n_design_points = values.shape  # noqa: RUF059
+        n_bins, _n_design_points = values.shape
 
         # Identify problematic points
-        feature_indices, design_point_indices = identify_high_uncertainty_points_absolute_threshold(  # noqa: RUF059
+        _feature_indices, design_point_indices = identify_high_uncertainty_points_absolute_threshold(
             values, uncertainties, config.method, config.threshold
         )
 

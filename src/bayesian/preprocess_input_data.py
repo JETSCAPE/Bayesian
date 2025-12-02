@@ -114,7 +114,7 @@ def smooth_statistical_outliers_in_predictions(
 
         # Filter training set
         logger.info("Filtering training set (Prediction)...")
-        all_observables, filtered_train = filter_problematic_design_points(  # noqa: RUF059
+        all_observables, _filtered_train = filter_problematic_design_points(
             all_observables,
             filtering_config,
             prediction_key="Prediction",  # ← Training set
@@ -123,7 +123,7 @@ def smooth_statistical_outliers_in_predictions(
         # Filter validation set SEPARATELY
         if "Prediction_validation" in all_observables:
             logger.info("Filtering validation set (Prediction_validation)...")
-            all_observables, filtered_val = filter_problematic_design_points(  # noqa: RUF059
+            all_observables, _filtered_val = filter_problematic_design_points(
                 all_observables,
                 filtering_config,
                 prediction_key="Prediction_validation",  # ← Validation set

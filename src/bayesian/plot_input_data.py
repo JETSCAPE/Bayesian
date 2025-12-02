@@ -8,7 +8,8 @@ from __future__ import annotations
 import inspect
 import logging
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 import attrs
 import numpy as np
@@ -18,8 +19,7 @@ import pandas as pd
 import seaborn as sns
 import statsmodels.api as sm
 
-from bayesian import data_IO, outliers_smoothing
-from bayesian.emulation import base
+from bayesian import data_IO, emulation, outliers_smoothing
 
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,7 @@ class ObservableGrouping:
             raise ValueError(f"Invalid ObservableGrouping settings: {self}")
         return label
 
-    def gen(self, config: base.EmulatorOrganizationConfig, observables_filename: str, validation_set: bool) -> Iterable[tuple[str, str, pd.DataFrame]]:
+    def gen(self, config: emulation.EmulationConfig, observables_filename: str, validation_set: bool) -> Iterable[tuple[str, str, pd.DataFrame]]:
         """ Generate a sequence of DataFrames, each of which contains a subset of the observables.
 
         :param np.ndarray observables: Predictions to be grouped.
@@ -105,7 +105,7 @@ class ObservableGrouping:
                 df["design_point"] = design_points
                 yield f"observable_{observable_key}", observable_key, df
         elif self.emulator_groups:
-            for emulation_group_name, emulation_group_config in config.emulation_groups_config.items():
+            for emulation_group_name, emulation_group_config in config.emulation_settings.items():
                 observables = data_IO.predictions_matrix_from_h5(
                     config.output_dir,
                     filename=observables_filename,
@@ -149,7 +149,7 @@ class ObservableGrouping:
 
 
 ####################################################################################################################
-def plot(config: base.EmulatorOrganizationConfig):
+def plot(config: emulation.EmulationConfig):
     '''
     Generate plots for input experimental data and predictions, using data written to file in the data import.
 
@@ -200,7 +200,7 @@ def plot(config: base.EmulatorOrganizationConfig):
 
 ####################################################################################################################
 def _plot_predictions_for_all_design_points(
-    config: base.EmulatorOrganizationConfig,
+    config: emulation.EmulationConfig,
     plot_dir: Path,
     select_which_to_plot: list[str],
     grid_size: tuple[int, int] | None = None,
@@ -288,7 +288,7 @@ def _plot_predictions_for_all_design_points(
 
 ####################################################################################################################
 def _plot_pairplot_correlations(
-    config: base.EmulatorOrganizationConfig,
+    config: emulation.EmulationConfig,
     plot_dir: Path,
     observable_grouping: ObservableGrouping | None = None,
     outliers_config: outliers_smoothing.OutliersConfig | None = None,

@@ -21,6 +21,7 @@ For further information, see the documentation in `emulation.interface`
 
 from __future__ import annotations
 
+from bayesian.emulation.base import IO  # noqa: F401
 from bayesian.emulation.interface import (  # noqa: F401
     EmulationConfig,
     fit_emulators,

@@ -19,9 +19,7 @@ from matplotlib.collections import PathCollection
 import seaborn as sns
 sns.set_context('paper', rc={'font.size':18,'axes.titlesize':18,'axes.labelsize':18})
 
-from bayesian import data_IO
-from bayesian import plot_utils
-from bayesian.emulation import base
+from bayesian import data_IO, emulation, plot_utils
 from bayesian import mcmc
 
 logger = logging.getLogger(__name__)
@@ -356,13 +354,13 @@ def _plot_posterior_observables(chain, plot_dir, config, n_samples=200):
     # Get emulator predictions at these points
     observables = data_IO.read_dict_from_h5(config.output_dir, config.observables_filename, verbose=False)
     # To get the results, we need to setup the emulation config
-    emulation_config = base.EmulatorOrganizationConfig.from_config_file(
+    emulation_config = emulation.EmulationConfig.from_config_file(
         analysis_name=config.analysis_name,
         parameterization=config.parameterization,
         analysis_config=config.analysis_config,
         config_file=config.config_file,
     )
-    emulator_predictions = base.predict(posterior_samples, emulation_config=emulation_config)
+    emulator_predictions = emulation.predict(posterior_samples, emulation_config=emulation_config)
     emulator_predictions_dict = data_IO.observable_dict_from_matrix(emulator_predictions['central_value'],
                                                                     observables,
                                                                     observable_filter=emulation_config.observable_filter)

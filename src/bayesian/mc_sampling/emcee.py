@@ -12,14 +12,14 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 
-import bayesian.emulation.base as emulation_base
+from bayesian import emulation
 
 logger = logging.getLogger(__name__)
 
 
 def _run_using_emcee(
     config: MCMCConfig,
-    emulation_config: emulation_base.EmulatorOrganizationConfig,
+    emulation_config: emulation.EmulationConfig,
     emulation_results: dict[str, dict[str, npt.NDArray[np.float64]]],
     emulator_cov_unexplained: dict,
     experimental_results: dict,

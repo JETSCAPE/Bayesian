@@ -1197,8 +1197,8 @@ def initialize_observables_dict_from_tables(
 
     #----------------------
     # Print observables that we will use
-    # NOTE: We don't need to pass the observable filter because we already filtered the observables via `_accept_observables``
-    [logger.info(f'Accepted observable {s}') for s in sorted_observable_list_from_dict(observables['Prediction'])]
+    # NOTE: We don't need to pass the observable filter because we already filtered the observables via `_accept_observables`
+    [logger.info(f"Accepted observable  {s}") for s in sorted_observable_list_from_dict(observables["Prediction"])]  # type: ignore[func-returns-value]
 
     return observables
 
@@ -1228,7 +1228,8 @@ def write_dict_to_h5(results, output_dir, filename, verbose=True):
         logger.info("Done.")
         logger.info("")
 
-def read_dict_from_h5(input_dir, filename, verbose=True):
+
+def read_dict_from_h5(input_dir: Path, filename: str, verbose: bool = True) -> dict[str, Any]:
     """
     Read dictionary of ndarrays from hdf5
     Note: all keys should be strings
@@ -1237,14 +1238,12 @@ def read_dict_from_h5(input_dir, filename, verbose=True):
     :param str filename: name of hdf5 file to read
     """
     if verbose:
-        logger.info("")
-        logger.info(f"Loading results from {input_dir}/{filename}...")
+        logger.info(f"\nLoading results from {input_dir}/{filename}...")
 
-    results = h5todict(os.path.join(input_dir, filename))
+    results = h5todict(str(input_dir / filename))
 
     if verbose:
-        logger.info("Done.")
-        logger.info("")
+        logger.info("Done.\n")
 
     return results
 
@@ -1293,7 +1292,9 @@ def predictions_matrix_from_h5(output_dir, filename, validation_set=False, obser
     return Y
 
 
-def design_array_from_h5(output_dir: Path, filename: str, validation_set: bool = False) -> npt.NDArray[np.float32 | np.float64]:
+def design_array_from_h5(
+    output_dir: Path, filename: str, validation_set: bool = False
+) -> npt.NDArray[np.float32 | np.float64]:
     """
     Initialize design array from observables.h5 file
 

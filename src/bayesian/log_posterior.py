@@ -43,12 +43,12 @@ def initialize_pool_variables(local_min, local_max, local_emulation_config, loca
     - Store in global variable for efficient reuse during MCMC
     """
 
-    global g_min  # noqa: PLW0603
-    global g_max  # noqa: PLW0603
-    global g_emulation_config  # noqa: PLW0603
-    global g_emulation_results  # noqa: PLW0603
-    global g_experimental_results  # noqa: PLW0603
-    global g_emulator_cov_unexplained  # noqa: PLW0603
+    global g_min  
+    global g_max  
+    global g_emulation_config  
+    global g_emulation_results  
+    global g_experimental_results  
+    global g_emulator_cov_unexplained  
     global g_systematic_covariance
     g_min = local_min
     g_max = local_max
@@ -99,9 +99,32 @@ def initialize_pool_variables(local_min, local_max, local_emulation_config, loca
             n_features = len(g_experimental_results['y'])
             g_systematic_covariance = np.zeros((n_features, n_features))
 
-        # SAVE covariance matrices for plotting
+    # Build statistical covariance (may include per-observable external stat cov)
+    if 'per_observable_external_stat_cov' in g_experimental_results and g_experimental_results['per_observable_external_stat_cov']:
+        # Build with per-observable external stat cov blocks
+        n_features = len(g_experimental_results['y'])
+        C_stat = np.zeros((n_features, n_features))
+        
+        # Fill diagonal with standard statistical errors by default
+        np.fill_diagonal(C_stat, g_experimental_results['y_err_stat']**2)
+        
+        # Replace blocks with external stat cov where specified
+        for obs_label, cov_info in g_experimental_results['per_observable_external_stat_cov'].items():
+            start = cov_info['start']
+            end = cov_info['end']
+            ext_cov = cov_info['matrix']
+            
+            # Replace the block
+            C_stat[start:end, start:end] = ext_cov
+
+            logger.info(f"Saved external stat cov for {obs_label} (bins {start}-{end}) to plotting file")
+
+    else:
+        # Use diagonal statistical errors
+        C_stat = np.diag(g_experimental_results['y_err_stat']**2)
+    
     covariance_matrices = {
-        'statistical': np.diag(g_experimental_results['y_err_stat']**2), # external_cov mode will ignore this
+        'statistical': C_stat,  # Now includes per-observable external stat cov if present
         'systematic_total': g_systematic_covariance,
         'emulator': None,  # Will be filled with emulator predictions
     }
@@ -185,7 +208,30 @@ def log_posterior(X, *, set_to_infinite_outside_bounds: bool = True) -> npt.NDAr
                 logger.error("Non-finite values in covariance matrix!")
         else:
             # MODE 2 & 3: Standard mode (stat + sys)
-            covariance_matrix += np.diag(data_y_err**2)
+            
+            # Check for per-observable external stat covariances
+            if 'per_observable_external_stat_cov' in g_experimental_results and g_experimental_results['per_observable_external_stat_cov']:
+                # Build statistical covariance with per-observable external cov where specified
+                C_stat = np.zeros((n_features, n_features))
+                
+                # Fill diagonal with standard statistical errors by default
+                np.fill_diagonal(C_stat, data_y_err**2)
+                
+                # Replace blocks with external stat cov where specified
+                for obs_label, cov_info in g_experimental_results['per_observable_external_stat_cov'].items():
+                    start = cov_info['start']
+                    end = cov_info['end']
+                    ext_cov = cov_info['matrix']
+                    
+                    # Replace the block
+                    C_stat[start:end, start:end] = ext_cov
+                
+                covariance_matrix += C_stat[np.newaxis, :, :]
+            else:
+
+                # Use diagonal statistical errors
+                covariance_matrix += np.diag(data_y_err**2)
+            
             # Add systematic covariance matrix (same for all parameter points)
             if g_systematic_covariance is not None:
                 covariance_matrix += g_systematic_covariance[np.newaxis, :, :]

@@ -405,6 +405,48 @@ def _read_external_covariance(filepath):
         logger.error(f"Failed to read external covariance: {e}")
         return None
 
+def _read_external_stat_covariance(filepath, n_bins, obs_label):
+    """
+    Load per-observable external statistical covariance matrix.
+    
+    Args:
+        filepath: Path to covariance matrix file
+        n_bins: Expected number of bins for this observable
+        obs_label: Observable label (for error messages)
+    
+    Returns:
+        Covariance matrix of shape (n_bins, n_bins)
+    
+    Raises:
+        ValueError: If file cannot be loaded or has wrong shape
+    """
+    try:
+        cov_matrix = np.loadtxt(filepath)
+    except Exception as e:
+        raise ValueError(f"Failed to load external_stat_cov for {obs_label} from {filepath}: {e}")
+    
+    # Validate shape
+    if cov_matrix.shape != (n_bins, n_bins):
+        raise ValueError(
+            f"External stat covariance for {obs_label} has shape {cov_matrix.shape}, "
+            f"expected ({n_bins}, {n_bins})"
+        )
+    
+    # Validate symmetry
+    if not np.allclose(cov_matrix, cov_matrix.T):
+        logger.warning(f"External stat covariance for {obs_label} is not symmetric. Symmetrizing.")
+        cov_matrix = 0.5 * (cov_matrix + cov_matrix.T)
+    
+    # Validate positive semi-definite
+    eigvals = np.linalg.eigvalsh(cov_matrix)
+    if np.any(eigvals < -1e-10):
+        raise ValueError(
+            f"External stat covariance for {obs_label} is not positive semi-definite. "
+            f"Minimum eigenvalue: {eigvals.min()}"
+        )
+    
+    logger.info(f"Loaded external statistical covariance for {obs_label} from {filepath}")
+    return cov_matrix
 
 def _sum_systematics_quadrature(systematics_dict):
     """
@@ -534,7 +576,12 @@ def _parse_config_observables(analysis_config, correlation_groups=None):
                     # Ignore sys_data if external covariance is used
                     sys_data = [] if external_cov_file else obs_config.get('sys_data', [])
                     sys_theory = obs_config.get('sys_theory', [])
-                    parsed_observables.append((obs_name, sys_data, sys_theory))
+                    
+                    # Extract per-observable external stat cov (if specified)
+                    external_stat_cov = obs_config.get('external_stat_cov', None)
+                    
+                    # Append with external_stat_cov info
+                    parsed_observables.append((obs_name, sys_data, sys_theory, external_stat_cov))
                 else:
                     logger.warning(f"Unrecognized observable config format: {obs_config}")
                     
@@ -785,6 +832,9 @@ def _data_array_from_h5_with_correlations(observables, correlation_manager,
             data_dict[observable_label]['y_err_stat'] = exp_uncertainty
             data_dict[observable_label]['systematics'] = exp_data_dict[observable_label]['systematics']
 
+            if 'external_stat_cov_matrix' in exp_data_dict[observable_label]:
+                data_dict[observable_label]['external_stat_cov_matrix'] = exp_data_dict[observable_label]['external_stat_cov_matrix']
+
     all_systematic_names = correlation_manager.get_all_systematic_names()
     
     data = {
@@ -854,6 +904,22 @@ def _data_array_from_h5_with_correlations(observables, correlation_manager,
             raise ValueError(f"Shape mismatch in systematic uncertainty stacking: {e}")
     else:
         data['y_err_syst'] = np.array([]).reshape(len(data['y']), 0)
+
+    # Collect per-observable external stat covariances
+    data['per_observable_external_stat_cov'] = {}
+    for observable_label in sorted_observable_list:
+        ext_cov = data_dict[observable_label].get('external_stat_cov_matrix', None)
+        if ext_cov is not None:
+            # Find observable ranges
+            for start, end, obs_name in data['observable_ranges']:
+                if obs_name == observable_label:
+                    data['per_observable_external_stat_cov'][observable_label] = {
+                        'matrix': ext_cov,
+                        'start': start,
+                        'end': end
+                    }
+                    logger.info(f"Stored external stat cov for {observable_label} (bins {start}-{end})")
+                    break
     
     correlation_manager.register_observable_ranges(data['observable_ranges'])
     correlation_manager.resolve_bin_counts(data['observable_ranges'])
@@ -983,9 +1049,10 @@ def initialize_observables_dict_from_tables(
                                             correlation_groups=correlation_groups
     )
 
+    # Build config map including external_stat_cov
     systematic_config_map = {}
-    for obs_name, sys_data_list, sys_theory_list in parsed_observables:
-        systematic_config_map[obs_name] = (sys_data_list, sys_theory_list)
+    for obs_name, sys_data_list, sys_theory_list, external_stat_cov in parsed_observables:
+        systematic_config_map[obs_name] = (sys_data_list, sys_theory_list, external_stat_cov)
 
     if external_cov_file:
         external_cov_path = os.path.join(table_dir, external_cov_file)
@@ -1021,8 +1088,35 @@ def initialize_observables_dict_from_tables(
             data_entry['y_err_stat'] = data[:,3] 
 
             observable_label, _ = _filename_to_labels(filename)
+
+            sys_data_list, sys_theory_list, external_stat_cov_file = systematic_config_map.get(
+                observable_label, ([], [], None)
+            )
+
+            # Check if this observable has per-observable external stat cov
+            external_stat_cov_matrix = None
+            if external_stat_cov_file is not None and external_cov_file is None:
+                # Only load if global external cov is NOT set
+                n_bins = len(data_entry['y'])
+                
+                # Construct full path (resolve relative to table_dir)
+                if not os.path.isabs(external_stat_cov_file):
+                    external_stat_cov_full_path = os.path.join(table_dir, external_stat_cov_file)
+                else:
+                    external_stat_cov_full_path = external_stat_cov_file
+                
+                try:
+                    external_stat_cov_matrix = _read_external_stat_covariance(
+                        external_stat_cov_full_path, n_bins, observable_label
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to load external_stat_cov for {observable_label}: {e}")
+                    external_stat_cov_matrix = None
+
+            # Store in data_entry
+            data_entry['external_stat_cov_file'] = external_stat_cov_file
+            data_entry['external_stat_cov_matrix'] = external_stat_cov_matrix
             
-            sys_data_list, _ = systematic_config_map.get(observable_label, ([], []))
             if sys_data_list:
                 systematic_columns = _parse_data_systematic_header(os.path.join(data_dir, filename))
                 systematic_data = _read_data_systematics(os.path.join(data_dir, filename), systematic_columns)
@@ -1146,7 +1240,7 @@ def initialize_observables_dict_from_tables(
                     design_points_to_exclude=design_points_to_exclude,
                 )
 
-                _, sys_theory_list = systematic_config_map.get(observable_label, ([], []))
+                _, sys_theory_list, _ = systematic_config_map.get(observable_label, ([], [], None))
                 model_name = analysis_config.get('model_name', 'exponential')
                 theory_systematics = _read_theory_systematics(table_dir, model_name, observable_label, sys_theory_list)
                 filtered_theory_systematics = _filter_systematics_by_config(theory_systematics, sys_theory_list)

@@ -13,7 +13,7 @@ import yaml
 from pathlib import Path
 import numpy as np
 
-from bayesian import analysis as ana, data_IO, emulation, preprocess_input_data, mcmc
+from bayesian import analysis, data_IO, emulation, preprocess_input_data, mcmc
 from bayesian import plot_input_data, plot_emulation, plot_mcmc, plot_qhat, plot_closure, plot_analyses, plot_covariance
 
 from bayesian import common_base, helpers
@@ -39,12 +39,14 @@ class SteerAnalysis(common_base.CommonBase):
     def initialize(self) -> None:
         logger.info("Initializing class objects")
 
-        with open(self.config_file, "r") as stream:
+        with self.config_file.open() as stream:
             config = yaml.safe_load(stream)
 
-        self.output_dir = config["output_dir"]
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir)
+        self.output_dir = Path(config["output_dir"])
+        self.output_dir.mkdir(exist_ok=True, parents=True)
+
+        # Option to reduce logging to file
+        self._reduce_logging_to_file = config.get("reduce_logging_to_file", False)
 
         # Data inputs
         self.observable_table_dir = config["observable_table_dir"]
@@ -66,10 +68,17 @@ class SteerAnalysis(common_base.CommonBase):
         if self.correlation_groups:
             logger.info(f"Loaded correlation_groups with {len(self.correlation_groups)} group tags")
 
-    # ---------------------------------------------------------------
-    # Main function
-    # ---------------------------------------------------------------
-    def run_analysis(self):
+    def run_analysis(self) -> None:
+        """Main steering function for analyses."""
+        # Keep track of log and config for each run for reproducibility.
+        if not self._reduce_logging_to_file:
+            # Add logging to file
+            _root_log = logging.getLogger()
+            _root_log.addHandler(logging.FileHandler(self.output_dir / 'steer_analysis.log', 'w'))
+
+            # Also write analysis config to shared directory
+            shutil.copy(self.config_file, Path(self.output_dir) / "steer_analysis_config.yaml")
+
         # Loop through each analysis
         with helpers.progress_bar() as progress:
             analysis_task = progress.add_task("[deep_sky_blue1]Running analysis...", total=len(self.analyses))
@@ -92,7 +101,12 @@ class SteerAnalysis(common_base.CommonBase):
                 )
 
                 for parameterization in analysis_config.get("parameterizations", ["default"]):
-                    analysis_settings = ana.AnalysisSettings.from_config_file()
+                    analysis_settings = analysis.AnalysisSettings.from_config_file(
+                        analysis_name=analysis_name,
+                        # TODO(RJE): Need to figure out whether I need to pass this here - or if not, how to handle it.
+                        parameterization=parameterization,
+                        config_file=self.config_file
+                    )
 
                     # Initialize design points, predictions, data, and uncertainties
                     # We store them in a dict and write/read it to HDF5

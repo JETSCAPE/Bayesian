@@ -19,7 +19,7 @@ from types import ModuleType
 
 import yaml
 
-from bayesian import common_base, data_IO, register_modules
+from bayesian import common_base, data_IO, emulation, register_modules
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,8 @@ def run_mcmc(config: MCMCConfig, closure_index: int = -1) -> None:
     ndim = len(names)
 
     # Load emulators
-    emulation_config = base.EmulatorOrganizationConfig.from_config_file(
+    emulation_config = emulation.EmulationConfig.from_config_file(
+        analysis_settings=config.analysis_config,
         analysis_name=config.analysis_name,
         parameterization=config.parameterization,
         analysis_config=config.analysis_config,

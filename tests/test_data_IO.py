@@ -31,6 +31,30 @@ def test_observable_matrix_round_trip(caplog: Any) -> None:
     Y_round_trip = data_IO.observable_matrix_from_dict(Y_dict)
     np.testing.assert_allclose(Y, Y_round_trip)
 
+
+def test_predictions_matrix_selects_requested_value_key(monkeypatch: Any) -> None:
+    observable = "5020__PbPb__hadron__pt_ch_cms____0-5"
+    predictions = {
+        observable: {
+            "y": np.array([[0.4, 0.5], [0.6, 0.7]]),
+            "y_err_stat": np.array([[0.01, 0.02], [0.03, 0.04]]),
+        }
+    }
+    monkeypatch.setattr(
+        data_IO,
+        "read_dict_from_h5",
+        lambda *args, **kwargs: {"Prediction": predictions},
+    )
+
+    result = data_IO.predictions_matrix_from_h5(
+        ".",
+        "unused.h5",
+        value_key="y_err_stat",
+    )
+
+    np.testing.assert_allclose(result, predictions[observable]["y_err_stat"].T)
+
+
 @pytest.mark.parametrize(
     "design_points_to_exclude",
     [[17, 43, 203], []],

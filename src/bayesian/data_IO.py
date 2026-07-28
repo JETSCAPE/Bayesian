@@ -1462,7 +1462,11 @@ def read_dict_from_h5(input_dir: Path, filename: str, verbose: bool = True) -> d
 
 
 def predictions_matrix_from_h5(
-    output_dir, filename, validation_set=False, observable_filter: ObservableFilter | None = None
+    output_dir,
+    filename,
+    validation_set=False,
+    observable_filter: ObservableFilter | None = None,
+    value_key: str = "y",
 ):
     """
     Initialize predictions from observables.h5 file into a single 2D array:
@@ -1470,6 +1474,8 @@ def predictions_matrix_from_h5(
     :param str output_dir: location of filename
     :param str filename: h5 filename (typically 'observables.h5')
     :param ObservableFilter observable_filter: (optional) filter to apply to the observables
+    :param str value_key: prediction field to stack (for example, ``y`` or
+        ``y_err_stat``)
     :return 2darray Y: matrix of predictions at all design points (design_point_index, observable_bins) i.e. (n_samples, n_features)
     """
 
@@ -1489,7 +1495,7 @@ def predictions_matrix_from_h5(
     #   (design_point_index, observable_bins) i.e. (n_samples, n_features)
     length_of_Y = 0
     for i, observable_label in enumerate(sorted_observable_list):
-        values = observables[prediction_label][observable_label]["y"].T
+        values = observables[prediction_label][observable_label][value_key].T
         length_of_Y += values.shape[1]
         logger.info(f"{observable_label} shape: {values.shape}, length: {length_of_Y=}")
         if i == 0:

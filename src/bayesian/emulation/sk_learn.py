@@ -15,6 +15,8 @@ Based in part on JETSCAPE/STAT code.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Any, ClassVar
@@ -34,6 +36,109 @@ logger = logging.getLogger(__name__)
 
 # Name under which the module is registered.
 _register_name = "sk_learn"
+_CACHE_METADATA_VERSION = 1
+
+
+def _training_metadata(
+    emulator_settings: SKLearnEmulatorSettings,
+    analysis_settings: analysis.AnalysisSettings,
+    Y: npt.NDArray[np.float64],
+    design: npt.NDArray[np.float64],
+    Y_err_stat: npt.NDArray[np.float64] | None = None,
+) -> dict[str, Any]:
+    """Describe the inputs and settings that make a cached GP reusable."""
+    observable_list = emulator_settings.settings.get("observable_list", [])
+    observable_names = [
+        item["observable"] if isinstance(item, dict) else item
+        for item in observable_list
+    ]
+    parameterization = analysis_settings.raw_analysis_config["parameterization"][
+        analysis_settings.parameterization
+    ]
+    settings = {
+        "backend": _register_name,
+        "n_pc": emulator_settings.n_pc,
+        "max_n_components_to_calculate": emulator_settings.max_n_components_to_calculate,
+        "active_kernels": emulator_settings.active_kernels,
+        "n_restarts": emulator_settings.n_restarts,
+        "alpha": emulator_settings.alpha,
+        "normalize_y": emulator_settings.normalize_y,
+        "random_state": emulator_settings.random_state,
+        "use_prediction_statistical_uncertainty": (
+            emulator_settings.use_prediction_statistical_uncertainty
+        ),
+        "observable_names": observable_names,
+        "observable_exclude_list": emulator_settings.settings.get(
+            "observable_exclude_list", []
+        ),
+        "parameterization": {
+            "name": analysis_settings.parameterization,
+            "parameter_names": parameterization.get("names"),
+            "min": parameterization["min"],
+            "max": parameterization["max"],
+        },
+    }
+    settings_json = json.dumps(
+        settings,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+    arrays_hash = hashlib.sha256()
+    arrays = [("Y", Y), ("design", design)]
+    if Y_err_stat is not None:
+        arrays.append(("Y_err_stat", Y_err_stat))
+    for name, array in arrays:
+        canonical = np.ascontiguousarray(array, dtype="<f8")
+        arrays_hash.update(name.encode())
+        arrays_hash.update(str(canonical.shape).encode())
+        arrays_hash.update(canonical.tobytes())
+
+    return {
+        "version": _CACHE_METADATA_VERSION,
+        "settings": settings,
+        "settings_sha256": hashlib.sha256(settings_json).hexdigest(),
+        "training_arrays_sha256": arrays_hash.hexdigest(),
+    }
+
+
+def _validate_cached_emulator(
+    cached_results: dict[str, Any],
+    expected_metadata: dict[str, Any],
+    output_filename: Path,
+) -> None:
+    metadata = cached_results.get("training_metadata")
+    if metadata is None:
+        msg = (
+            f"Cached emulator {output_filename} has no training metadata, "
+            "so compatibility with the requested data and GP settings cannot "
+            "be verified. Set force_retrain: true once to replace this legacy "
+            "cache."
+        )
+        raise RuntimeError(msg)
+
+    if metadata != expected_metadata:
+        msg = (
+            f"Cached emulator {output_filename} was trained with different "
+            "settings or input arrays. Set force_retrain: true to replace it."
+        )
+        raise RuntimeError(msg)
+
+
+def _build_gaussian_process(
+    kernel: Any,
+    emulator_settings: SKLearnEmulatorSettings,
+    *,
+    alpha: float | npt.NDArray[np.float64] | None = None,
+) -> sklearn_gaussian_process.GaussianProcessRegressor:
+    return sklearn_gaussian_process.GaussianProcessRegressor(
+        kernel=kernel,
+        alpha=emulator_settings.alpha if alpha is None else alpha,
+        n_restarts_optimizer=emulator_settings.n_restarts,
+        normalize_y=emulator_settings.normalize_y,
+        random_state=emulator_settings.random_state,
+        copy_X_train=False,
+    )
 
 
 def fit_emulator(
@@ -54,12 +159,58 @@ def fit_emulator(
         emulator_settings=emulator_settings, analysis_settings=analysis_settings
     )
 
+    # Load the exact training inputs before checking the cache so incompatible
+    # settings or data cannot silently reuse a fitted emulator.
+    Y = data_IO.predictions_matrix_from_h5(
+        output_dir=analysis_settings.output_dir,
+        filename=analysis_settings.io.observables_filename,
+        observable_filter=emulator_settings.base_settings.observable_filter,
+    )
+    design = data_IO.design_array_from_h5(
+        analysis_settings.output_dir,
+        filename=analysis_settings.io.observables_filename,
+    )
+    Y_err_stat = None
+    if emulator_settings.use_prediction_statistical_uncertainty:
+        Y_err_stat = data_IO.predictions_matrix_from_h5(
+            output_dir=analysis_settings.output_dir,
+            filename=analysis_settings.io.observables_filename,
+            observable_filter=emulator_settings.base_settings.observable_filter,
+            value_key="y_err_stat",
+        )
+        if Y_err_stat.shape != Y.shape:
+            raise ValueError(
+                "Prediction values and statistical uncertainties have "
+                f"different shapes: {Y.shape} != {Y_err_stat.shape}"
+            )
+        if not np.all(np.isfinite(Y_err_stat)) or np.any(Y_err_stat < 0):
+            raise ValueError(
+                "Prediction statistical uncertainties must be finite and "
+                "non-negative"
+            )
+    training_metadata = _training_metadata(
+        emulator_settings,
+        analysis_settings,
+        Y,
+        design,
+        Y_err_stat,
+    )
+
     # Check if emulator already exists
     if output_filename.exists():
         if emulator_settings.force_retrain:
             output_filename.unlink()
             logger.info(f"Removed {output_filename}")
         else:
+            cached_results = emulation_base.IO.read_emulator(
+                emulator_settings=emulator_settings,
+                analysis_settings=analysis_settings,
+            )
+            _validate_cached_emulator(
+                cached_results,
+                training_metadata,
+                output_filename,
+            )
             logger.info(f"Emulators already exist: {output_filename} (to force retrain, set force_retrain: True)")
             return {}
 
@@ -67,11 +218,6 @@ def fit_emulator(
     # A consistent order of observables is enforced internally in data_IO
     # NOTE: One sample corresponds to one design point, while one feature is one bin of one observable
     logger.info("Doing PCA...")
-    Y = data_IO.predictions_matrix_from_h5(
-        output_dir=analysis_settings.output_dir,
-        filename=analysis_settings.io.observables_filename,
-        observable_filter=emulator_settings.base_settings.observable_filter,
-    )
 
     # Use sklearn to:
     #  - Center and scale each feature (and later invert)
@@ -118,17 +264,28 @@ def fit_emulator(
     # Scale data and perform PCA
     Y_pca = pca.fit_transform(scaler.fit_transform(Y))
     Y_pca_truncated = Y_pca[:, : emulator_settings.n_pc]  # Select PCs here
+    alpha_per_pc = _project_prediction_uncertainties_to_pc_space(
+        Y_err_stat=Y_err_stat,
+        scaler=scaler,
+        pca=pca,
+        Y_pca_truncated=Y_pca_truncated,
+        normalize_y=emulator_settings.normalize_y,
+        jitter=emulator_settings.alpha,
+    )
+    if alpha_per_pc is not None:
+        logger.info(
+            "Using projected model-statistical variances as heteroscedastic "
+            "GP alpha (min=%.3g, median=%.3g, max=%.3g)",
+            float(np.min(alpha_per_pc)),
+            float(np.median(alpha_per_pc)),
+            float(np.max(alpha_per_pc)),
+        )
     # Invert PCA and undo the scaling
     Y_reconstructed_truncated = Y_pca_truncated.dot(pca.components_[: emulator_settings.n_pc, :])
     Y_reconstructed_truncated_unscaled = scaler.inverse_transform(Y_reconstructed_truncated)
     explained_variance_ratio = pca.explained_variance_ratio_
     logger.info(
         f"  Variance explained by first {emulator_settings.n_pc} components: {np.sum(explained_variance_ratio[: emulator_settings.n_pc])}"
-    )
-
-    # Get design
-    design = data_IO.design_array_from_h5(
-        analysis_settings.output_dir, filename=analysis_settings.io.observables_filename
     )
 
     # Define GP kernel (covariance function)
@@ -173,15 +330,20 @@ def fit_emulator(
     logger.info("")
     logger.info("Fitting GPs...")
     logger.info(f"  The design has {design.shape[1]} parameters")
-    emulators = [
-        sklearn_gaussian_process.GaussianProcessRegressor(
-            kernel=kernel,
-            alpha=emulator_settings.alpha,
-            n_restarts_optimizer=emulator_settings.n_restarts,
-            copy_X_train=False,
-        ).fit(design, y)
-        for y in Y_pca_truncated.T
-    ]
+    emulators = []
+    for i_pc, y in enumerate(Y_pca_truncated.T):
+        alpha = (
+            emulator_settings.alpha
+            if alpha_per_pc is None
+            else alpha_per_pc[:, i_pc]
+        )
+        emulators.append(
+            _build_gaussian_process(
+                kernel,
+                emulator_settings,
+                alpha=alpha,
+            ).fit(design, y)
+        )
 
     # Print hyperparameters.
     logger.info("")
@@ -199,9 +361,46 @@ def fit_emulator(
     output_dict["PCA"]["Y_reconstructed_truncated_unscaled"] = Y_reconstructed_truncated_unscaled
     output_dict["PCA"]["pca"] = pca
     output_dict["PCA"]["scaler"] = scaler
+    output_dict["PCA"]["Y_err_stat"] = Y_err_stat
+    output_dict["PCA"]["alpha_per_pc"] = alpha_per_pc
     output_dict["emulators"] = emulators
+    output_dict["training_metadata"] = training_metadata
 
     return output_dict
+
+
+def _project_prediction_uncertainties_to_pc_space(
+    *,
+    Y_err_stat: npt.NDArray[np.float64] | None,
+    scaler: sklearn_preprocessing.StandardScaler,
+    pca: sklearn_decomposition.PCA,
+    Y_pca_truncated: npt.NDArray[np.float64],
+    normalize_y: bool,
+    jitter: float,
+) -> npt.NDArray[np.float64] | None:
+    """Project diagonal feature-level simulation covariance into PC variances.
+
+    Off-diagonal PC covariance is discarded because each retained PC is fit by
+    an independent Gaussian process.
+    """
+    if Y_err_stat is None:
+        return None
+
+    scaled_variance = (Y_err_stat / scaler.scale_[np.newaxis, :]) ** 2
+    retained_components_squared = (
+        pca.components_[: Y_pca_truncated.shape[1], :] ** 2
+    )
+    alpha_per_pc = scaled_variance @ retained_components_squared.T
+
+    # sklearn normalizes y before adding alpha, so alpha must use the same
+    # normalized target units.
+    if normalize_y:
+        pc_scale = np.std(Y_pca_truncated, axis=0)
+        pc_scale[pc_scale == 0] = 1.0
+        alpha_per_pc /= pc_scale[np.newaxis, :] ** 2
+
+    alpha_per_pc += jitter
+    return alpha_per_pc
 
 
 def predict(
@@ -402,6 +601,9 @@ class SKLearnEmulatorSettings:
     settings: dict[str, Any]
     # Additional name, for providing
     additional_name: str = attrs.field(default="")
+    normalize_y: bool = attrs.field(default=False)
+    random_state: int | None = attrs.field(default=None)
+    use_prediction_statistical_uncertainty: bool = attrs.field(default=False)
 
     def __attrs_post_init__(self):
         """
@@ -439,6 +641,11 @@ class SKLearnEmulatorSettings:
             active_kernels={kernel_type: config["kernels"][kernel_type] for kernel_type in config["kernels"]["active"]},
             n_restarts=config["GPR"]["n_restarts"],
             alpha=config["GPR"]["alpha"],
+            normalize_y=config["GPR"].get("normalize_y", False),
+            random_state=config["GPR"].get("random_state"),
+            use_prediction_statistical_uncertainty=config["GPR"].get(
+                "use_prediction_statistical_uncertainty", False
+            ),
             settings=config,
         )
 

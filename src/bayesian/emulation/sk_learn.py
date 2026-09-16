@@ -36,6 +36,62 @@ logger = logging.getLogger(__name__)
 _register_name = "sk_learn"
 
 
+def _signal_amplitude_settings(emulator_settings: SKLearnEmulatorSettings) -> dict[str, Any] | None:
+    """Canonical configuration for an optional, PC-variance-scaled signal amplitude."""
+    if "signal_amplitude" not in emulator_settings.active_kernels:
+        return None
+    settings = emulator_settings.active_kernels["signal_amplitude"]
+    expected = {"constant_value_factor", "constant_value_bounds_factor"}
+    if not isinstance(settings, dict) or set(settings) != expected:
+        msg = f"signal_amplitude requires exactly {sorted(expected)}"
+        raise ValueError(msg)
+    try:
+        value = float(settings["constant_value_factor"])
+        bounds = np.asarray(settings["constant_value_bounds_factor"], dtype=float)
+    except (TypeError, ValueError) as exc:
+        msg = "signal_amplitude factors must be numeric"
+        raise ValueError(msg) from exc
+    if (
+        not np.isfinite(value)
+        or bounds.shape != (2,)
+        or not np.isfinite(bounds).all()
+        or not 0 < bounds[0] <= value <= bounds[1]
+        or bounds[0] == bounds[1]
+    ):
+        msg = "signal_amplitude requires finite 0 < lower <= constant_value_factor <= upper, with lower < upper"
+        raise ValueError(msg)
+    return {"constant_value_factor": value, "constant_value_bounds_factor": bounds.tolist()}
+
+
+def _kernel_for_pc(kernel: Any, pc_values: npt.NDArray[np.float64], emulator_settings: SKLearnEmulatorSettings) -> Any:
+    """Scale only the smooth kernel; retain additive constant and noise semantics."""
+    settings = _signal_amplitude_settings(emulator_settings)
+    if settings is None:
+        return kernel
+    variance = max(float(np.var(pc_values)), 1e-8)
+    kernels = sklearn_gaussian_process.kernels
+    amplitude = kernels.ConstantKernel(
+        constant_value=variance * settings["constant_value_factor"],
+        constant_value_bounds=variance * np.asarray(settings["constant_value_bounds_factor"]),
+    )
+
+    def scale_smooth(component: Any) -> Any:
+        if isinstance(component, (kernels.Matern, kernels.RBF)):
+            return amplitude * component
+        if isinstance(component, kernels.Sum):
+            return scale_smooth(component.k1) + scale_smooth(component.k2)
+        return component
+
+    return scale_smooth(kernel)
+
+
+def _validate_signal_amplitude_cache(results: dict[str, Any], emulator_settings: SKLearnEmulatorSettings) -> None:
+    """Do not silently load a unit-amplitude fit after enabling signal amplitude."""
+    if results.get("signal_amplitude") != _signal_amplitude_settings(emulator_settings):
+        msg = "Cached emulator signal_amplitude settings differ; retrain with force_retrain: true before prediction"
+        raise ValueError(msg)
+
+
 def fit_emulator(
     emulator_settings: SKLearnEmulatorSettings, analysis_settings: analysis.AnalysisSettings
 ) -> dict[str, Any]:
@@ -60,6 +116,8 @@ def fit_emulator(
             output_filename.unlink()
             logger.info(f"Removed {output_filename}")
         else:
+            cached = emulation_base.IO.read_emulator(emulator_settings, analysis_settings)
+            _validate_signal_amplitude_cache(cached, emulator_settings)
             logger.info(f"Emulators already exist: {output_filename} (to force retrain, set force_retrain: True)")
             return {}
 
@@ -175,7 +233,7 @@ def fit_emulator(
     logger.info(f"  The design has {design.shape[1]} parameters")
     emulators = [
         sklearn_gaussian_process.GaussianProcessRegressor(
-            kernel=kernel,
+            kernel=_kernel_for_pc(kernel, y, emulator_settings),
             alpha=emulator_settings.alpha,
             n_restarts_optimizer=emulator_settings.n_restarts,
             copy_X_train=False,
@@ -200,6 +258,9 @@ def fit_emulator(
     output_dict["PCA"]["pca"] = pca
     output_dict["PCA"]["scaler"] = scaler
     output_dict["emulators"] = emulators
+    signal_amplitude = _signal_amplitude_settings(emulator_settings)
+    if signal_amplitude is not None:
+        output_dict["signal_amplitude"] = signal_amplitude
 
     return output_dict
 
@@ -238,6 +299,8 @@ def predict(
     Returns:
         emulator_predictions: dictionary containing matrices of central values and covariance
     """
+
+    _validate_signal_amplitude_cache(results, emulator_settings)
 
     # The emulators are stored as a list (one for each PC)
     emulators = results["emulators"]
@@ -413,6 +476,7 @@ class SKLearnEmulatorSettings:
         assert sum([s in self.active_kernels for s in reference_strings]) == 1, (
             "Must provide exactly one of 'matern', 'rbf' kernel"
         )
+        _signal_amplitude_settings(self)
 
         # Validation for noise configuration
         if "noise" in self.active_kernels:

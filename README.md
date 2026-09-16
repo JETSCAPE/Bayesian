@@ -33,3 +33,8 @@ python steer_analysis.py -c ./config/jet_substructure.yaml
 ```
 
 Configure the software as usual for python using a virtual environment.
+
+### GP signal amplitude
+
+The scikit-learn emulator supports an opt-in, per-PC multiplicative signal amplitude,
+separate from the additive WhiteKernel. See [configuration and compatibility notes](docs/gp_signal_amplitude.md).

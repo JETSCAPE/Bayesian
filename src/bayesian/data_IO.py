@@ -573,6 +573,61 @@ def _filter_systematics_by_config(systematic_data, config_systematics):
     return filtered_systematics
 
 
+def _source_short_name(key):
+    """Strip a leading 'sys,' or 'sys_' prefix from a systematic column key.
+
+    'sys,taa' -> 'taa', 'sys_jec' -> 'jec', 'correlated' -> 'correlated'.
+    Lets a bucket config reference the friendly source name regardless of the
+    (comma- or underscore-prefixed) column convention in the data file.
+    """
+    for pre in ("sys,", "sys_"):
+        if key.startswith(pre):
+            return key[len(pre):]
+    return key
+
+
+def _bucket_systematics(systematic_data, buckets):
+    """Collapse per-source systematic columns into named buckets by quadrature sum.
+
+    `buckets` maps bucket_name -> list of member source names (matched against each
+    column's short name, i.e. any 'sys,'/'sys_' prefix stripped, or the raw key). A
+    member list containing '*' is a catch-all: it claims every source not explicitly
+    listed in another bucket. Sources claimed by no bucket are kept as their own
+    single-source column (their own block), so nothing is silently dropped.
+
+    Returns a new {name: sigma_array} dict with one column per non-empty bucket
+    (+ any unbucketed sources) -- ready for per-source treatment (one ptgauss block
+    per column). Example: {'measurement': ['*'], 'normalization': ['taa','luminosity']}
+    on {'sys,correlated','sys,uncorrelated','sys,taa','sys,luminosity'} -> two columns.
+    """
+    if not buckets:
+        return dict(systematic_data)
+
+    short = {k: _source_short_name(k) for k in systematic_data}
+    explicit = {b: set(m) for b, m in buckets.items() if "*" not in list(m)}
+    catchall = [b for b, m in buckets.items() if "*" in list(m)]
+
+    out = {}
+    claimed = set()
+    for bname, members in explicit.items():
+        cols = [k for k, s in short.items() if s in members or k in members]
+        claimed.update(cols)
+        if cols:
+            out[bname] = _sum_systematics_quadrature({k: systematic_data[k] for k in cols})
+
+    rest = [k for k in systematic_data if k not in claimed]
+    if catchall:
+        bname = catchall[0]
+        if rest:
+            out[bname] = _sum_systematics_quadrature({k: systematic_data[k] for k in rest})
+    else:
+        # No catch-all: keep any unclaimed source as its own block (never drop data).
+        for k in rest:
+            out[k] = systematic_data[k]
+
+    return out
+
+
 def _parse_config_observables(analysis_config, correlation_groups=None):
     """
     Parse observable configuration for systematic support.
@@ -942,6 +997,21 @@ def _data_array_from_h5_with_correlations(observables, correlation_manager, pseu
     correlation_manager.register_observable_ranges(data["observable_ranges"])
     correlation_manager.resolve_bin_counts(data["observable_ranges"])
 
+    # Per-observable pT rescaled to [0,1], for the 'gaussian_pt' summed-correlation kernel
+    # (paper Eq. 10). Uses the FINAL (post-cut/post-align) bin centres so it lines up with
+    # each observable's covariance feature range. Missing/mismatched -> skipped (kernel then
+    # falls back to full correlation with a warning).
+    pt_map = {}
+    for start, end, obs_label in data["observable_ranges"]:
+        obs_dd = data_dict.get(obs_label, {})
+        xmin = np.asarray(obs_dd.get("xmin", []), dtype=float)
+        xmax = np.asarray(obs_dd.get("xmax", []), dtype=float)
+        if xmin.size == (end - start) and xmax.size == (end - start) and xmin.size > 0:
+            centres = 0.5 * (xmin + xmax)
+            span = centres.max() - centres.min()
+            pt_map[obs_label] = (centres - centres.min()) / span if span > 0 else np.zeros_like(centres)
+    correlation_manager.set_observable_pt(pt_map)
+
     logger.info("Data loading complete:")
     logger.info(f"  Features: {data['y'].shape[0]}")
     logger.info(f"  Systematic uncertainties: {data['y_err_syst'].shape[1]} sources")
@@ -964,6 +1034,7 @@ def initialize_observables_dict_from_tables(
     analysis_config: dict[str, Any],
     parameterization: str,
     correlation_groups: dict[str, str] | None = None,
+    sys_source_buckets: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """
     Initialize observables dictionary from .dat files with systematic uncertainty support.
@@ -1170,31 +1241,64 @@ def initialize_observables_dict_from_tables(
             data_entry["external_stat_cov_matrix"] = external_stat_cov_matrix
 
             if sys_data_list:
-                # Handle 'sum' configurations - check if this observable wants summed systematics
-                for sys_config in sys_data_list:
-                    if sys_config.startswith("sum"):
-                        # This observable wants summed systematics
-                        logger.info(f"Observable '{observable_label}' requests summed systematics")
-
-                        if systematic_data:
-                            # Sum all available systematics in quadrature
-                            summed_sys = _sum_systematics_quadrature(systematic_data)
-
-                            # Replace individual systematics with single summed one
-                            logger.info(
-                                f"  Replaced {len(systematic_data)} individual systematics with 1 summed systematic"
+                if any(s.startswith("persource") for s in sys_data_list):
+                    # Per-source: keep EACH systematic source as its own column (NO quadrature
+                    # collapse) and register one auto-tagged individual per source, so the
+                    # covariance builder forms a σ_s⊗σ_s Gaussian-correlated block per source
+                    # and sums them (block-diagonal per observable). See systematic_correlation
+                    # 'persource:ptgauss:<L>'.
+                    if systematic_data:
+                        # Optionally collapse the discovered sources into fewer named buckets
+                        # (quadrature sum per bucket) BEFORE registering -> one ptgauss block per
+                        # bucket instead of per raw source. Reproduces the paper's coarser 2-block
+                        # structure (e.g. measurement vs normalization) from the full curated data.
+                        sysd = (
+                            _bucket_systematics(systematic_data, sys_source_buckets)
+                            if sys_source_buckets
+                            else dict(systematic_data)
+                        )
+                        correlation_manager.register_persource_sources(
+                            observable_label, list(sysd.keys())
+                        )
+                        data_entry["systematics"] = sysd
+                        logger.info(
+                            f"Observable '{observable_label}' per-source systematics: kept "
+                            f"{len(sysd)} sources {list(sysd.keys())}"
+                            + (
+                                f" (bucketed from {len(systematic_data)} raw sources)"
+                                if sys_source_buckets
+                                else ""
                             )
-                            systematic_data = {"sum": summed_sys}
-                        else:
-                            logger.warning(f"  No systematic columns found to sum for '{observable_label}'")
-                            # Create empty sum systematic to maintain structure
-                            systematic_data = {}
+                        )
+                    else:
+                        logger.warning(f"  No systematic columns found for per-source '{observable_label}'")
+                        data_entry["systematics"] = {}
+                else:
+                    # Handle 'sum' configurations - check if this observable wants summed systematics
+                    for sys_config in sys_data_list:
+                        if sys_config.startswith("sum"):
+                            # This observable wants summed systematics
+                            logger.info(f"Observable '{observable_label}' requests summed systematics")
 
-                        # Only one 'sum' directive should exist per observable
-                        break
+                            if systematic_data:
+                                # Sum all available systematics in quadrature
+                                summed_sys = _sum_systematics_quadrature(systematic_data)
 
-                filtered_systematics = _filter_systematics_by_config(systematic_data, sys_data_list)
-                data_entry["systematics"] = filtered_systematics
+                                # Replace individual systematics with single summed one
+                                logger.info(
+                                    f"  Replaced {len(systematic_data)} individual systematics with 1 summed systematic"
+                                )
+                                systematic_data = {"sum": summed_sys}
+                            else:
+                                logger.warning(f"  No systematic columns found to sum for '{observable_label}'")
+                                # Create empty sum systematic to maintain structure
+                                systematic_data = {}
+
+                            # Only one 'sum' directive should exist per observable
+                            break
+
+                    filtered_systematics = _filter_systematics_by_config(systematic_data, sys_data_list)
+                    data_entry["systematics"] = filtered_systematics
             else:
                 data_entry["systematics"] = {}
 
@@ -1204,6 +1308,13 @@ def initialize_observables_dict_from_tables(
             if 0 in data_entry["y"]:
                 msg = f"{filename} has value=0"
                 raise ValueError(msg)
+
+    # 'persource:...' observables register one auto-tagged individual systematic per source during
+    # the data loop above (register_persource_sources), mutating the manager AFTER the earlier
+    # to_dict() at config-parse time. Re-serialize now so those per-source systematics are persisted
+    # into observables['correlation_manager'] for the covariance builder, which reloads via from_dict.
+    if correlation_manager.get_all_systematic_names():
+        observables["correlation_manager"] = correlation_manager.to_dict()
 
     # ----------------------
     # Read design points
@@ -1229,7 +1340,13 @@ def initialize_observables_dict_from_tables(
 
             # Separate training and validation sets into separate dicts
             design_points = _read_design_points_from_design_dat(table_dir, parameterization)
-            training_indices, training_design_points, validation_indices, validation_design_points = (
+            # NOTE: as in the prediction loop below, do NOT assign the returned validation
+            # indices back onto `validation_indices`. The function takes design IDS but returns
+            # POSITIONAL indices, and this block runs BEFORE the prediction loop -- overwriting
+            # here fed positions in as ids there, so Design and Prediction split at different
+            # points (symptom: Design 170/29 but Prediction 171/28, then the GP fit fails with
+            # "inconsistent numbers of samples: [170, 171]").
+            training_indices, training_design_points, validation_positions_design, validation_design_points = (
                 _split_training_validation_indices(
                     design_points=design_points,
                     validation_indices=validation_indices,
@@ -1239,7 +1356,7 @@ def initialize_observables_dict_from_tables(
 
             observables["Design"] = design_point_parameters[training_indices]
             observables["Design_indices"] = training_design_points
-            observables["Design_validation"] = design_point_parameters[validation_indices]
+            observables["Design_validation"] = design_point_parameters[validation_positions_design]
             observables["Design_indices_validation"] = validation_design_points
 
     # ----------------------
@@ -1316,7 +1433,14 @@ def initialize_observables_dict_from_tables(
                         # by guarding on `hasattr(val, 'shape')` and dives into the
                         # nested 'systematics' dict, which is the actually-correct fix.
                         obs_data = observables["Data"][observable_label]
-                        mask = (x_min <= obs_data["xmin"]) & (obs_data["xmax"] <= x_max)
+                        # `cuts_on: center` (opt-in) applies the window to the bin CENTRE, which is
+                        # STAT's convention (SetupAnalysis.py MinPT: drop bins with centre < MinPT, strict);
+                        # the default keeps the edge-based rule (xmin >= x_min and xmax <= x_max).
+                        if analysis_config.get("cuts_on", "edges") == "center":
+                            _xc = 0.5 * (obs_data["xmin"] + obs_data["xmax"])
+                            mask = (x_min <= _xc) & (_xc <= x_max)
+                        else:
+                            mask = (x_min <= obs_data["xmin"]) & (obs_data["xmax"] <= x_max)
                         prediction_values = prediction_values[mask, :]
                         prediction_errors = prediction_errors[mask, :]
                         n_data = obs_data["y"].shape[0]
@@ -1341,7 +1465,12 @@ def initialize_observables_dict_from_tables(
                     prediction_dir=prediction_dir,
                     filename_prediction_values=filename_prediction_values,
                 )
-                training_indices, _, validation_indices, _ = _split_training_validation_indices(
+                # NOTE: keep the CONFIG validation ids in `validation_indices` -- this returns
+                # POSITIONAL indices, so assigning them back would feed positions in as design
+                # ids on the next observable and silently corrupt every subsequent split
+                # (symptom: one observable gets the holdout, the rest keep all design points,
+                # then the prediction matrices fail to concatenate).
+                training_indices, _, validation_positions, _ = _split_training_validation_indices(
                     design_points=design_points,
                     validation_indices=validation_indices,
                     design_points_to_exclude=design_points_to_exclude,
@@ -1356,9 +1485,12 @@ def initialize_observables_dict_from_tables(
                     for obs_key, cut_range in cuts.items():
                         if obs_key in observable_label:
                             x_min, x_max = cut_range
-                            mask = (x_min <= observables["Data"][observable_label]["xmin"]) & (
-                                observables["Data"][observable_label]["xmax"] <= x_max
-                            )
+                            _od = observables["Data"][observable_label]
+                            if analysis_config.get("cuts_on", "edges") == "center":
+                                _xc = 0.5 * (_od["xmin"] + _od["xmax"])
+                                mask = (x_min <= _xc) & (_xc <= x_max)
+                            else:
+                                mask = (x_min <= _od["xmin"]) & (_od["xmax"] <= x_max)
                             for sys_name, sys_data in filtered_theory_systematics.items():
                                 filtered_theory_systematics[sys_name] = sys_data[mask, :]
 
@@ -1377,10 +1509,10 @@ def initialize_observables_dict_from_tables(
                 observables["Prediction_validation"][observable_label] = {
                     "xmin": observables["Data"][observable_label]["xmin"],
                     "xmax": observables["Data"][observable_label]["xmax"],
-                    "y": np.take(prediction_values, validation_indices, axis=1),
-                    "y_err_stat": np.take(prediction_errors, validation_indices, axis=1),
+                    "y": np.take(prediction_values, validation_positions, axis=1),
+                    "y_err_stat": np.take(prediction_errors, validation_positions, axis=1),
                     "systematics": {
-                        sys_name: np.take(sys_data, validation_indices, axis=1)
+                        sys_name: np.take(sys_data, validation_positions, axis=1)
                         for sys_name, sys_data in filtered_theory_systematics.items()
                     },
                 }
@@ -1519,6 +1651,43 @@ def design_array_from_h5(
     observables = read_dict_from_h5(output_dir, filename, verbose=False)  # type: ignore[no-untyped-call]
     k = "Design_validation" if validation_set else "Design"
     return observables[k]  # type: ignore[no-any-return]
+
+
+def get_log_scale_indices(analysis_config: dict, parameterization: str) -> tuple:
+    """Read `log_scale_indices` from the parameterization config (community-generic).
+
+    Parameters listed here are emulated AND sampled in NATURAL-LOG space (STAT `LogScale`),
+    e.g. [2, 3, 5] = c1, c2, c3 for the exponential qhat parametrization. Absent/empty ->
+    every parameter is linear (default; other models are unaffected).
+    """
+    try:
+        pcfg = analysis_config["parameterization"][parameterization]
+    except (KeyError, TypeError):
+        return ()
+    return tuple(int(i) for i in (pcfg.get("log_scale_indices", ()) or ()))
+
+
+def apply_log_scale(arr: npt.NDArray[np.float64], log_scale_indices) -> npt.NDArray[np.float64]:
+    """Return a copy of `arr` with np.log applied along the listed parameter columns.
+
+    `arr` is (..., n_params): a 1D bounds vector or a 2D (n_points, n_params) design/sample
+    matrix. Used to move selected parameters into log space before emulation / MCMC. Values
+    must be strictly positive on those columns (guaranteed by the design/prior lower bound).
+    """
+    if not log_scale_indices:
+        return arr
+    out = np.array(arr, dtype=float, copy=True)
+    out[..., list(log_scale_indices)] = np.log(out[..., list(log_scale_indices)])
+    return out
+
+
+def invert_log_scale(arr: npt.NDArray[np.float64], log_scale_indices) -> npt.NDArray[np.float64]:
+    """Inverse of apply_log_scale (np.exp on the listed columns) -- for physical/qhat outputs."""
+    if not log_scale_indices:
+        return arr
+    out = np.array(arr, dtype=float, copy=True)
+    out[..., list(log_scale_indices)] = np.exp(out[..., list(log_scale_indices)])
+    return out
 
 
 ####################################################################################################################

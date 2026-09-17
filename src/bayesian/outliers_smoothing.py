@@ -399,9 +399,11 @@ def perform_interpolation_on_values(
     mask[points_to_interpolate] = False
 
     # Further validation
-    if len(bin_centers[mask]) == 1:
-        # Skip - we can't interpolate one point.
-        msg = f"Can't interpolate due to only one point left to anchor the interpolation. {mask=}"
+    if len(bin_centers[mask]) <= 1:
+        # Skip - we can't interpolate with <=1 anchor point left (0 -> np.interp gets empty
+        # sample points and throws; 1 -> not enough to interpolate). Aggressive smoothing
+        # (low n_RMS) can flag every bin of an observable, leaving no good anchors.
+        msg = f"Can't interpolate due to <=1 point left to anchor the interpolation. {mask=}"
         raise CannotInterpolateDueToOnePointError(msg)
 
     # NOTE: ROOT::Interpolator uses a Cubic Spline, so this might be a reasonable future approach
@@ -477,6 +479,13 @@ def identify_high_uncertainty_points_absolute_threshold(
     elif method == "absolute_statistical_error":
         # Filter where |σ| > threshold
         mask = np.abs(uncertainties) > threshold
+
+    elif method == "absolute_value":
+        # Filter where |value| > threshold (catches divide-by-near-zero R_AA blow-ups,
+        # e.g. R_AA -> O(1e4) when the pp reference is ~0 at a bad design point).
+        with np.errstate(invalid="ignore"):
+            mask = np.abs(values) > threshold
+            mask[~np.isfinite(values)] = True
 
     else:
         msg = f"Unknown filtering method: {method}"

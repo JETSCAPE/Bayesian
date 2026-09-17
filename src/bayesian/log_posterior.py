@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 g_min: npt.NDArray[np.float64] = None
 g_max: npt.NDArray[np.float64] = None
+# Parameter indices given a uniform-in-LOG prior (reweights the flat-in-linear prior by
+# -sum(ln x_i)). Empty tuple = all parameters flat-in-linear (legacy behaviour).
+g_log_prior_indices: tuple = ()
 g_emulation_config: emulation.EmulationConfig = None
 g_emulation_results: dict[str, dict[str, npt.NDArray[np.float64]]] = None
 g_experimental_results: dict = None
@@ -116,6 +119,7 @@ def initialize_pool_variables(
     local_emulation_results,
     local_experimental_results,
     local_emulator_cov_unexplained,
+    local_log_prior_indices=(),
 ) -> None:
     """
     Initialize globals for each multiprocessing-pool worker. The systematic and statistical
@@ -125,9 +129,10 @@ def initialize_pool_variables(
     """
 
     global g_min, g_max, g_emulation_config, g_emulation_results, g_experimental_results
-    global g_emulator_cov_unexplained, g_systematic_covariance, g_C_stat
+    global g_emulator_cov_unexplained, g_systematic_covariance, g_C_stat, g_log_prior_indices
     g_min = local_min
     g_max = local_max
+    g_log_prior_indices = tuple(local_log_prior_indices or ())
     g_emulation_config = local_emulation_config
     g_emulation_results = local_emulation_results
     g_experimental_results = local_experimental_results
@@ -189,6 +194,13 @@ def log_posterior(X, *, set_to_infinite_outside_bounds: bool = True) -> npt.NDAr
     inside = np.all((X > g_min) & (X < g_max), axis=1)  # noqa: SIM300
     # -1e300 is apparently preferred for pocoMC
     log_posterior[~inside] = -np.inf if set_to_infinite_outside_bounds else -1e300
+
+    # Uniform-in-LOG prior on the configured (strictly positive) parameters: reweight the
+    # flat-in-linear prior to log-uniform by adding -sum(ln x_i). Matches the paper's
+    # log-uniform prior on c1/c2/c3. In-bounds samples have x > g_min > 0, so ln is safe.
+    if g_log_prior_indices and np.any(inside):
+        cols = list(g_log_prior_indices)
+        log_posterior[inside] -= np.sum(np.log(X[inside][:, cols]), axis=1)
 
     # Evaluate log-posterior for samples inside parameter bounds
     n_samples = np.count_nonzero(inside)

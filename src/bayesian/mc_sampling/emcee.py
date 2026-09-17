@@ -58,6 +58,18 @@ class SamplerSettings:
     n_logging_steps: int = attrs.field()
     settings: dict[str, Any] = attrs.field()
     random_seed: int | None = attrs.field(default=None)
+    # Ensemble move set. None/"stretch" -> emcee's default StretchMove (unchanged behaviour).
+    # "de" -> differential-evolution mix (DEMove 0.8 + DESnookerMove 0.2), which proposes along
+    # the ensemble's own covariance and mixes far better on strongly correlated posteriors
+    # (here the alpha_s-Q0-tau0 ridge) where StretchMove stalls at low acceptance.
+    moves: str | None = attrs.field(default=None)
+    # DEMove mean stretch factor. None -> emcee default 2.38/sqrt(2*ndim) (~0.69 for 6 params).
+    # Smaller values shorten DE proposals. Matters here because the unconstrained nuisances
+    # (c1,c2,c3) span the whole prior box, so the ensemble spread -- and hence DE's difference
+    # vectors -- is huge along those axes; full-length proposals exit the hard bounds and are
+    # rejected (observed: acceptance ~0.036 with defaults, flat through production, unchanged
+    # by the burn-in reseed since reseeding only contracts the CONSTRAINED directions).
+    de_gamma0: float | None = attrs.field(default=None)
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> SamplerSettings:
@@ -68,6 +80,8 @@ class SamplerSettings:
             n_sampling_steps=config["n_sampling_steps"],
             n_logging_steps=config["n_logging_steps"],
             random_seed=config.get("random_seed"),
+            moves=config.get("moves"),
+            de_gamma0=config.get("de_gamma0"),
             settings=config,
         )
 
@@ -80,6 +94,7 @@ def run_sampling(
     parameter_min: npt.NDArray[np.float64],
     parameter_max: npt.NDArray[np.float64],
     parameter_ndim: int,
+    parameter_log_prior_indices: tuple = (),
 ) -> None:
     """Run emcee-based MCMC.
 
@@ -111,15 +126,33 @@ def run_sampling(
             emulation_results,
             experimental_results,
             {},  # emulator_cov_unexplained: computed dynamically by predict() if needed
+            parameter_log_prior_indices,
         ],
     ) as pool:
         logger.info("Initializing sampler...")
+        # Move set: default (None / "stretch") keeps emcee's StretchMove so existing configs are
+        # untouched. "de" uses the differential-evolution mix recommended by the emcee docs for
+        # correlated targets; it fails loudly on an unknown name rather than silently falling back.
+        move_name = (sampler_settings.moves or "stretch").lower()
+        if move_name == "stretch":
+            moves = None
+        elif move_name == "de":
+            # gamma0=None reproduces emcee's default, so `moves: de` without de_gamma0 is unchanged.
+            moves = [(emcee.moves.DEMove(gamma0=sampler_settings.de_gamma0), 0.8),
+                     (emcee.moves.DESnookerMove(), 0.2)]
+            if sampler_settings.de_gamma0 is not None:
+                logger.info(f"DEMove gamma0 = {sampler_settings.de_gamma0}")
+        else:
+            msg = f"Unknown mcmc 'moves' setting {sampler_settings.moves!r}; use 'stretch' or 'de'."
+            raise ValueError(msg)
+        logger.info(f"Ensemble moves: {move_name}")
         sampler = LoggingEnsembleSampler(
             sampler_settings.n_walkers,
             parameter_ndim,
             log_posterior.log_posterior,
             kwargs={"set_to_infinite_outside_bounds": True},
             pool=pool,
+            moves=moves,
         )
         _apply_random_seed(sampler, sampler_settings.random_seed)
 

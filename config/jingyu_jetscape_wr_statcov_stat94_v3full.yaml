@@ -1,0 +1,421 @@
+# JETSCAPE q-hat (arXiv:2408.08247) -- PAPER REPRODUCTION on the fixed curated tables, STAT's covariance recipe.
+#   tables      : data/20230914_curated_v3 (curation-audit fix, all 92 STAT observables / 729 bins; cuts_on: center = STAT MinPT rule)
+#   design      : STAT's exact 94 kept design ids (default.p designindex), via design_points_to_exclude; ids 200-229 = validation
+#   emulator    : 4 whitened PCs, RBF+White, alpha 0.1, seeded (random_state 20260916) -> lands on STAT's own GP optima
+#   covariance  : STAT's Reader.EstimateCovariance copied exactly: per source, kernel S*exp(-(|p~i-p~j|/L)^1.9), default
+#                 L=0.1 ('ptgauss:0.1'), STAT's per-source overrides (999 -> '-1:1', 0.2 -> 'ptgauss:0.2', 0 -> 'uncor'),
+#                 NO cross-observable correlation (every source is its own per-observable group)
+#   sampler     : emcee DE moves, 100 walkers x 40k steps
+#   result      : reproduces the paper's own chain (STAT/result/STAT20230320ExponentialRBF_N4/mcmc_chain.h5) within its noise
+#   twin config : jingyu_jetscape_wr_crosscorr_stat94_v3full.yaml = identical except the correlation groups
+#-------------------------------------------
+output_dir: "/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/jingyu_jetscape_wr_statcov_stat94_v3full/"
+
+initialize_observables: True
+preprocess_input_data: True
+fit_emulators: False   # emulator.pkl in the results dir was fitted on THIS setup (data/20230914_curated_v3, 94 STAT ids) with random_state 20260916; set True to refit (same seed -> same optima, LML per PC [-8.43, -125.4, -70.57, -124.58] == STAT's)
+run_mcmc: True
+run_closure_tests: False
+
+plot:
+  input_data: True
+  covariance: False
+  emulators: False
+  mcmc: True
+  qhat: False
+  closure_tests: False
+  across_analyses: False
+
+debug_level: 0
+
+observable_table_dir: "/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/data/20230914_curated_v3/tables"   # fixed curated tables, ALL 92 observables (build_full_tables now honours PredictionExclude)
+observable_config_dir: "/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/config"
+observables_filename: "observables_preprocessed.h5"
+
+parameters:
+  preprocessing_parameters: &default_preprocessing_parameters
+    filtering:
+      enable: false       # QA is done by design-point exclusion instead
+      method: "relative_statistical_error"
+      threshold: 0.10
+      problem_fraction_threshold: 0.07
+      min_design_points: 50
+      max_filtered_fraction: 0.6
+    smoothing:
+      enable: false        # QA is done by design-point exclusion instead
+      outlier_n_RMS: 2.      # lower = flag more bins as statistical outliers -> interpolate
+      interpolation_method: "linear"
+      max_n_feature_outliers_to_interpolate: 3
+    outlier_cleaning:
+      method: none         # clean 20230320 tables (max R_AA 1.49) - NO cleaning needed
+      max_abs: 5.0
+
+  emulator_parameters: &default_emulator_parameters
+    force_retrain: True
+    random_state: 20260916   # seeds the GP hyperparameter restarts (opt-in, see sk_learn.py)
+    pca_whiten: True
+    kernels:
+      active: ["rbf", "noise"]
+      matern: {nu: 1.5, length_scale_bounds_factor: [0.01, 100]}
+      rbf: {length_scale_bounds_factor: [0.01, 100]}
+      constant: {constant_value: 1., constant_value_bounds: [0.001, 10]}
+      noise: {type: "white", args: {noise_level: 0.25, noise_level_bounds: [1.e-8, 100]}}
+    GPR: {n_restarts: 50, alpha: 0.1}
+    cross_validation: False
+    cross_validation_k: 5
+    independent_validation: True
+
+  mcmc_parameters: &default_mcmc_parameters
+    n_walkers: 100
+    n_burn_steps: 3000
+    moves: de       # DEMove 0.8 + DESnookerMove 0.2 (see _full_expcorr_de): ~2x ESS along the alpha_s-Q0-tau0 ridge
+    n_sampling_steps: 40000     # DE moves; 92-observable posterior mixes faster (tau~200-250 in the curated_* runs)
+    n_logging_steps: 10
+
+  closure: &default_closure_parameters
+    confidence: 0.9
+
+analysis_base: &model_base
+  model_name: "MATTER+LBT"
+  parameterizations: ["exponential"]
+  sqrts_list: [200, 2760, 5020]
+  centrality_range: [[0, 50]]
+  recoil_scheme: "negative_recominber"
+  parameterization:
+    exponential:
+      names: ['$\alpha_S^{\rm{fix}}$', "$Q_0$", "$c_1$", "$c_2$", '$\tau_0$', "$c_3$"]
+      min: [0.1, 1, 0.006737946999085467, 0.006737946999085467, 0, 0.049787068367863944]
+      max: [0.5, 10, 10, 10, 1.5, 100]
+      log_scale_indices: [2, 3, 5]
+      corner_plot_ranges: [[0.1, 0.5], [1, 10], [0, 2], [0, 2], [0, 1.5], [1, 4]]
+    binomial:
+      names: ['$\alpha_S^{\rm{fix}}$', "$Q_0$", "$c_1$", "$c_2$", "$a$", "$b$", '$\tau_0$']
+      min: [0.1, 1, 0.006737946999085467, 0.006737946999085467, -10, -10, 0]
+      max: [0.5, 10, 10, 10, 100, 100, 1.5]
+  alpha: 0.2
+  validation_indices: [200, 230]   # STAT's declared holdout batch
+  cuts_on: center             # STAT convention: keep a bin iff its CENTRE >= 9 (edge-based dropped 20 bins STAT fitted, 709 vs 729)
+  cuts:                       # pT > 9 GeV (paper's MinPT-9). Jets/chjets already start
+    hadron: [9., 100000.]     # above 9 GeV, so this only trims the 189 low-pT hadron bins.
+    inclusive_jet: [9., 100000.]
+    inclusive_chjet: [9., 100000.]
+
+analyses:
+  # Cross-observable normalization groups (taa/lumi/norm, shared by exp+energy) + all local
+  # measurement groups default to FULL correlation (-1:1). 'uncor' is diagonal (built-in).
+  # Change 'default' to e.g. '3:0.8' for a finite bin-index decay on the LOCAL groups.
+  correlation_groups:
+    # STAT-faithful covariance (Reader.EstimateCovariance): per source, kernel S*exp(-(|p~i-p~j|/L)^1.9) with
+    # p~ rescaled per observable, default L=0.1, NO cross-observable blocks. Each source below is its own
+    # per-observable group; only STAT's per-source overrides are listed (999 -> '-1:1', 0.2 -> 'ptgauss:0.2',
+    # 0 -> 'uncor'). Everything not listed uses the default. Generated 2026-09-15 from Exponential20230320RBF_N4.yaml.
+    default: 'ptgauss:0.1'
+    5020__PbPb__hadron__pt_ch_cms____0-5__sys_taa: '-1:1'
+    5020__PbPb__hadron__pt_ch_cms____0-5__sys_luminosity: '-1:1'
+    5020__PbPb__hadron__pt_ch_cms____5-10__sys_taa: '-1:1'
+    5020__PbPb__hadron__pt_ch_cms____5-10__sys_luminosity: '-1:1'
+    5020__PbPb__hadron__pt_ch_cms____30-50__sys_taa: '-1:1'
+    5020__PbPb__hadron__pt_ch_cms____30-50__sys_luminosity: '-1:1'
+    200__AuAu__hadron__pt_pi0_phenix____0-10__sys_norm: '-1:1'
+    200__AuAu__hadron__pt_pi0_phenix____40-50__sys_norm: '-1:1'
+    200__AuAu__hadron__pt_ch_star____0-5__sys_norm: '-1:1'
+    200__AuAu__hadron__pt_ch_star____10-20__sys_norm: '-1:1'
+    200__AuAu__hadron__pt_ch_star____20-30__sys_norm: '-1:1'
+    200__AuAu__hadron__pt_ch_star____30-40__sys_norm: '-1:1'
+    200__AuAu__hadron__pt_pi0_phenix____10-20__sys_norm: '-1:1'
+    200__AuAu__hadron__pt_pi0_phenix____20-30__sys_norm: '-1:1'
+    200__AuAu__hadron__pt_pi0_phenix____30-40__sys_norm: '-1:1'
+    200__AuAu__inclusive_chjet__pt_star__R0.2__0-10__sys_correlated: '-1:1'
+    200__AuAu__inclusive_chjet__pt_star__R0.2__0-10__sys_reference: '-1:1'
+    200__AuAu__inclusive_chjet__pt_star__R0.2__0-10__sys_shape: 'ptgauss:0.2'
+    200__AuAu__inclusive_chjet__pt_star__R0.2__0-10__sys_taa: '-1:1'
+    200__AuAu__inclusive_chjet__pt_star__R0.4__0-10__sys_correlated: '-1:1'
+    200__AuAu__inclusive_chjet__pt_star__R0.4__0-10__sys_reference: '-1:1'
+    200__AuAu__inclusive_chjet__pt_star__R0.4__0-10__sys_shape: 'ptgauss:0.2'
+    200__AuAu__inclusive_chjet__pt_star__R0.4__0-10__sys_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_alice__R0.2__0-10__sys_correlated: '-1:1'
+    2760__PbPb__inclusive_jet__pt_alice__R0.2__0-10__sys_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_alice__R0.2__0-10__sys_unfolding: 'ptgauss:0.2'
+    2760__PbPb__inclusive_jet__pt_alice__R0.2__10-30__sys_correlated: '-1:1'
+    2760__PbPb__inclusive_jet__pt_alice__R0.2__10-30__sys_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_alice__R0.2__10-30__sys_unfolding: 'ptgauss:0.2'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__0-10__sys_correlated: 'ptgauss:0.2'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__0-10__sys_luminosity: '-1:1'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__0-10__sys_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__10-20__sys_correlated: 'ptgauss:0.2'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__10-20__sys_luminosity: '-1:1'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__10-20__sys_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__20-30__sys_correlated: 'ptgauss:0.2'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__20-30__sys_luminosity: '-1:1'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__20-30__sys_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__30-40__sys_correlated: 'ptgauss:0.2'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__30-40__sys_luminosity: '-1:1'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__30-40__sys_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__40-50__sys_correlated: 'ptgauss:0.2'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__40-50__sys_luminosity: '-1:1'
+    2760__PbPb__inclusive_jet__pt_atlas__R0.4__40-50__sys_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_cms__R0.2__0-5__sys_lumi_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_cms__R0.2__10-30__sys_lumi_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_cms__R0.2__30-50__sys_lumi_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_cms__R0.2__5-10__sys_lumi_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_cms__R0.3__0-5__sys_lumi_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_cms__R0.3__10-30__sys_lumi_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_cms__R0.3__30-50__sys_lumi_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_cms__R0.3__5-10__sys_lumi_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_cms__R0.4__0-5__sys_lumi_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_cms__R0.4__10-30__sys_lumi_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_cms__R0.4__30-50__sys_lumi_taa: '-1:1'
+    2760__PbPb__inclusive_jet__pt_cms__R0.4__5-10__sys_lumi_taa: '-1:1'
+    5020__PbPb__hadron__pt_ch_cms____10-30__sys_luminosity: '-1:1'
+    5020__PbPb__hadron__pt_ch_cms____10-30__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10__sys_correlated: '-1:1'
+    5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10__sys_lumi_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10__sys_unfolding: 'ptgauss:0.2'
+    5020__PbPb__inclusive_jet__pt_alice__R0.4__0-10__sys_correlated: '-1:1'
+    5020__PbPb__inclusive_jet__pt_alice__R0.4__0-10__sys_lumi_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_alice__R0.4__0-10__sys_unfolding: 'ptgauss:0.2'
+    5020__PbPb__inclusive_jet__pt_atlas__R0.4__0-10__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_atlas__R0.4__0-10__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_atlas__R0.4__10-20__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_atlas__R0.4__10-20__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_atlas__R0.4__20-30__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_atlas__R0.4__20-30__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_atlas__R0.4__30-40__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_atlas__R0.4__30-40__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_atlas__R0.4__40-50__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_atlas__R0.4__40-50__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.2__0-10__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.2__0-10__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.2__10-30__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.2__10-30__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.2__30-50__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.2__30-50__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.3__0-10__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.3__0-10__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.3__10-30__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.3__10-30__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.3__30-50__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.3__30-50__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.4__0-10__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.4__0-10__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.4__10-30__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.4__10-30__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.4__30-50__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.4__30-50__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.6__0-10__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.6__0-10__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.6__10-30__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.6__10-30__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.6__30-50__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.6__30-50__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.8__0-10__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.8__0-10__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.8__10-30__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.8__10-30__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.8__30-50__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R0.8__30-50__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R1.0__0-10__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R1.0__0-10__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R1.0__10-30__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R1.0__10-30__sys_taa: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R1.0__30-50__sys_luminosity: '-1:1'
+    5020__PbPb__inclusive_jet__pt_cms__R1.0__30-50__sys_taa: '-1:1'
+  analysis_jetscape_wr_20230320:
+    global_observable_exclude_list: []
+    design_points_to_exclude: [0, 4, 5, 7, 9, 10, 11, 12, 14, 16, 17, 18, 19, 21, 23, 24, 26, 27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 39, 40, 42, 43, 45, 46, 48, 49, 50, 51, 53, 54, 55, 57, 61, 65, 67, 69, 70, 71, 72, 73, 74, 75, 79, 81, 82, 87, 89, 90, 91, 92, 95, 97, 100, 102, 104, 111, 115, 116, 118, 121, 125, 128, 131, 133, 136, 137, 139, 140, 142, 143, 145, 146, 147, 151, 154, 159, 160, 166, 167, 168, 172, 173, 177, 179, 180, 183, 185, 187, 188, 189, 192, 193, 194, 198, 201, 204, 210, 211, 213, 214, 216, 219]   # keep EXACTLY STAT's 94 kept design ids (default.p designindex); ids>=200 = validation batch   # max R_AA>1.5 on pT>9 bins (98 dropped -> 107 training)
+    parameters:
+      preprocessing: {<<: *default_preprocessing_parameters}
+      emulators:
+        default_group:
+          <<: *default_emulator_parameters
+          emulator_package: sk_learn
+          n_pc: 4
+          observable_list:
+            - observable: '200__AuAu__hadron__pt_ch_star____0-5'
+              sys_data: ['sys,norm:200__AuAu__hadron__pt_ch_star____0-5__sys_norm']
+            - observable: '200__AuAu__hadron__pt_ch_star____10-20'
+              sys_data: ['sys,norm:200__AuAu__hadron__pt_ch_star____10-20__sys_norm']
+            - observable: '200__AuAu__hadron__pt_ch_star____20-30'
+              sys_data: ['sys,norm:200__AuAu__hadron__pt_ch_star____20-30__sys_norm']
+            - observable: '200__AuAu__hadron__pt_ch_star____30-40'
+              sys_data: ['sys,norm:200__AuAu__hadron__pt_ch_star____30-40__sys_norm']
+            - observable: '200__AuAu__hadron__pt_pi0_phenix____10-20'
+              sys_data: ['sys,uncorrelated:uncor', 'sys,correlated:200__AuAu__hadron__pt_pi0_phenix____10-20__sys_correlated', 'sys,norm:200__AuAu__hadron__pt_pi0_phenix____10-20__sys_norm']
+            - observable: '200__AuAu__hadron__pt_pi0_phenix____20-30'
+              sys_data: ['sys,uncorrelated:uncor', 'sys,correlated:200__AuAu__hadron__pt_pi0_phenix____20-30__sys_correlated', 'sys,norm:200__AuAu__hadron__pt_pi0_phenix____20-30__sys_norm']
+            - observable: '200__AuAu__hadron__pt_pi0_phenix____30-40'
+              sys_data: ['sys,uncorrelated:uncor', 'sys,correlated:200__AuAu__hadron__pt_pi0_phenix____30-40__sys_correlated', 'sys,norm:200__AuAu__hadron__pt_pi0_phenix____30-40__sys_norm']
+            - observable: '200__AuAu__inclusive_chjet__pt_star__R0.2__0-10'
+              sys_data: ['sys,correlated:200__AuAu__inclusive_chjet__pt_star__R0.2__0-10__sys_correlated', 'sys,shape:200__AuAu__inclusive_chjet__pt_star__R0.2__0-10__sys_shape', 'sys,taa:200__AuAu__inclusive_chjet__pt_star__R0.2__0-10__sys_taa', 'sys,reference:200__AuAu__inclusive_chjet__pt_star__R0.2__0-10__sys_reference']
+            - observable: '200__AuAu__inclusive_chjet__pt_star__R0.4__0-10'
+              sys_data: ['sys,correlated:200__AuAu__inclusive_chjet__pt_star__R0.4__0-10__sys_correlated', 'sys,shape:200__AuAu__inclusive_chjet__pt_star__R0.4__0-10__sys_shape', 'sys,taa:200__AuAu__inclusive_chjet__pt_star__R0.4__0-10__sys_taa', 'sys,reference:200__AuAu__inclusive_chjet__pt_star__R0.4__0-10__sys_reference']
+            - observable: '2760__PbPb__hadron__pt_ch_alice____0-5'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_alice____0-5__sys', 'sys,norm:2760__PbPb__hadron__pt_ch_alice____0-5__sys_norm']
+            - observable: '2760__PbPb__hadron__pt_ch_alice____10-20'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_alice____10-20__sys', 'sys,norm:2760__PbPb__hadron__pt_ch_alice____10-20__sys_norm']
+            - observable: '2760__PbPb__hadron__pt_ch_alice____20-30'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_alice____20-30__sys', 'sys,norm:2760__PbPb__hadron__pt_ch_alice____20-30__sys_norm']
+            - observable: '2760__PbPb__hadron__pt_ch_alice____30-40'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_alice____30-40__sys', 'sys,norm:2760__PbPb__hadron__pt_ch_alice____30-40__sys_norm']
+            - observable: '2760__PbPb__hadron__pt_ch_alice____40-50'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_alice____40-50__sys', 'sys,norm:2760__PbPb__hadron__pt_ch_alice____40-50__sys_norm']
+            - observable: '2760__PbPb__hadron__pt_ch_alice____5-10'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_alice____5-10__sys', 'sys,norm:2760__PbPb__hadron__pt_ch_alice____5-10__sys_norm']
+            - observable: '2760__PbPb__hadron__pt_ch_atlas____10-20'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_atlas____10-20__sys']
+            - observable: '2760__PbPb__hadron__pt_ch_atlas____20-30'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_atlas____20-30__sys']
+            - observable: '2760__PbPb__hadron__pt_ch_atlas____30-40'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_atlas____30-40__sys']
+            - observable: '2760__PbPb__hadron__pt_ch_atlas____40-50'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_atlas____40-50__sys']
+            - observable: '2760__PbPb__hadron__pt_ch_atlas____5-10'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_atlas____5-10__sys']
+            - observable: '2760__PbPb__hadron__pt_ch_cms____0-5'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_cms____0-5__sys']
+            - observable: '2760__PbPb__hadron__pt_ch_cms____10-30'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_cms____10-30__sys']
+            - observable: '2760__PbPb__hadron__pt_ch_cms____5-10'
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_cms____5-10__sys']
+            - observable: '2760__PbPb__hadron__pt_pi0_alice____0-10'
+              sys_data: ['sys:2760__PbPb__hadron__pt_pi0_alice____0-10__sys']
+            - observable: '2760__PbPb__hadron__pt_pi0_alice____20-50'
+              sys_data: ['sys:2760__PbPb__hadron__pt_pi0_alice____20-50__sys']
+            - observable: '2760__PbPb__hadron__pt_pi_alice____0-5'
+              sys_data: ['sys:2760__PbPb__hadron__pt_pi_alice____0-5__sys']
+            - observable: '2760__PbPb__hadron__pt_pi_alice____10-20'
+              sys_data: ['sys:2760__PbPb__hadron__pt_pi_alice____10-20__sys']
+            - observable: '2760__PbPb__hadron__pt_pi_alice____20-40'
+              sys_data: ['sys:2760__PbPb__hadron__pt_pi_alice____20-40__sys']
+            - observable: '2760__PbPb__hadron__pt_pi_alice____5-10'
+              sys_data: ['sys:2760__PbPb__hadron__pt_pi_alice____5-10__sys']
+            - observable: '2760__PbPb__inclusive_jet__pt_alice__R0.2__0-10'
+              sys_data: ['sys,correlated:2760__PbPb__inclusive_jet__pt_alice__R0.2__0-10__sys_correlated', 'sys,unfolding:2760__PbPb__inclusive_jet__pt_alice__R0.2__0-10__sys_unfolding', 'sys,taa:2760__PbPb__inclusive_jet__pt_alice__R0.2__0-10__sys_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_alice__R0.2__10-30'
+              sys_data: ['sys,correlated:2760__PbPb__inclusive_jet__pt_alice__R0.2__10-30__sys_correlated', 'sys,unfolding:2760__PbPb__inclusive_jet__pt_alice__R0.2__10-30__sys_unfolding', 'sys,taa:2760__PbPb__inclusive_jet__pt_alice__R0.2__10-30__sys_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_atlas__R0.4__0-10'
+              sys_data: ['sys,correlated:2760__PbPb__inclusive_jet__pt_atlas__R0.4__0-10__sys_correlated', 'sys,uncorrelated:uncor', 'sys,taa:2760__PbPb__inclusive_jet__pt_atlas__R0.4__0-10__sys_taa', 'sys,luminosity:2760__PbPb__inclusive_jet__pt_atlas__R0.4__0-10__sys_luminosity']
+            - observable: '2760__PbPb__inclusive_jet__pt_atlas__R0.4__10-20'
+              sys_data: ['sys,correlated:2760__PbPb__inclusive_jet__pt_atlas__R0.4__10-20__sys_correlated', 'sys,uncorrelated:uncor', 'sys,taa:2760__PbPb__inclusive_jet__pt_atlas__R0.4__10-20__sys_taa', 'sys,luminosity:2760__PbPb__inclusive_jet__pt_atlas__R0.4__10-20__sys_luminosity']
+            - observable: '2760__PbPb__inclusive_jet__pt_atlas__R0.4__20-30'
+              sys_data: ['sys,correlated:2760__PbPb__inclusive_jet__pt_atlas__R0.4__20-30__sys_correlated', 'sys,uncorrelated:uncor', 'sys,taa:2760__PbPb__inclusive_jet__pt_atlas__R0.4__20-30__sys_taa', 'sys,luminosity:2760__PbPb__inclusive_jet__pt_atlas__R0.4__20-30__sys_luminosity']
+            - observable: '2760__PbPb__inclusive_jet__pt_atlas__R0.4__30-40'
+              sys_data: ['sys,correlated:2760__PbPb__inclusive_jet__pt_atlas__R0.4__30-40__sys_correlated', 'sys,uncorrelated:uncor', 'sys,taa:2760__PbPb__inclusive_jet__pt_atlas__R0.4__30-40__sys_taa', 'sys,luminosity:2760__PbPb__inclusive_jet__pt_atlas__R0.4__30-40__sys_luminosity']
+            - observable: '2760__PbPb__inclusive_jet__pt_atlas__R0.4__40-50'
+              sys_data: ['sys,correlated:2760__PbPb__inclusive_jet__pt_atlas__R0.4__40-50__sys_correlated', 'sys,uncorrelated:uncor', 'sys,taa:2760__PbPb__inclusive_jet__pt_atlas__R0.4__40-50__sys_taa', 'sys,luminosity:2760__PbPb__inclusive_jet__pt_atlas__R0.4__40-50__sys_luminosity']
+            - observable: '2760__PbPb__inclusive_jet__pt_cms__R0.2__0-5'
+              sys_data: ['sys:2760__PbPb__inclusive_jet__pt_cms__R0.2__0-5__sys', 'sys,lumi_taa:2760__PbPb__inclusive_jet__pt_cms__R0.2__0-5__sys_lumi_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_cms__R0.2__10-30'
+              sys_data: ['sys:2760__PbPb__inclusive_jet__pt_cms__R0.2__10-30__sys', 'sys,lumi_taa:2760__PbPb__inclusive_jet__pt_cms__R0.2__10-30__sys_lumi_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_cms__R0.2__30-50'
+              sys_data: ['sys:2760__PbPb__inclusive_jet__pt_cms__R0.2__30-50__sys', 'sys,lumi_taa:2760__PbPb__inclusive_jet__pt_cms__R0.2__30-50__sys_lumi_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_cms__R0.2__5-10'
+              sys_data: ['sys:2760__PbPb__inclusive_jet__pt_cms__R0.2__5-10__sys', 'sys,lumi_taa:2760__PbPb__inclusive_jet__pt_cms__R0.2__5-10__sys_lumi_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_cms__R0.3__0-5'
+              sys_data: ['sys:2760__PbPb__inclusive_jet__pt_cms__R0.3__0-5__sys', 'sys,lumi_taa:2760__PbPb__inclusive_jet__pt_cms__R0.3__0-5__sys_lumi_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_cms__R0.3__10-30'
+              sys_data: ['sys:2760__PbPb__inclusive_jet__pt_cms__R0.3__10-30__sys', 'sys,lumi_taa:2760__PbPb__inclusive_jet__pt_cms__R0.3__10-30__sys_lumi_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_cms__R0.3__30-50'
+              sys_data: ['sys:2760__PbPb__inclusive_jet__pt_cms__R0.3__30-50__sys', 'sys,lumi_taa:2760__PbPb__inclusive_jet__pt_cms__R0.3__30-50__sys_lumi_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_cms__R0.3__5-10'
+              sys_data: ['sys:2760__PbPb__inclusive_jet__pt_cms__R0.3__5-10__sys', 'sys,lumi_taa:2760__PbPb__inclusive_jet__pt_cms__R0.3__5-10__sys_lumi_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_cms__R0.4__0-5'
+              sys_data: ['sys:2760__PbPb__inclusive_jet__pt_cms__R0.4__0-5__sys', 'sys,lumi_taa:2760__PbPb__inclusive_jet__pt_cms__R0.4__0-5__sys_lumi_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_cms__R0.4__10-30'
+              sys_data: ['sys:2760__PbPb__inclusive_jet__pt_cms__R0.4__10-30__sys', 'sys,lumi_taa:2760__PbPb__inclusive_jet__pt_cms__R0.4__10-30__sys_lumi_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_cms__R0.4__30-50'
+              sys_data: ['sys:2760__PbPb__inclusive_jet__pt_cms__R0.4__30-50__sys', 'sys,lumi_taa:2760__PbPb__inclusive_jet__pt_cms__R0.4__30-50__sys_lumi_taa']
+            - observable: '2760__PbPb__inclusive_jet__pt_cms__R0.4__5-10'
+              sys_data: ['sys:2760__PbPb__inclusive_jet__pt_cms__R0.4__5-10__sys', 'sys,lumi_taa:2760__PbPb__inclusive_jet__pt_cms__R0.4__5-10__sys_lumi_taa']
+            - observable: '5020__PbPb__hadron__pt_ch_alice____0-5'
+              sys_data: ['sys:5020__PbPb__hadron__pt_ch_alice____0-5__sys', 'sys,norm:5020__PbPb__hadron__pt_ch_alice____0-5__sys_norm']
+            - observable: '5020__PbPb__hadron__pt_ch_alice____10-20'
+              sys_data: ['sys:5020__PbPb__hadron__pt_ch_alice____10-20__sys', 'sys,norm:5020__PbPb__hadron__pt_ch_alice____10-20__sys_norm']
+            - observable: '5020__PbPb__hadron__pt_ch_alice____20-30'
+              sys_data: ['sys:5020__PbPb__hadron__pt_ch_alice____20-30__sys', 'sys,norm:5020__PbPb__hadron__pt_ch_alice____20-30__sys_norm']
+            - observable: '5020__PbPb__hadron__pt_ch_alice____30-40'
+              sys_data: ['sys:5020__PbPb__hadron__pt_ch_alice____30-40__sys', 'sys,norm:5020__PbPb__hadron__pt_ch_alice____30-40__sys_norm']
+            - observable: '5020__PbPb__hadron__pt_ch_alice____40-50'
+              sys_data: ['sys:5020__PbPb__hadron__pt_ch_alice____40-50__sys', 'sys,norm:5020__PbPb__hadron__pt_ch_alice____40-50__sys_norm']
+            - observable: '5020__PbPb__hadron__pt_ch_alice____5-10'
+              sys_data: ['sys:5020__PbPb__hadron__pt_ch_alice____5-10__sys', 'sys,norm:5020__PbPb__hadron__pt_ch_alice____5-10__sys_norm']
+            - observable: '5020__PbPb__hadron__pt_ch_cms____10-30'
+              sys_data: ['sys:5020__PbPb__hadron__pt_ch_cms____10-30__sys', 'sys,taa:5020__PbPb__hadron__pt_ch_cms____10-30__sys_taa', 'sys,luminosity:5020__PbPb__hadron__pt_ch_cms____10-30__sys_luminosity']
+            - observable: '5020__PbPb__hadron__pt_pi_alice____0-5'
+              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____0-5__sys']
+            - observable: '5020__PbPb__hadron__pt_pi_alice____10-20'
+              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____10-20__sys']
+            - observable: '5020__PbPb__hadron__pt_pi_alice____20-30'
+              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____20-30__sys']
+            - observable: '5020__PbPb__hadron__pt_pi_alice____30-40'
+              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____30-40__sys']
+            - observable: '5020__PbPb__hadron__pt_pi_alice____40-50'
+              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____40-50__sys']
+            - observable: '5020__PbPb__hadron__pt_pi_alice____5-10'
+              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____5-10__sys']
+            - observable: '5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10'
+              sys_data: ['sys,correlated:5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10__sys_correlated', 'sys,unfolding:5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10__sys_unfolding', 'sys,lumi_taa:5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10__sys_lumi_taa']
+            - observable: '5020__PbPb__inclusive_jet__pt_alice__R0.4__0-10'
+              sys_data: ['sys,correlated:5020__PbPb__inclusive_jet__pt_alice__R0.4__0-10__sys_correlated', 'sys,unfolding:5020__PbPb__inclusive_jet__pt_alice__R0.4__0-10__sys_unfolding', 'sys,lumi_taa:5020__PbPb__inclusive_jet__pt_alice__R0.4__0-10__sys_lumi_taa']
+            - observable: '5020__PbPb__inclusive_jet__pt_atlas__R0.4__0-10'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_atlas__R0.4__0-10__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_atlas__R0.4__0-10__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_atlas__R0.4__0-10__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_atlas__R0.4__10-20'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_atlas__R0.4__10-20__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_atlas__R0.4__10-20__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_atlas__R0.4__10-20__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_atlas__R0.4__20-30'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_atlas__R0.4__20-30__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_atlas__R0.4__20-30__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_atlas__R0.4__20-30__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_atlas__R0.4__30-40'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_atlas__R0.4__30-40__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_atlas__R0.4__30-40__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_atlas__R0.4__30-40__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_atlas__R0.4__40-50'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_atlas__R0.4__40-50__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_atlas__R0.4__40-50__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_atlas__R0.4__40-50__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.2__0-10'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.2__0-10__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.2__0-10__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.2__0-10__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.2__10-30'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.2__10-30__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.2__10-30__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.2__10-30__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.2__30-50'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.2__30-50__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.2__30-50__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.2__30-50__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.3__0-10'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.3__0-10__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.3__0-10__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.3__0-10__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.3__10-30'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.3__10-30__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.3__10-30__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.3__10-30__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.3__30-50'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.3__30-50__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.3__30-50__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.3__30-50__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.4__0-10'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.4__0-10__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.4__0-10__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.4__0-10__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.4__10-30'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.4__10-30__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.4__10-30__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.4__10-30__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.4__30-50'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.4__30-50__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.4__30-50__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.4__30-50__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.6__0-10'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.6__0-10__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.6__0-10__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.6__0-10__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.6__10-30'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.6__10-30__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.6__10-30__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.6__10-30__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.6__30-50'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.6__30-50__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.6__30-50__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.6__30-50__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.8__0-10'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.8__0-10__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.8__0-10__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.8__0-10__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.8__10-30'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.8__10-30__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.8__10-30__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.8__10-30__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R0.8__30-50'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R0.8__30-50__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R0.8__30-50__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R0.8__30-50__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R1.0__0-10'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R1.0__0-10__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R1.0__0-10__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R1.0__0-10__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R1.0__10-30'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R1.0__10-30__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R1.0__10-30__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R1.0__10-30__sys_luminosity']
+            - observable: '5020__PbPb__inclusive_jet__pt_cms__R1.0__30-50'
+              sys_data: ['sys:5020__PbPb__inclusive_jet__pt_cms__R1.0__30-50__sys', 'sys,taa:5020__PbPb__inclusive_jet__pt_cms__R1.0__30-50__sys_taa', 'sys,luminosity:5020__PbPb__inclusive_jet__pt_cms__R1.0__30-50__sys_luminosity']
+            - observable: '2760__PbPb__hadron__pt_ch_atlas____0-5'   # restored 2026-09-16 (PredictionExclude now applied in build_full_tables)
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_atlas____0-5__sys']
+            - observable: '5020__PbPb__hadron__pt_ch_cms____0-5'   # restored 2026-09-16 (PredictionExclude now applied in build_full_tables)
+              sys_data: ['sys:5020__PbPb__hadron__pt_ch_cms____0-5__sys', 'sys,taa:5020__PbPb__hadron__pt_ch_cms____0-5__sys_taa', 'sys,luminosity:5020__PbPb__hadron__pt_ch_cms____0-5__sys_luminosity']
+            - observable: '5020__PbPb__hadron__pt_ch_cms____5-10'   # restored 2026-09-16 (PredictionExclude now applied in build_full_tables)
+              sys_data: ['sys:5020__PbPb__hadron__pt_ch_cms____5-10__sys', 'sys,taa:5020__PbPb__hadron__pt_ch_cms____5-10__sys_taa', 'sys,luminosity:5020__PbPb__hadron__pt_ch_cms____5-10__sys_luminosity']
+            - observable: '5020__PbPb__hadron__pt_ch_cms____30-50'   # restored 2026-09-16 (PredictionExclude now applied in build_full_tables)
+              sys_data: ['sys:5020__PbPb__hadron__pt_ch_cms____30-50__sys', 'sys,taa:5020__PbPb__hadron__pt_ch_cms____30-50__sys_taa', 'sys,luminosity:5020__PbPb__hadron__pt_ch_cms____30-50__sys_luminosity']
+            - observable: '200__AuAu__hadron__pt_pi0_phenix____0-10'   # restored 2026-09-16 (PredictionExclude now applied in build_full_tables)
+              sys_data: ['sys,uncorrelated:uncor', 'sys,correlated:200__AuAu__hadron__pt_pi0_phenix____0-10__sys_correlated', 'sys,norm:200__AuAu__hadron__pt_pi0_phenix____0-10__sys_norm']
+            - observable: '200__AuAu__hadron__pt_pi0_phenix____40-50'   # restored 2026-09-16 (PredictionExclude now applied in build_full_tables)
+              sys_data: ['sys,uncorrelated:uncor', 'sys,correlated:200__AuAu__hadron__pt_pi0_phenix____40-50__sys_correlated', 'sys,norm:200__AuAu__hadron__pt_pi0_phenix____40-50__sys_norm']
+      mcmc: {<<: *default_mcmc_parameters}
+      closure: {<<: *default_closure_parameters}
+    <<: *model_base
+    plot_panel_shapes: [[5, 5], [5, 5], [5, 5], [5, 5]]

@@ -74,6 +74,11 @@ class SteerAnalysis(common_base.CommonBase):
         # Configuration of different analyses
         all_analyses_config = config["analyses"]
         self.correlation_groups = all_analyses_config.pop("correlation_groups", {})
+        # Optional: collapse per-source curated systematics into named buckets (quadrature sum
+        # per bucket) before per-source ptgauss treatment. e.g.
+        #   sys_source_buckets: {measurement: ['*'], normalization: ['taa','luminosity']}
+        # yields two ptgauss blocks per observable instead of one-per-raw-source.
+        self.sys_source_buckets = all_analyses_config.pop("sys_source_buckets", {})
         self.analyses = all_analyses_config  # Now only contains actual analyses
 
         if self.correlation_groups:
@@ -133,6 +138,7 @@ class SteerAnalysis(common_base.CommonBase):
                             analysis_config,
                             parameterization,
                             correlation_groups=self.correlation_groups,
+                            sys_source_buckets=self.sys_source_buckets,
                         )
                         data_IO.write_dict_to_h5(
                             observables,

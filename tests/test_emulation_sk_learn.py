@@ -7,6 +7,8 @@ from bayesian.emulation import sk_learn
 
 class _DummySettings:
     n_pc = 1
+    # No optional kernels: `_signal_amplitude_settings` (PR #10) reads `active_kernels` inside predict().
+    active_kernels: dict = {}
 
 
 class _ZeroVarianceEmulator:

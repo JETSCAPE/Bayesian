@@ -168,16 +168,32 @@ def fit_emulator(
     max_n_components = emulator_settings.max_n_components_to_calculate
     if max_n_components is not None:
         logger.info(f"Running with max n_pc={max_n_components}")
-    # NOTE-STAT: Whiten=True, but here, Whiten=False.
-    # NOTE-STAT: RJE thinks this doesn't matter, based on the comments above.
+    # PCA whitening (config `pca_whiten`, default False -> backward compatible).
+    # NOTE-STAT: STAT sets whiten=True (emulator.py:103). Whitening rescales each PC score to unit
+    #   variance. This matters when the GP kernel has unit signal amplitude (a bare RBF/Matern with
+    #   no ConstantKernel prefactor): such a GP "expects" ~unit-variance targets, so without whitening
+    #   the large-variance leading PCs are poorly modeled. It is config-driven so other models /
+    #   parameterizations can opt in or out. Reconstruction below is made whiten-aware via `pca_transfer`.
+    pca_whiten = bool(emulator_settings.settings.get("pca_whiten", False))
     pca = sklearn_decomposition.PCA(
-        n_components=max_n_components, svd_solver="full", whiten=False
+        n_components=max_n_components, svd_solver="full", whiten=pca_whiten
     )  # Include all PCs here, so we can access them later
     # Scale data and perform PCA
     Y_pca = pca.fit_transform(scaler.fit_transform(Y))
     Y_pca_truncated = Y_pca[:, : emulator_settings.n_pc]  # Select PCs here
+    # Transfer matrix S^T mapping (possibly whitened) PC scores back to scaled-feature space.
+    #   whiten=False: Y_scaled = Y_pca . components_
+    #   whiten=True : fit_transform divided each score by sqrt(explained_variance_), so we multiply
+    #                 it back here: Y_scaled = Y_pca_whitened . (sqrt(explained_variance_)[:,None] * components_).
+    # Note: pca.components_ and pca.explained_variance_ are UNCHANGED by whiten (whiten only rescales
+    #   transform() output), so the truncated-PC add-back (compute_emulator_cov_unexplained) needs no change.
+    # We store `transfer` and use it consistently in fit + predict so whitening stays invertible.
+    if pca_whiten:
+        pca_transfer = np.sqrt(pca.explained_variance_)[:, None] * pca.components_
+    else:
+        pca_transfer = pca.components_
     # Invert PCA and undo the scaling
-    Y_reconstructed_truncated = Y_pca_truncated.dot(pca.components_[: emulator_settings.n_pc, :])
+    Y_reconstructed_truncated = Y_pca_truncated.dot(pca_transfer[: emulator_settings.n_pc, :])
     Y_reconstructed_truncated_unscaled = scaler.inverse_transform(Y_reconstructed_truncated)
     explained_variance_ratio = pca.explained_variance_ratio_
     logger.info(
@@ -192,6 +208,19 @@ def fit_emulator(
     # Define GP kernel (covariance function)
     min = np.array(analysis_settings.raw_analysis_config["parameterization"][analysis_settings.parameterization]["min"])
     max = np.array(analysis_settings.raw_analysis_config["parameterization"][analysis_settings.parameterization]["max"])
+
+    # Emulate selected parameters (config `log_scale_indices`, e.g. c1/c2/c3) in NATURAL-LOG
+    # space (STAT `LogScale`): the GP then interpolates where the design is evenly spread, and
+    # the length-scale seeding (max-min) is taken over the same log range. The MCMC samples in
+    # this same space (see mc_sampling.base) so predict() inputs are consistent.
+    log_scale_indices = data_IO.get_log_scale_indices(
+        analysis_settings.raw_analysis_config, analysis_settings.parameterization
+    )
+    if log_scale_indices:
+        logger.info(f"Emulating parameters {list(log_scale_indices)} in natural-log space (log_scale_indices).")
+        design = data_IO.apply_log_scale(design, log_scale_indices)
+        min = data_IO.apply_log_scale(min, log_scale_indices)
+        max = data_IO.apply_log_scale(max, log_scale_indices)
 
     kernel = None
     for kernel_type, kernel_args in emulator_settings.active_kernels.items():
@@ -231,15 +260,23 @@ def fit_emulator(
     logger.info("")
     logger.info("Fitting GPs...")
     logger.info(f"  The design has {design.shape[1]} parameters")
+    # Opt-in reproducibility: config `random_state` seeds the restart draws of the hyperparameter
+    # optimizer (default None = unchanged behaviour). Without it, the low-variance PCs (whose
+    # log-marginal-likelihood surface has several optima within a few units) land on a different
+    # optimum from fit to fit, which alone shifts the posterior (seen 2026-09-16: alpha_s by 0.03).
+    random_state = emulator_settings.settings.get("random_state", None)
     emulators = [
         sklearn_gaussian_process.GaussianProcessRegressor(
             kernel=_kernel_for_pc(kernel, y, emulator_settings),
             alpha=emulator_settings.alpha,
             n_restarts_optimizer=emulator_settings.n_restarts,
             copy_X_train=False,
+            random_state=random_state,
         ).fit(design, y)
         for y in Y_pca_truncated.T
     ]
+    for i_pc, gp in enumerate(emulators):
+        logger.info(f"  PC{i_pc}: log-marginal-likelihood {gp.log_marginal_likelihood_value_:.3f}  kernel_ {gp.kernel_}")
 
     # Print hyperparameters.
     logger.info("")
@@ -256,6 +293,7 @@ def fit_emulator(
     output_dict["PCA"]["Y_reconstructed_truncated"] = Y_reconstructed_truncated
     output_dict["PCA"]["Y_reconstructed_truncated_unscaled"] = Y_reconstructed_truncated_unscaled
     output_dict["PCA"]["pca"] = pca
+    output_dict["PCA"]["transfer"] = pca_transfer
     output_dict["PCA"]["scaler"] = scaler
     output_dict["emulators"] = emulators
     signal_amplitude = _signal_amplitude_settings(emulator_settings)
@@ -348,8 +386,11 @@ def predict(
     # Note we use array broadcasting to calculate over all samples.
     pca: sklearn_decomposition.PCA = results["PCA"]["pca"]
     scaler: sklearn_preprocessing.StandardScaler = results["PCA"]["scaler"]
+    # Whiten-aware transfer matrix S^T (falls back to components_ for emulators trained before this
+    # field existed, i.e. whiten=False). See fit_emulator for the definition.
+    pca_transfer = results["PCA"].get("transfer", pca.components_)
     emulator_central_value_reconstructed_scaled = emulator_central_value.dot(
-        pca.components_[: emulator_settings.n_pc, :]
+        pca_transfer[: emulator_settings.n_pc, :]
     )
     emulator_central_value_reconstructed = scaler.inverse_transform(emulator_central_value_reconstructed_scaled)
 
@@ -365,8 +406,8 @@ def predict(
     # Note: should be equivalent to: https://github.com/jdmulligan/STAT/blob/master/src/emulator.py#L145
     # TODO: one can make this faster with broadcasting/einsum
     # TODO: NOTE-STAT: Compare this more carefully with STAT L286 and on.
-    n_features = pca.components_.shape[1]
-    S = pca.components_.T[:, : emulator_settings.n_pc]
+    n_features = pca_transfer.shape[1]
+    S = pca_transfer.T[:, : emulator_settings.n_pc]
     emulator_cov_reconstructed_scaled = np.zeros((n_samples, n_features, n_features))
     for i_sample in range(n_samples):
         emulator_cov_reconstructed_scaled[i_sample] = S.dot(emulator_cov[i_sample].dot(S.T))
@@ -507,6 +548,11 @@ class SKLearnEmulatorSettings:
             n_restarts=config["GPR"]["n_restarts"],
             alpha=config["GPR"]["alpha"],
             settings=config,
+            # Read from config so multiple emulator groups can write to DISTINCT files.
+            # Without this, every group falls back to "emulator.pkl" and the later group
+            # silently overwrites the earlier one -- so a hadron/jet split trained twice
+            # but only the second survived.
+            additional_name=config.get("additional_name", ""),
         )
 
     @classmethod

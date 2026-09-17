@@ -16,13 +16,49 @@ import numpy as np
 import numpy.typing as npt
 import seaborn as sns
 import yaml
+import matplotlib.image as mpimg
 from matplotlib import pyplot as plt
+from matplotlib.offsetbox import AnnotationBbox, OffsetImage
 
 from bayesian import data_IO
 
 sns.set_context("paper", rc={"font.size": 18, "axes.titlesize": 18, "axes.labelsize": 18})
 
 logger = logging.getLogger(__name__)
+
+# JETSCAPE logo (rasterized from jetscape_home_logo.pdf, white background made transparent),
+# overlaid top-left on each observable panel along with a "Work-in-progress" tag.
+_JETSCAPE_LOGO_PATH = Path(__file__).parent / "jetscape_home_logo.png"
+_JETSCAPE_LOGO = mpimg.imread(_JETSCAPE_LOGO_PATH) if _JETSCAPE_LOGO_PATH.exists() else None
+
+
+def _add_jetscape_logo_and_wip(ax, fontsize: float, zoom: float = 0.1) -> None:
+    """Overlay the JETSCAPE logo (top-left) and a 'Work-in-progress' tag on one panel."""
+    if _JETSCAPE_LOGO is not None:
+        imagebox = OffsetImage(_JETSCAPE_LOGO, zoom=zoom)
+        imagebox.image.axes = ax
+        ab = AnnotationBbox(
+            imagebox,
+            (0.04, 0.96),
+            xycoords="axes fraction",
+            box_alignment=(0.0, 1.0),
+            frameon=False,
+            pad=0.0,
+            zorder=20,
+        )
+        ax.add_artist(ab)
+    ax.text(
+        0.03,
+        0.78,
+        "Work-in-progress",
+        transform=ax.transAxes,
+        fontsize=fontsize,
+        style="italic",
+        color="0.15",
+        ha="left",
+        va="top",
+        zorder=20,
+    )
 
 
 # ---------------------------------------------------------------
@@ -127,7 +163,15 @@ def plot_observable_panels(
         fontsize = 14.0 / plot_shape[0]
         markersize = 8.0 / plot_shape[0]
         if i_subplot == 0:
-            fig, axs = plt.subplots(plot_shape[0], plot_shape[1], constrained_layout=True, squeeze=False)
+            # Scale the figure with the panel grid (width per column, height per row), so wide
+            # layouts (e.g. [2, 4]) render as wide figures rather than the default ~square size.
+            fig, axs = plt.subplots(
+                plot_shape[0],
+                plot_shape[1],
+                figsize=(plot_shape[1] * 3.5, plot_shape[0] * 3.0),
+                constrained_layout=True,
+                squeeze=False,
+            )
             for ax in axs.flat:
                 ax.tick_params(labelsize=fontsize)
             row = 0
@@ -141,6 +185,10 @@ def plot_observable_panels(
         current_ax.set_ylabel(ytitle, fontsize=fontsize)
         current_ax.set_ylim([ymin, ymax])
         current_ax.set_xlim(xmin[0], xmax[-1])
+
+        # JETSCAPE logo (top-left) + "Work-in-progress" tag -- posterior observable plot only
+        if "posterior" in filename:
+            _add_jetscape_logo_and_wip(current_ax, fontsize)
 
         # Draw predictions
         for i_prediction, _ in enumerate(plot_list):

@@ -40,7 +40,7 @@ import attrs
 import numpy as np
 import numpy.typing as npt
 
-from bayesian import analysis, data_IO, emulation, register_modules
+from bayesian import analysis, data_IO, emulation, log_posterior, register_modules
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +185,19 @@ def run_mcmc(config: MCConfig) -> None:
     parameter_min = np.array(param_cfg["min"])
     parameter_max = np.array(param_cfg["max"])
     ndim = len(param_cfg["names"])
+    # Parameters emulated+sampled in natural-log space (config `log_scale_indices`). Log their
+    # bounds so the MCMC samples in the SAME space the emulator was trained in (mc predict inputs
+    # stay consistent). A flat box prior in log space is automatically uniform-in-log, so
+    # log_scale SUPERSEDES the explicit log_uniform prior reweighting for those parameters.
+    log_scale_indices = data_IO.get_log_scale_indices(
+        config.analysis_settings.raw_analysis_config, parameterization
+    )
+    if log_scale_indices:
+        parameter_min = data_IO.apply_log_scale(parameter_min, log_scale_indices)
+        parameter_max = data_IO.apply_log_scale(parameter_max, log_scale_indices)
+    # Uniform-in-log prior reweighting only for params NOT already sampled in log space.
+    log_uniform = set(int(i) for i in (param_cfg.get("log_uniform_indices", ()) or ()))
+    log_prior_indices = tuple(sorted(log_uniform - set(log_scale_indices)))
 
     # Load emulators from disk
     emulation_config = emulation.EmulationConfig.from_config_file(analysis_settings=config.analysis_settings)
@@ -197,6 +210,11 @@ def run_mcmc(config: MCConfig) -> None:
         pseudodata_index=config.closure_index,
         observable_filter=emulation_config.observable_filter,
     )
+
+    # Persist the static covariance pieces once on the master, before the sampler creates a
+    # multiprocessing pool, so worker processes don't race on covariance_matrices.pkl and so
+    # plot_covariance reuses the exact matrices used in sampling (rather than recomputing).
+    log_posterior.save_covariance_matrices_for_plotting(experimental_results, config.output_dir)
 
     sampler_name = config.sampler_settings.sampler_name
     try:
@@ -213,6 +231,7 @@ def run_mcmc(config: MCConfig) -> None:
         parameter_min=parameter_min,
         parameter_max=parameter_max,
         parameter_ndim=ndim,
+        parameter_log_prior_indices=log_prior_indices,
     )
 
 

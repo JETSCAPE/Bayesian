@@ -448,34 +448,26 @@ class SortEmulationGroupObservables:
         # Requires special handling since we're adding matrices (ie. 3d rather than 2d)
         if "cov" in self._available_value_types:
             value_type = "cov"
-
-            # We have to sort them according to the mapping that we've derived.
-            # However, it's not quite as trivial to just insert them (as we do for the central values),
-            # so we'll use the output matrix slice as the key to sort by below.
-            inputs_for_block_diag = {}
-            for observable_name, (  # noqa: B007
-                emulation_group_name,
-                slice_in_output_matrix,
-                slice_in_emulation_group_matrix,
-            ) in self.emulation_group_to_observable_matrix.items():
-                emulation_group_matrix = group_matrices[emulation_group_name]
-                # NOTE: The slice_in_output_matrix.start should provide unique integers to sort by
-                #       (basically, we just use the starting position instead of inserting it directly).
-                inputs_for_block_diag[slice_in_output_matrix.start] = emulation_group_matrix[value_type][
-                    :, slice_in_emulation_group_matrix, slice_in_emulation_group_matrix
-                ]
-
-            # And then merge them together in a block diagonal, sorting to put them in the right order
-            output[value_type] = nd_block_diag(
-                # sort based on the start value of the slice in the output matrix.
-                [
-                    # NOTE: We don't want to pass the key, but we need it for sorting, so we then
-                    #       have to explicitly select the actual matrices (ie. the v of the k, v pair)
-                    #       to pass along.
-                    m[1]
-                    for m in sorted(inputs_for_block_diag.items(), key=lambda x: x[0])
-                ]
-            )
+            # FIX 2026-09-16: the previous implementation assembled the merged covariance as a block
+            # diagonal of PER-OBSERVABLE blocks, which silently discarded every cross-observable element
+            # of the emulator covariance -- including within a single emulation group, where the
+            # PCA-based emulator covariance (GP part and truncated-PC part) is genuinely dense across
+            # observables. STAT keeps the full matrix (src/emulator.py predict: gp_var . var_trans +
+            # cov_trunc). Dropping it changed the likelihood substantially (chi2 307 vs 732 and
+            # -log det 1916 vs 2192 at the same parameter points, 92 observables). Now every pair of
+            # observables served by the SAME emulation group keeps its full block; pairs in different
+            # groups stay zero (they are emulated independently).
+            n_samples = next(iter(group_matrices.values()))[value_type].shape[0]
+            n_features = self.shape[1]
+            merged = np.zeros((n_samples, n_features, n_features))
+            entries = list(self.emulation_group_to_observable_matrix.values())
+            for group_i, out_i, grp_i in entries:
+                group_cov = group_matrices[group_i][value_type]
+                for group_j, out_j, grp_j in entries:
+                    if group_j != group_i:
+                        continue
+                    merged[:, out_i, out_j] = group_cov[:, grp_i, grp_j]
+            output[value_type] = merged
 
         # Handle the other values (as of 14 August 2023, it's just "central_value")
         for value_type in self._available_value_types:

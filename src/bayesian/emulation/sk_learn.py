@@ -309,10 +309,11 @@ def predict(
         emulator_cov_reconstructed_scaled[i_sample] = S.dot(emulator_cov[i_sample].dot(S.T))
     assert emulator_cov_reconstructed_scaled.shape == (n_samples, n_features, n_features)
 
-    # Include predictive variance due to truncated PCs.
-    # See comments in mcmc.py for further details.
+    # Include predictive variance due to truncated PCs. This is a per-parameter-point
+    # model uncertainty, so it must not depend on how many points are predicted in
+    # the current batch.
     for i_sample in range(n_samples):
-        emulator_cov_reconstructed_scaled[i_sample] += additional_covariance / n_samples
+        emulator_cov_reconstructed_scaled[i_sample] += additional_covariance
 
     # Propagate uncertainty: inverse preprocessing
     # We only need to undo the unit variance scaling, since the shift does not affect the covariance matrix.
@@ -359,8 +360,10 @@ def compute_emulator_cov_unexplained(
       as a function of theta.
     We can't do this with the second term, since we didn't emulate it -- so we estimate it,
       treating it as independent of theta, and add it to the emulator covariance:
-        Sigma_unexplained = 1/n_samples * S_{>n_pc} D^2_{>n_pc} S_{>n_pc}^T,
-      where we will include the 1/n_samples factor to account for the fact that we are estimating the covariance from a set of samples.
+        Sigma_unexplained = S_{>n_pc} V_{>n_pc} S_{>n_pc}^T,
+      where V is ``PCA.explained_variance_``. Scikit-learn has already normalized
+      these eigenvalues by ``n_samples - 1``, so no additional division by the
+      prediction batch size is appropriate.
     See eqs 21-22 of https://arxiv.org/pdf/2102.11337.pdf
     TODO: double check this (and compare to https://github.com/jdmulligan/STAT/blob/master/src/emulator.py#L145)
 

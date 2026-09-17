@@ -280,10 +280,32 @@ class EmulationConfig:
         """
         c = cls(analysis_settings=analysis_settings)
         # Initialize the config for each emulator
-        c.emulation_settings = {
-            group_name: _emulators[group_cfg["emulator_package"]].EmulatorSettings.from_config(group_cfg)
-            for group_name, group_cfg in analysis_settings.raw_analysis_config["parameters"]["emulators"].items()
-        }
+        c.emulation_settings = {}
+        group_configs = analysis_settings.raw_analysis_config["parameters"][
+            "emulators"
+        ]
+        resolved_filenames: dict[str, str] = {}
+        for group_name, group_cfg in group_configs.items():
+            emulator_settings = _emulators[group_cfg["emulator_package"]].EmulatorSettings.from_config(group_cfg)
+            if "additional_name" in group_cfg:
+                emulator_settings.additional_name = group_cfg["additional_name"]
+            elif len(group_configs) > 1:
+                emulator_settings.additional_name = group_name
+
+            filename = emulation_base.IO.output_filename(
+                emulator_settings=emulator_settings,
+                analysis_settings=analysis_settings,
+            ).name
+            if filename in resolved_filenames:
+                other_group = resolved_filenames[filename]
+                msg = (
+                    f"Emulator groups '{other_group}' and '{group_name}' both "
+                    f"resolve to '{filename}'. Configure distinct "
+                    "additional_name values."
+                )
+                raise ValueError(msg)
+            resolved_filenames[filename] = group_name
+            c.emulation_settings[group_name] = emulator_settings
         return c
 
     def read_all_emulator_groups(

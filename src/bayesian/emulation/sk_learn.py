@@ -260,15 +260,23 @@ def fit_emulator(
     logger.info("")
     logger.info("Fitting GPs...")
     logger.info(f"  The design has {design.shape[1]} parameters")
+    # Opt-in reproducibility: config `random_state` seeds the restart draws of the hyperparameter
+    # optimizer (default None = unchanged behaviour). Without it, the low-variance PCs (whose
+    # log-marginal-likelihood surface has several optima within a few units) land on a different
+    # optimum from fit to fit, which alone shifts the posterior (seen 2026-09-16: alpha_s by 0.03).
+    random_state = emulator_settings.settings.get("random_state", None)
     emulators = [
         sklearn_gaussian_process.GaussianProcessRegressor(
             kernel=_kernel_for_pc(kernel, y, emulator_settings),
             alpha=emulator_settings.alpha,
             n_restarts_optimizer=emulator_settings.n_restarts,
             copy_X_train=False,
+            random_state=random_state,
         ).fit(design, y)
         for y in Y_pca_truncated.T
     ]
+    for i_pc, gp in enumerate(emulators):
+        logger.info(f"  PC{i_pc}: log-marginal-likelihood {gp.log_marginal_likelihood_value_:.3f}  kernel_ {gp.kernel_}")
 
     # Print hyperparameters.
     logger.info("")

@@ -1433,7 +1433,14 @@ def initialize_observables_dict_from_tables(
                         # by guarding on `hasattr(val, 'shape')` and dives into the
                         # nested 'systematics' dict, which is the actually-correct fix.
                         obs_data = observables["Data"][observable_label]
-                        mask = (x_min <= obs_data["xmin"]) & (obs_data["xmax"] <= x_max)
+                        # `cuts_on: center` (opt-in) applies the window to the bin CENTRE, which is
+                        # STAT's convention (SetupAnalysis.py MinPT: drop bins with centre < MinPT, strict);
+                        # the default keeps the edge-based rule (xmin >= x_min and xmax <= x_max).
+                        if analysis_config.get("cuts_on", "edges") == "center":
+                            _xc = 0.5 * (obs_data["xmin"] + obs_data["xmax"])
+                            mask = (x_min <= _xc) & (_xc <= x_max)
+                        else:
+                            mask = (x_min <= obs_data["xmin"]) & (obs_data["xmax"] <= x_max)
                         prediction_values = prediction_values[mask, :]
                         prediction_errors = prediction_errors[mask, :]
                         n_data = obs_data["y"].shape[0]
@@ -1478,9 +1485,12 @@ def initialize_observables_dict_from_tables(
                     for obs_key, cut_range in cuts.items():
                         if obs_key in observable_label:
                             x_min, x_max = cut_range
-                            mask = (x_min <= observables["Data"][observable_label]["xmin"]) & (
-                                observables["Data"][observable_label]["xmax"] <= x_max
-                            )
+                            _od = observables["Data"][observable_label]
+                            if analysis_config.get("cuts_on", "edges") == "center":
+                                _xc = 0.5 * (_od["xmin"] + _od["xmax"])
+                                mask = (x_min <= _xc) & (_xc <= x_max)
+                            else:
+                                mask = (x_min <= _od["xmin"]) & (_od["xmax"] <= x_max)
                             for sys_name, sys_data in filtered_theory_systematics.items():
                                 filtered_theory_systematics[sys_name] = sys_data[mask, :]
 

@@ -254,8 +254,32 @@ def _plot_posterior_pairplot(chain, plot_dir, config, holdout_test=False, holdou
     # Flatten chain to shape (n_steps*n_walkers, n_dim)
     samples = chain.reshape((chain.shape[0] * chain.shape[1], chain.shape[2]))
 
-    # Construct dataframe of samples
+    # Construct dataframe of samples.
     names = [rf"{s}" for s in config.analysis_config["parameterization"][config.parameterization]["names"]]
+
+    # Parameters in `log_scale_indices` are emulated AND sampled in natural-log space, so the chain
+    # columns for them are ALREADY log values (unlike the design, which is linear and gets np.log'd
+    # below). We therefore only RELABEL them as ln(.) - no further transform - so the axes read
+    # correctly (e.g. ln c_1 in [-5, ln10]) instead of a linear "c_1" label on a log axis.
+    log_scale_indices = data_IO.get_log_scale_indices(config.analysis_config, config.parameterization)
+
+    def _ln_label(latex_name):
+        # "$c_1$" -> r"$\ln c_1$"; robust to names with/without surrounding $.
+        inner = latex_name.strip("$")
+        return rf"$\ln {inner}$"
+
+    names = [(_ln_label(s) if i in log_scale_indices else s) for i, s in enumerate(names)]
+
+    # Reorder columns so the non-log (physical) parameters come first in config order, then the
+    # log-sampled parameters. For the exponential model this yields the paper's corner order
+    # alpha_s, Q0, tau0, ln c1, ln c2, ln c3 (tau0 is linear; c1,c2,c3 are the log params).
+    plot_order = [i for i in range(len(names)) if i not in log_scale_indices] + [
+        i for i in range(len(names)) if i in log_scale_indices
+    ]
+    samples = samples[:, plot_order]
+    names = [names[i] for i in plot_order]
+    if holdout_test and holdout_point is not None:
+        holdout_point = [holdout_point[i] for i in plot_order]
     df = pd.DataFrame(samples, columns=names)
 
     # Plot posterior pairplot
@@ -273,6 +297,22 @@ def _plot_posterior_pairplot(chain, plot_dir, config, holdout_test=False, holdou
                 for artist in ax.get_children():
                     if isinstance(artist, PathCollection):
                         artist.set_rasterized(True)
+
+    # Optional per-parameter display ranges for the corner axes (config `corner_plot_ranges`),
+    # given in the config `names` order, in PLOT units (i.e. log units for log_scale params).
+    # Useful e.g. to match a paper's cropped figure (log c1,c2 in [0,2], log c3 in [1,4]).
+    # Absent/None entries -> seaborn auto-range.
+    corner_ranges = config.analysis_config["parameterization"][config.parameterization].get("corner_plot_ranges")
+    if corner_ranges is not None:
+        corner_ranges = [corner_ranges[i] for i in plot_order]  # reorder names-order -> plot order
+        n_axes = len(g.axes)
+        for i in range(n_axes):
+            for j in range(n_axes):
+                ax = g.axes[i][j]
+                if j < len(corner_ranges) and corner_ranges[j] is not None:
+                    ax.set_xlim(*corner_ranges[j])
+                if i != j and i < len(corner_ranges) and corner_ranges[i] is not None:
+                    ax.set_ylim(*corner_ranges[i])
 
     # If holdout test, draw the holdout point
     # (and we will return whether it is contained in the credible region)

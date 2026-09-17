@@ -85,6 +85,7 @@ def run_sampling(
     parameter_min: npt.NDArray[np.float64],
     parameter_max: npt.NDArray[np.float64],
     parameter_ndim: int,
+    parameter_log_prior_indices: tuple = (),  # accepted for API parity; see note at initargs
 ) -> None:
     """Run pocoMC-based Preconditioned Monte Carlo sampling.
 
@@ -125,6 +126,10 @@ def run_sampling(
             emulation_results,
             experimental_results,
             {},  # emulator_cov_unexplained: computed dynamically by predict() if needed
+            # NOTE: intentionally NOT passing parameter_log_prior_indices here. For pocoMC,
+            # log_posterior is used as the LIKELIHOOD and the prior is the separate `prior`
+            # object below; a log-uniform prior must be applied there, not in log_posterior,
+            # to avoid double-counting. TODO: build a log-uniform pmc prior for these indices.
         ],
     ) as pool:
         logger.info("Starting pocoMC sampler...")

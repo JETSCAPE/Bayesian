@@ -447,7 +447,6 @@ class SortEmulationGroupObservables:
         output: dict[str, npt.NDArray[np.float64]] = {}
         # Requires special handling since we're adding matrices (ie. 3d rather than 2d)
         if "cov" in self._available_value_types:
-            # Setup
             value_type = "cov"
 
             # We have to sort them according to the mapping that we've derived.

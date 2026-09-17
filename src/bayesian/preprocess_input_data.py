@@ -100,6 +100,33 @@ def smooth_statistical_outliers_in_predictions(
     # Setup for observables
     all_observables = data_IO.read_dict_from_h5(preprocessing_config.output_dir, "observables.h5")
 
+    # Stage 0: Outlier cleaning (config-driven method selector; default 'none').
+    #   method: drop_design_points -> remove design points whose prediction blows up
+    #   (any bin |value| > max_abs), e.g. R_AA -> O(1e4) from a divide-by-near-zero pp reference.
+    outlier_cfg = preprocessing_config.analysis_config["parameters"]["preprocessing"].get("outlier_cleaning", {})
+    oc_method = outlier_cfg.get("method", "none")
+    if oc_method == "drop_design_points":
+        max_abs = float(outlier_cfg.get("max_abs", 5.0))
+        logger.info(f"Outlier cleaning: dropping design points with any |value| > {max_abs}")
+        clean_cfg = FilteringConfig(
+            method="absolute_value",
+            threshold=max_abs,
+            min_design_points=int(outlier_cfg.get("min_design_points", 50)),
+            max_filtered_fraction=float(outlier_cfg.get("max_filtered_fraction", 0.6)),
+            problem_fraction_threshold=float(outlier_cfg.get("problem_fraction_threshold", 0.0)),  # any bad bin -> drop
+        )
+        all_observables, dropped_train = filter_problematic_design_points(
+            all_observables, clean_cfg, prediction_key="Prediction"
+        )
+        logger.info(f"  outlier_cleaning dropped {len(dropped_train)} training design points: {dropped_train}")
+        if "Prediction_validation" in all_observables:
+            all_observables, dropped_val = filter_problematic_design_points(
+                all_observables, clean_cfg, prediction_key="Prediction_validation"
+            )
+            logger.info(f"  outlier_cleaning dropped {len(dropped_val)} validation design points: {dropped_val}")
+    elif oc_method not in ("none", None):
+        logger.warning(f"Unknown outlier_cleaning method '{oc_method}' — skipping (use 'drop_design_points' or 'none').")
+
     # Stage 1: Filter design points
     logger.info("Filtering outliers in predictions...")
     filtering_config_dict = preprocessing_config.analysis_config["parameters"]["preprocessing"].get("filtering", {})

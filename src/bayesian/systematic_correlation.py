@@ -187,6 +187,12 @@ class SystematicInfo:
     # for summed systematics they come from the sys_data string itself.
     cor_length: int = attrs.field(default=-1)  # -1 means all bins (only applies to sum)
     cor_strength: float = attrs.field(default=1.0)  # Only applies to sum
+    # Correlation kernel for a summed systematic:
+    #   "exp_bin"     -> cor_strength * exp(-|i-j| / cor_length)   in BIN INDEX (default)
+    #   "gaussian_pt" -> cor_strength * exp(-((p_i - p_j)/cor_length_pt)^2)  in pT rescaled
+    #                    to [0,1] per observable (JETSCAPE paper Eq. 10)
+    cor_kind: str = attrs.field(default="exp_bin")
+    cor_length_pt: float = attrs.field(default=0.2)
 
     def __attrs_post_init__(self):
         """Validate systematic info after initialization."""
@@ -241,7 +247,30 @@ def parse_systematic_config(sys_config_string: str) -> dict:
     parts = sys_config_string.split(":")
 
     if parts[0] == "sum":
-        # Summed systematic: sum[:cor_length[:cor_strength]]
+        # pT-Gaussian correlation (paper Eq. 10): 'sum:ptgauss:<length>[:<strength>]'.
+        # <length> is in pT rescaled to [0,1] per observable; <strength> defaults to 1.0.
+        if len(parts) > 1 and parts[1] == "ptgauss":
+            if len(parts) < 3 or len(parts) > 4:
+                raise ValueError(
+                    f"Invalid sum:ptgauss format: '{sys_config_string}'. "
+                    f"Use 'sum:ptgauss:<length>' or 'sum:ptgauss:<length>:<strength>'."
+                )
+            try:
+                cor_length_pt = float(parts[2])
+                cor_strength = float(parts[3]) if len(parts) > 3 else 1.0
+            except (ValueError, IndexError) as e:
+                raise ValueError(f"Invalid sum:ptgauss format: '{sys_config_string}': {e}") from e
+            return {
+                "type": "sum",
+                "name": "sum",
+                "group_tag": "",
+                "cor_length": -1,
+                "cor_strength": float(np.clip(cor_strength, 0.0, 1.0)),
+                "cor_kind": "gaussian_pt",
+                "cor_length_pt": cor_length_pt,
+            }
+
+        # Summed systematic: sum[:cor_length[:cor_strength]]  (exponential in bin index)
         if len(parts) > 3:
             msg = (
                 f"Invalid sum format: '{sys_config_string}'. "
@@ -269,6 +298,35 @@ def parse_systematic_config(sys_config_string: str) -> dict:
             "cor_strength": cor_strength,
         }
         logger.debug(f"Parsed sum: {sys_config_string} -> length={cor_length}, strength={cor_strength}")
+
+    elif parts[0] == "persource":
+        # Per-source correlation (STAT-faithful; paper Eq. 10). Each systematic SOURCE becomes
+        # its OWN correlation group: it is correlated within the observable via the pT-Gaussian
+        # kernel, and the per-source covariance blocks are then summed (on the diagonal this
+        # reproduces the usual quadrature Σσ_s²; off-diagonal each source keeps its own
+        # correlation, avoiding the Cauchy-Schwarz over-correlation of quadrature-then-correlate).
+        # Block-diagonal per (observable, centrality); NO cross-observable correlation. Source
+        # names are auto-discovered at data-load time, so none are listed here.
+        #   Format: 'persource:ptgauss:<length>[:<strength>]'   (<length> in pT rescaled to [0,1])
+        if len(parts) < 3 or len(parts) > 4 or parts[1] != "ptgauss":
+            raise ValueError(
+                f"Invalid persource format: '{sys_config_string}'. "
+                f"Use 'persource:ptgauss:<length>' or 'persource:ptgauss:<length>:<strength>'."
+            )
+        try:
+            cor_length_pt = float(parts[2])
+            cor_strength = float(parts[3]) if len(parts) > 3 else 1.0
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"Invalid persource format: '{sys_config_string}': {e}") from e
+        return {
+            "type": "persource",
+            "name": "persource",
+            "group_tag": "",
+            "cor_length": -1,
+            "cor_strength": float(np.clip(cor_strength, 0.0, 1.0)),
+            "cor_kind": "gaussian_pt",
+            "cor_length_pt": cor_length_pt,
+        }
 
     else:
         # Individual systematic: name:group_tag OR just name (auto-generates unique tag)
@@ -316,6 +374,75 @@ def parse_systematic_config(sys_config_string: str) -> dict:
     return config
 
 
+def _parse_group_correlation_param(param_string: str, group_tag: str = "default") -> dict:
+    """Parse one `correlation_groups` value into kernel parameters.
+
+    Two accepted forms:
+      1. '<cor_length>:<cor_strength>'  -- bin-index kernel, rho = S * exp(-|i-j| / L);
+         L = -1 means FULL correlation across every bin carrying the tag. e.g. '-1:1', '3:0.8'.
+      2. 'ptgauss:<L>[:<strength>]'     -- pT-Gaussian kernel (paper Eq. 10),
+         rho = S * exp(-(|p~_i - p~_j| / L)^1.9) with p~ = pT rescaled to [0,1] per observable.
+         e.g. 'ptgauss:0.1'. Only well-defined WITHIN a single observable: a tag spanning
+         several observables falls back to full correlation (the covariance builder warns),
+         since p~ is rescaled per observable and a shared length is meaningless across them.
+
+    Returns {'cor_kind', 'cor_length', 'cor_length_pt', 'cor_strength'}.
+    """
+    parts = str(param_string).split(":")
+
+    if parts[0].strip().lower() == "ptgauss":
+        if len(parts) not in (2, 3):
+            msg = (
+                f"Failed to parse correlation_groups['{group_tag}'] = '{param_string}'. "
+                f"Expected 'ptgauss:<length>' or 'ptgauss:<length>:<strength>' (e.g. 'ptgauss:0.1')."
+            )
+            raise ValueError(msg)
+        try:
+            length_pt = float(parts[1])
+            strength = float(parts[2]) if len(parts) == 3 else 1.0
+        except ValueError as e:
+            msg = f"Failed to parse correlation_groups['{group_tag}'] = '{param_string}': {e}"
+            raise ValueError(msg) from e
+        if length_pt <= 0:
+            msg = f"correlation_groups['{group_tag}']: ptgauss length must be > 0, got {length_pt}"
+            raise ValueError(msg)
+        return {
+            "cor_kind": "gaussian_pt",
+            "cor_length": -1,  # unused by the gaussian_pt kernel; -1 is the safe fallback
+            "cor_length_pt": length_pt,
+            "cor_strength": float(np.clip(strength, 0.0, 1.0)),
+        }
+
+    # Legacy bin-index form
+    if len(parts) != 2:
+        msg = (
+            f"Failed to parse correlation_groups['{group_tag}'] = '{param_string}'. "
+            f"Expected 'cor_length:cor_strength' (e.g. '5:0.95') or 'ptgauss:<length>'."
+        )
+        raise ValueError(msg)
+    try:
+        cor_length = int(parts[0])
+        cor_strength = float(parts[1])
+    except ValueError as e:
+        msg = (
+            f"Failed to parse correlation_groups['{group_tag}'] = '{param_string}': {e}. "
+            f"Expected 'cor_length:cor_strength' (e.g. '5:0.95') or 'ptgauss:<length>'."
+        )
+        raise ValueError(msg) from e
+    if cor_length < -1 or cor_length == 0:
+        logger.warning(f"correlation_groups['{group_tag}']: invalid cor_length={cor_length}, using -1")
+        cor_length = -1
+    if cor_strength < 0.0 or cor_strength > 1.0:
+        logger.warning(f"correlation_groups['{group_tag}']: cor_strength={cor_strength} outside [0,1], clipping")
+        cor_strength = float(np.clip(cor_strength, 0.0, 1.0))
+    return {
+        "cor_kind": "exp_bin",
+        "cor_length": cor_length,
+        "cor_length_pt": None,
+        "cor_strength": cor_strength,
+    }
+
+
 @attrs.define
 class SystematicCorrelationManager:
     """
@@ -330,6 +457,7 @@ class SystematicCorrelationManager:
     # Map systematic full names to their info
     systematic_info: dict[str, SystematicInfo] = attrs.field(factory=dict)
     # Structure: systematic_full_name -> SystematicInfo
+    # (see _parse_group_correlation_param below for the accepted correlation_groups value forms)
 
     # Map observables to their expected systematics
     observable_systematics: dict[str, list[str]] = attrs.field(factory=dict)
@@ -343,8 +471,21 @@ class SystematicCorrelationManager:
 
     _pending_correlation_params: dict[str, str] = attrs.field(factory=dict, init=False)
 
+    # observable_label -> per-bin pT rescaled to [0,1] (for "gaussian_pt" summed correlation)
+    _observable_pt: dict[str, "np.ndarray"] = attrs.field(factory=dict, init=False)
+
+    # observable_label -> persource directive spec {cor_kind, cor_length_pt, cor_strength}.
+    # Populated at config-parse for 'persource:...' observables; expanded into one auto-tagged
+    # individual systematic per source at data-load time (register_persource_sources), since the
+    # actual source names are only known once the data files are read.
+    _persource_specs: dict[str, dict] = attrs.field(factory=dict, init=False)
+
     default_cor_length: int = attrs.field(default=-1)  # -1 means full correlation (all bins)
     default_cor_strength: float = attrs.field(default=1.0)  # 1.0 means fully correlated
+    # Kernel for groups: "exp_bin" (bin-index decay, the 'length:strength' form) or
+    # "gaussian_pt" (the 'ptgauss:<L>' form; only well-defined WITHIN one observable).
+    default_cor_kind: str = attrs.field(default="exp_bin")
+    default_cor_length_pt: float = attrs.field(default=0.1)
 
     def parse_configuration(self, parsed_observables: list[tuple[str, list[str], list[str], str | None]]):
         """
@@ -396,6 +537,21 @@ class SystematicCorrelationManager:
                 cor_strength = config["cor_strength"]
                 is_summed = config["type"] == "sum"
 
+                # Per-source: source names are unknown until the data is read. Record the
+                # directive spec now; register_persource_sources() expands it into one
+                # auto-tagged individual (gaussian_pt) per discovered source at data-load.
+                if config["type"] == "persource":
+                    self._persource_specs[obs_name] = {
+                        "cor_kind": config.get("cor_kind", "gaussian_pt"),
+                        "cor_length_pt": config.get("cor_length_pt", 0.2),
+                        "cor_strength": config.get("cor_strength", 1.0),
+                    }
+                    logger.debug(
+                        f"  {obs_name}: persource (kind={config.get('cor_kind')}, "
+                        f"length_pt={config.get('cor_length_pt')}) - sources resolved at data-load"
+                    )
+                    continue
+
                 # Construct full name
                 is_auto_tagged = False
                 if is_summed:
@@ -425,6 +581,8 @@ class SystematicCorrelationManager:
                     is_auto_tagged=is_auto_tagged,
                     cor_length=cor_length,
                     cor_strength=cor_strength,
+                    cor_kind=config.get("cor_kind", "exp_bin"),
+                    cor_length_pt=config.get("cor_length_pt", 0.2),
                 )
                 self.systematic_info[full_name] = sys_info
                 self.observable_systematics[obs_name].append(full_name)
@@ -452,6 +610,62 @@ class SystematicCorrelationManager:
                 f"  Summed systematics with unresolved cor_length: {n_unresolved} (will resolve after data load)"
             )
 
+    def has_persource(self, obs_name: str) -> bool:
+        """Return True if this observable was configured with a 'persource:...' directive."""
+        return obs_name in self._persource_specs
+
+    def register_persource_sources(self, obs_name: str, source_names: list[str]) -> None:
+        """Expand a 'persource:...' directive into one auto-tagged individual systematic per source.
+
+        Called at data-load once the actual source column names are known. Each source becomes an
+        individual with a unique per-observable tag (=> NO cross-observable correlation) carrying
+        the directive's pT-Gaussian kernel. The covariance builder (PATH 1) then forms one
+        σ_s⊗σ_s block per source, correlates it with the Gaussian, and sums the blocks
+        (block-diagonal per observable; diagonal reproduces the quadrature Σσ_s²).
+        """
+        # The spec is keyed by the YAML observable name (no centrality), but this is called with the
+        # file-derived runtime label that extends it with a centrality suffix. Resolve by longest
+        # substring containment (same convention as _resolve_observable_key). Registering under the
+        # full runtime label (below) keeps tags unique per (observable, centrality) => block-diagonal.
+        spec = self._persource_specs.get(obs_name)
+        if spec is None:
+            best_key = None
+            for ck in self._persource_specs:
+                if ck in obs_name and (best_key is None or len(ck) > len(best_key)):
+                    best_key = ck
+            if best_key is not None:
+                spec = self._persource_specs[best_key]
+        if spec is None:
+            logger.warning(f"register_persource_sources('{obs_name}') called with no persource spec; skipping")
+            return
+        self.observable_systematics.setdefault(obs_name, [])
+        for source in source_names:
+            correlation_tag = f"{source}_{obs_name}"
+            full_name = f"{source}:{correlation_tag}"
+            if full_name in self.systematic_info:
+                continue
+            self.systematic_info[full_name] = SystematicInfo(
+                base_name=source,
+                correlation_tag=correlation_tag,
+                full_name=full_name,
+                is_summed=False,
+                is_auto_tagged=True,
+                cor_length=-1,
+                cor_strength=spec.get("cor_strength", 1.0),
+                cor_kind=spec.get("cor_kind", "gaussian_pt"),
+                cor_length_pt=spec.get("cor_length_pt", 0.2),
+            )
+            if full_name not in self.observable_systematics[obs_name]:
+                self.observable_systematics[obs_name].append(full_name)
+        # Refresh the global ordered name list so downstream matrix building sees the new columns.
+        self.all_systematic_names = sorted(
+            set(self.all_systematic_names) | set(self.observable_systematics[obs_name])
+        )
+        logger.info(
+            f"  persource '{obs_name}': registered {len(source_names)} per-source systematics "
+            f"(kind={spec.get('cor_kind')}, length_pt={spec.get('cor_length_pt')})"
+        )
+
     def set_correlation_parameters(self, correlation_groups_params: dict[str, str]):
         """
         Store correlation parameters to be applied after correlation groups are built.
@@ -467,37 +681,31 @@ class SystematicCorrelationManager:
         # leak the previous defaults into the new configuration.
         self.default_cor_length = -1
         self.default_cor_strength = 1.0
+        self.default_cor_kind = "exp_bin"
+        self.default_cor_length_pt = 0.1
 
         # Check for 'default' key and extract it
         if "default" in correlation_groups_params:
             default_str = correlation_groups_params["default"]
             logger.info(f"Found 'default' correlation parameters: {default_str}")
 
-            try:
-                # Parse "cor_length:cor_strength" format
-                parts = default_str.split(":")
-                if len(parts) != 2:
-                    raise ValueError(f"Expected 'length:strength', got '{default_str}'")
+            p = _parse_group_correlation_param(default_str, "default")
+            self.default_cor_kind = p["cor_kind"]
+            self.default_cor_length = p["cor_length"]
+            self.default_cor_strength = p["cor_strength"]
+            if p["cor_length_pt"] is not None:
+                self.default_cor_length_pt = p["cor_length_pt"]
 
-                self.default_cor_length = int(parts[0])
-                self.default_cor_strength = float(parts[1])
-            except (ValueError, IndexError) as e:
-                raise ValueError(
-                    f"Failed to parse 'default' correlation_groups parameters '{default_str}': {e}. "
-                    f"Expected format 'cor_length:cor_strength' (e.g., '5:0.95')."
-                ) from e
-
-            # Validate
-            if self.default_cor_length < -1 or self.default_cor_length == 0:
-                logger.warning(f"Invalid default cor_length={self.default_cor_length}, using -1")
-                self.default_cor_length = -1
-            if self.default_cor_strength < 0.0 or self.default_cor_strength > 1.0:
-                logger.warning(f"default cor_strength={self.default_cor_strength} outside [0,1], clipping")
-                self.default_cor_strength = float(np.clip(self.default_cor_strength, 0.0, 1.0))
-
-            logger.info(
-                f"Set default correlation parameters: length={self.default_cor_length}, strength={self.default_cor_strength}"
-            )
+            if self.default_cor_kind == "gaussian_pt":
+                logger.info(
+                    f"Set default correlation: pT-Gaussian ell={self.default_cor_length_pt}, "
+                    f"strength={self.default_cor_strength} (applies WITHIN each observable; "
+                    f"multi-observable tags fall back to full correlation)"
+                )
+            else:
+                logger.info(
+                    f"Set default correlation parameters: length={self.default_cor_length}, strength={self.default_cor_strength}"
+                )
 
         # Store all parameters (including 'default' for now, will be filtered later)
         self._pending_correlation_params = correlation_groups_params
@@ -534,34 +742,18 @@ class SystematicCorrelationManager:
             # Determine which parameters to use
             if group_tag in correlation_groups_params:
                 # Use explicitly configured parameters
-                param_string = correlation_groups_params[group_tag]
-
-                try:
-                    parts = param_string.split(":")
-                    if len(parts) != 2:
-                        raise ValueError(f"Expected 'length:strength', got '{param_string}'")
-
-                    cor_length = int(parts[0])
-                    cor_strength = float(parts[1])
-                except (ValueError, IndexError) as e:
-                    raise ValueError(
-                        f"Failed to parse correlation_groups['{group_tag}'] = '{param_string}': {e}. "
-                        f"Expected format 'cor_length:cor_strength' (e.g., '5:0.95')."
-                    ) from e
-
-                # Validate
-                if cor_length < -1 or cor_length == 0:
-                    logger.warning(f"Invalid cor_length={cor_length}, using -1")
-                    cor_length = -1
-                if cor_strength < 0.0 or cor_strength > 1.0:
-                    logger.warning(f"cor_strength={cor_strength} outside [0,1], clipping")
-                    cor_strength = float(np.clip(cor_strength, 0.0, 1.0))
-
+                p = _parse_group_correlation_param(correlation_groups_params[group_tag], group_tag)
+                cor_kind = p["cor_kind"]
+                cor_length = p["cor_length"]
+                cor_strength = p["cor_strength"]
+                cor_length_pt = p["cor_length_pt"] if p["cor_length_pt"] is not None else self.default_cor_length_pt
                 source = "explicit"
             else:
                 # Use default parameters
+                cor_kind = self.default_cor_kind
                 cor_length = self.default_cor_length
                 cor_strength = self.default_cor_strength
+                cor_length_pt = self.default_cor_length_pt
                 source = "default"
 
             # Find all systematics in this group
@@ -575,13 +767,22 @@ class SystematicCorrelationManager:
                 if sys_full_name in self.systematic_info:
                     sys_info = self.systematic_info[sys_full_name]
                     if not sys_info.is_summed:
+                        sys_info.cor_kind = cor_kind
                         sys_info.cor_length = cor_length
                         sys_info.cor_strength = cor_strength
+                        if cor_kind == "gaussian_pt":
+                            sys_info.cor_length_pt = cor_length_pt
                         n_updated += 1
 
-            logger.info(
-                f"  Group '{group_tag}': Updated {n_updated} systematic(s) with length={cor_length}, strength={cor_strength} ({source})"
-            )
+            if cor_kind == "gaussian_pt":
+                logger.info(
+                    f"  Group '{group_tag}': Updated {n_updated} systematic(s) with "
+                    f"pT-Gaussian ell={cor_length_pt}, strength={cor_strength} ({source})"
+                )
+            else:
+                logger.info(
+                    f"  Group '{group_tag}': Updated {n_updated} systematic(s) with length={cor_length}, strength={cor_strength} ({source})"
+                )
 
         logger.info("Correlation parameter configuration complete")
 
@@ -684,7 +885,18 @@ class SystematicCorrelationManager:
         logger.info(f"  Resolved: {n_resolved}")
         logger.info(f"  Already had explicit values: {n_already_set}")
 
-    def build_intra_observable_correlation_matrix(self, systematic_full_name: str, n_bins: int) -> np.ndarray:
+    def set_observable_pt(self, pt_map: dict) -> None:
+        """Store per-observable pT (rescaled to [0,1]) for the 'gaussian_pt' summed kernel.
+
+        :param pt_map: observable_label -> 1D array of per-bin rescaled pT, in the same
+                       bin order as that observable's covariance feature range.
+        """
+        self._observable_pt = {k: np.asarray(v, dtype=float) for k, v in pt_map.items()}
+        logger.info(f"Registered rescaled-pT arrays for {len(self._observable_pt)} observables (gaussian_pt kernel).")
+
+    def build_intra_observable_correlation_matrix(
+        self, systematic_full_name: str, n_bins: int, pt: "np.ndarray | None" = None
+    ) -> np.ndarray:
         """
         Build intra-observable correlation matrix for a SUMMED systematic.
 
@@ -718,14 +930,38 @@ class SystematicCorrelationManager:
             logger.warning(f"Systematic '{systematic_full_name}' not found, returning identity")
             return np.eye(n_bins)
 
+        cor_strength = sys_info.cor_strength
+
+        # pT-Gaussian kernel (paper Eq. 10, STAT reader.py:333): C[i,j] = strength *
+        # exp(-(|p_i - p_j|/ell)^1.9), with p rescaled to [0,1] per observable. STAT uses the
+        # 1.9 stretched-exponential (not a pure Gaussian). This applies to BOTH summed and
+        # per-source individual ('persource') systematics, so it is checked before the
+        # is_summed fallback. Requires pt of length n_bins.
+        if sys_info.cor_kind == "gaussian_pt":
+            ell = sys_info.cor_length_pt
+            if pt is None or len(pt) != n_bins or ell <= 0:
+                logger.warning(
+                    f"gaussian_pt for '{systematic_full_name}': pt unavailable/mismatched "
+                    f"(n_bins={n_bins}, pt={None if pt is None else len(pt)}, ell={ell}); "
+                    f"falling back to full correlation."
+                )
+                C = np.full((n_bins, n_bins), cor_strength)
+                np.fill_diagonal(C, 1.0)
+                return C
+            p = np.asarray(pt, dtype=float)
+            distance = np.abs(p[:, None] - p[None, :])
+            C = cor_strength * np.exp(-((distance / ell) ** 1.9))
+            np.fill_diagonal(C, 1.0)
+            logger.debug(f"gaussian_pt correlation '{systematic_full_name}': ell={ell}, n_bins={n_bins}")
+            return C
+
         if not sys_info.is_summed:
-            # Individual systematics: fully correlated (identity is placeholder)
-            # Actual correlation handled by outer product in covariance calculation
+            # Individual systematics (non-gaussian): fully correlated (identity is placeholder;
+            # actual correlation handled by outer product in create_systematic_covariance_matrix).
             return np.eye(n_bins)
 
-        # Summed systematic: use exponential decay correlation
+        # Summed systematic: use exponential decay correlation (in bin index)
         cor_length = sys_info.cor_length
-        cor_strength = sys_info.cor_strength
 
         logger.debug(f"Building exponential correlation matrix for '{systematic_full_name}':")
         logger.debug(f"  n_bins={n_bins}, cor_length={cor_length}, cor_strength={cor_strength}")
@@ -821,6 +1057,10 @@ class SystematicCorrelationManager:
             bin_sigma_sq: dict[int, float] = defaultdict(float)
             cor_length = self.default_cor_length
             cor_strength = self.default_cor_strength
+            group_cor_kind = "exp_bin"
+            group_obs_labels: set[str] = set()
+            group_start_by_obs: dict[str, int] = {}
+            rep_name = None
             for obs_label, start, end, sys_full_name in group_members:
                 if sys_full_name not in systematic_names:
                     logger.warning(f"Systematic '{sys_full_name}' not found in systematic_names")
@@ -831,6 +1071,10 @@ class SystematicCorrelationManager:
                     continue
                 cor_length = sys_info.cor_length
                 cor_strength = sys_info.cor_strength
+                group_cor_kind = sys_info.cor_kind
+                rep_name = sys_full_name
+                group_obs_labels.add(obs_label)
+                group_start_by_obs[obs_label] = start
                 col = systematic_uncertainties[:, sys_idx]
                 for b in range(start, end):
                     bin_sigma_sq[b] += float(col[b]) ** 2
@@ -845,13 +1089,47 @@ class SystematicCorrelationManager:
 
             logger.debug(
                 f":{group_tag}: cor_length={cor_length}, cor_strength={cor_strength}, "
-                f"n_bins_in_tag={len(idx)}, "
-                f"mode={'full' if cor_length == -1 else 'exponential'}"
+                f"n_bins_in_tag={len(idx)}, kind={group_cor_kind}, "
+                f"mode={'gaussian_pt' if group_cor_kind == 'gaussian_pt' else ('full' if cor_length == -1 else 'exponential')}"
             )
 
-            if cor_length == -1:
-                # Full correlation across the tag's bins
-                block = np.outer(u, u)
+            if group_cor_kind == "gaussian_pt":
+                # Per-source pT-Gaussian block (paper Eq. 10). Auto-tagged per-source groups are
+                # single-observable, so map the group's global bins to the observable's local pT
+                # indices and correlate this ONE source's outer product. Summing across the
+                # observable's source groups (each added below) gives per-source-then-sum,
+                # block-diagonal per observable, matching STAT.
+                pt_local = None
+                if len(group_obs_labels) == 1:
+                    obs_label = next(iter(group_obs_labels))
+                    pt_full = self._observable_pt.get(obs_label)
+                    start0 = group_start_by_obs[obs_label]
+                    local_positions = idx - start0
+                    if (
+                        pt_full is not None
+                        and local_positions.min() >= 0
+                        and local_positions.max() < len(pt_full)
+                    ):
+                        pt_local = np.asarray(pt_full, dtype=float)[local_positions]
+                else:
+                    logger.warning(
+                        f"gaussian_pt group '{group_tag}' spans {len(group_obs_labels)} observables; "
+                        f"expected 1 (per-source auto-tag). Falling back to full correlation."
+                    )
+                # build_intra... applies exp(-(|Δp̃|/ell)^1.9); falls back to full corr if pt_local is None.
+                C = self.build_intra_observable_correlation_matrix(rep_name, len(idx), pt=pt_local)
+                block = C * np.outer(u, u)
+            elif cor_length == -1:
+                # Full correlation across the tag's bins, at strength cor_strength:
+                #   rho(i,j) = cor_strength for i != j, 1 on the diagonal.
+                # NOTE: cor_strength was previously ignored here, making every '-1:S' group a pure
+                # rank-1 outer product regardless of S. That matters: a rank-1 group gives its bins
+                # no independent variance, so any bin whose only other uncertainty is zero (e.g. the
+                # zero-stat PHENIX/CMS bins) becomes exactly degenerate and the total covariance is
+                # singular. Keeping the diagonal at 1 restores rank for S < 1.
+                C = np.full((len(idx), len(idx)), float(cor_strength))
+                np.fill_diagonal(C, 1.0)
+                block = C * np.outer(u, u)
             else:
                 # TODO(design): when this group spans more than one observable, this
                 # branch concatenates bins in tag order and decays over the
@@ -878,37 +1156,52 @@ class SystematicCorrelationManager:
 
             sys_idx = systematic_names.index(sys_full_name)
 
-            # Find which observable this summed systematic belongs to
-            obs_found = False
+            # The summed systematic 'sum_<config_key>' is registered against the config
+            # observable key (no centrality suffix), whereas runtime observable ranges carry a
+            # centrality suffix and ONE config key can map to SEVERAL of them (one per
+            # centrality). Resolve the config key, then add an independent correlation block to
+            # EVERY runtime range whose label contains that key -> block-diagonal per
+            # (observable, centrality), matching the paper's independent-datasets treatment.
+            config_key = None
             for obs_label, sys_list in self.observable_systematics.items():
-                if sys_full_name not in sys_list:
-                    continue
-
-                # Find the feature range for this observable
-                for start, end, obs_name in self._observable_ranges:
-                    if obs_name == obs_label:
-                        n_bins = end - start
-                        sys_uncertainties = systematic_uncertainties[start:end, sys_idx]
-
-                        # Build intra-observable correlation matrix
-                        C = self.build_intra_observable_correlation_matrix(sys_full_name, n_bins)
-
-                        # Add to covariance (only within observable, no cross-observable terms)
-                        cov_block = np.outer(sys_uncertainties, sys_uncertainties) * C
-                        total_cov[start:end, start:end] += cov_block
-
-                        logger.debug(
-                            f"  Added summed systematic: {sys_full_name} for {obs_label} "
-                            f"(cor_length={sys_info.cor_length}, cor_strength={sys_info.cor_strength})"
-                        )
-                        obs_found = True
-                        break
-
-                if obs_found:
+                if sys_full_name in sys_list:
+                    config_key = obs_label
                     break
+            if config_key is None:
+                logger.warning(f"No observable registered for summed systematic '{sys_full_name}'")
+                continue
 
-            if not obs_found:
-                logger.warning(f"Could not find observable range for summed systematic '{sys_full_name}'")
+            applied = False
+            matched_range = False
+            for start, end, obs_name in self._observable_ranges:
+                if config_key not in obs_name:
+                    continue
+                matched_range = True
+                sys_uncertainties = systematic_uncertainties[start:end, sys_idx]
+                if not np.any(sys_uncertainties):
+                    continue
+                n_bins = end - start
+                C = self.build_intra_observable_correlation_matrix(
+                    sys_full_name, n_bins, pt=self._observable_pt.get(obs_name)
+                )
+                total_cov[start:end, start:end] += np.outer(sys_uncertainties, sys_uncertainties) * C
+                applied = True
+                logger.debug(
+                    f"  Added summed systematic {sys_full_name} to {obs_name} "
+                    f"(kind={sys_info.cor_kind}, n_bins={n_bins})"
+                )
+
+            if not applied:
+                if matched_range:
+                    # Ranges matched but every one had zero summed uncertainty: the observable is
+                    # stat-only (e.g. the 4 STAR-200 curated tables). Correct -> covariance stays
+                    # statistical there; nothing to add. Not a problem.
+                    logger.info(
+                        f"Summed systematic '{sys_full_name}' is stat-only (zero systematic); "
+                        f"leaving those bins with statistical covariance only."
+                    )
+                else:
+                    logger.warning(f"Could not apply summed systematic '{sys_full_name}' to any observable range")
 
         # Handle uncorrelated systematics (diagonal only)
         for sys_full_name, sys_info in self.systematic_info.items():
@@ -1017,9 +1310,13 @@ class SystematicCorrelationManager:
                     "is_auto_tagged": info.is_auto_tagged,
                     "cor_length": info.cor_length,
                     "cor_strength": info.cor_strength,
+                    "cor_kind": info.cor_kind,
+                    "cor_length_pt": info.cor_length_pt,
                 }
                 for full_name, info in self.systematic_info.items()
             },
+            "_observable_pt": {str(k): np.asarray(v) for k, v in self._observable_pt.items()},
+            "_persource_specs": {str(k): dict(v) for k, v in self._persource_specs.items()},
             "observable_systematics": dict(self.observable_systematics),
             "all_systematic_names": self.all_systematic_names,
             "_pending_correlation_params": self._pending_correlation_params,
@@ -1085,7 +1382,22 @@ class SystematicCorrelationManager:
                 is_auto_tagged=bool(_unwrap(info_dict.get("is_auto_tagged", False))),
                 cor_length=int(_unwrap(info_dict.get("cor_length", -1))),
                 cor_strength=float(_unwrap(info_dict.get("cor_strength", 1.0))),
+                cor_kind=str(_unwrap(info_dict.get("cor_kind", "exp_bin"))),
+                cor_length_pt=float(_unwrap(info_dict.get("cor_length_pt", 0.2))),
             )
+
+        # Restore per-observable rescaled-pT arrays (for the gaussian_pt kernel).
+        manager._observable_pt = {
+            str(_unwrap(k)): np.asarray(v) for k, v in data.get("_observable_pt", {}).items()
+        }
+
+        # Restore persource directive specs (informational after expansion; kept for idempotency).
+        manager._persource_specs = {
+            str(_unwrap(k)): {
+                str(_unwrap(kk)): _unwrap(vv) for kk, vv in dict(spec).items()
+            }
+            for k, spec in data.get("_persource_specs", {}).items()
+        }
 
         # Restore other attributes
         manager.observable_systematics = {
@@ -1095,8 +1407,16 @@ class SystematicCorrelationManager:
         manager.all_systematic_names = [str(_unwrap(item)) for item in data["all_systematic_names"]]
 
         pending_params = data.get("_pending_correlation_params", {})
-        manager._pending_correlation_params = {
+        restored_params = {
             str(_unwrap(tag)): str(_unwrap(param_string)) for tag, param_string in pending_params.items()
         }
+        # Re-parse through set_correlation_parameters rather than just assigning, so the derived
+        # 'default' fields (cor_kind / cor_length / cor_length_pt / cor_strength) are rebuilt on the
+        # restored manager. Assigning the raw dict alone left default_cor_kind at its attrs default,
+        # which silently downgraded a `default: 'ptgauss:<L>'` config to bin-index correlation.
+        if restored_params:
+            manager.set_correlation_parameters(restored_params)
+        else:
+            manager._pending_correlation_params = restored_params
 
         return manager

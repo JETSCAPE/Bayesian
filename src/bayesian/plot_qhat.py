@@ -40,6 +40,12 @@ def plot(config):
     n_walkers, n_steps, n_params = results["chain"].shape
     posterior = results["chain"].reshape((n_walkers * n_steps, n_params))
 
+    # Parameters emulated/sampled in natural-log space (config `log_scale_indices`) come out of
+    # the chain in log space; qhat uses the PHYSICAL c1/c2/c3, so invert them here.
+    log_scale_indices = data_IO.get_log_scale_indices(config.analysis_config, config.parameterization)
+    if log_scale_indices:
+        posterior = data_IO.invert_log_scale(posterior, log_scale_indices)
+
     # Plot output dir
     plot_dir = Path(config.output_dir) / "plot_qhat"
     plot_dir.mkdir(parents=True, exist_ok=True)

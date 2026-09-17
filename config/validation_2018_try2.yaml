@@ -123,7 +123,7 @@ analyses:
       emulators:
         default_group:
           <<: *default_emulator_parameters
-          emulator_name: sk_learn
+          emulator_package: sk_learn
           n_pc: 5
           observable_list:
             - observable: '5020__PbPb__hadron__pt_ch_cms'

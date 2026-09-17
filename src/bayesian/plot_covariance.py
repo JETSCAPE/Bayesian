@@ -324,28 +324,24 @@ def _plot_individual_covariance_matrices(cov_components: dict[str, np.ndarray], 
             # Skip individual systematic groups for now (too many plots)
             continue
 
-        fig, (ax_cov, ax_corr) = plt.subplots(1, 2, figsize=(16, 6))
+        title = comp_name.replace("_", " ").title()
 
-        # Covariance matrix
-        _plot_single_matrix(
-            cov_matrix, ax_cov, f"{comp_name.replace('_', ' ').title()} Covariance", cmap, matrix_type="covariance"
-        )
+        # Covariance matrix -- separate figure
+        fig_cov, ax_cov = plt.subplots(1, 1, figsize=(8, 6))
+        _plot_single_matrix(cov_matrix, ax_cov, f"{title} Covariance", cmap, matrix_type="covariance")
+        fig_cov.tight_layout()
+        fig_cov.savefig(plot_dir / f"covariance_{comp_name}.pdf", dpi=300, bbox_inches="tight")
+        fig_cov.savefig(plot_dir / f"covariance_{comp_name}.png", dpi=300, bbox_inches="tight")
+        plt.close(fig_cov)
 
-        # Correlation matrix
+        # Correlation matrix -- separate figure
         corr_matrix = _covariance_to_correlation(cov_matrix)
-        _plot_single_matrix(
-            corr_matrix,
-            ax_corr,
-            f"{comp_name.replace('_', ' ').title()} Correlation",
-            "RdBu_r",
-            matrix_type="correlation",
-        )
-
-        plt.tight_layout()
-        filename = f"covariance_{comp_name}"
-        plt.savefig(plot_dir / f"{filename}.pdf", dpi=300, bbox_inches="tight")
-        plt.savefig(plot_dir / f"{filename}.png", dpi=300, bbox_inches="tight")
-        plt.close()
+        fig_corr, ax_corr = plt.subplots(1, 1, figsize=(8, 6))
+        _plot_single_matrix(corr_matrix, ax_corr, f"{title} Correlation", "RdBu_r", matrix_type="correlation")
+        fig_corr.tight_layout()
+        fig_corr.savefig(plot_dir / f"correlation_{comp_name}.pdf", dpi=300, bbox_inches="tight")
+        fig_corr.savefig(plot_dir / f"correlation_{comp_name}.png", dpi=300, bbox_inches="tight")
+        plt.close(fig_corr)
 
     logger.info("Created individual covariance matrix plots")
 

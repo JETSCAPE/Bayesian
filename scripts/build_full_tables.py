@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 """Build a FULL-design table dir: every design point that exists, no QA / no pT cut baked in.
 
-    usage: myenv312/bin/python scripts/build_full_tables.py <curated_root> <out_tables_dir>
-    e.g.   myenv312/bin/python scripts/build_full_tables.py \
-             /tmp/curated/jetscape_curated_tables  data/20230320_full/tables
-    (extract jetscape_curated_tables.tar.gz first; this script only WRITES into <out_tables_dir>)
+    usage: python scripts/build_full_tables.py <curated_root> <out_tables_dir> [<STAT_root>]
+    e.g.   python scripts/build_full_tables.py \
+             /tmp/curated/jetscape_curated_tables  data/20230320_full/tables  ~/JetScapeSTAT
+    (extract jetscape_curated_tables.tar.gz first; this script only WRITES into <out_tables_dir>.
+     <STAT_root> -- or the environment variable STAT_ROOT -- is the directory holding the STAT
+     repository checkout (STAT/input/...) and the Emulators yaml (Emulators/yaml/...).)
 
 Read-only sources:
   Design      STAT/input/STAT20230116Exponential/Design__exponential.dat  (230 rows, LINEAR;
@@ -31,7 +33,12 @@ import os, re, sys, glob
 import numpy as np
 import yaml
 
-STAT = "/Users/zhanj82/Desktop/JetScapeSTAT"
+if len(sys.argv) not in (3, 4):
+    sys.exit(__doc__.split("\n\n")[0])
+STAT = sys.argv[3] if len(sys.argv) == 4 else os.environ.get("STAT_ROOT")
+if not STAT:
+    sys.exit("give <STAT_root> as the third argument or set STAT_ROOT")
+STAT = os.path.expanduser(STAT)
 YAML_F = f"{STAT}/Emulators/yaml/Exponential20230320RBF_N4.yaml"
 IN = f"{STAT}/STAT/input/STAT20230320Exponential"
 DESIGN_SRC = f"{STAT}/STAT/input/STAT20230116Exponential/Design__exponential.dat"

@@ -98,9 +98,9 @@ analysis_base: &model_base
     inclusive_chjet: [9., 100000.]
 
 analyses:
-  # Cross-observable normalization groups (taa/lumi/norm, shared by exp+energy) + all local
-  # measurement groups default to FULL correlation (-1:1). 'uncor' is diagonal (built-in).
-  # Change 'default' to e.g. '3:0.8' for a finite bin-index decay on the LOCAL groups.
+  # Normalization groups (taa/lumi/norm, shared by experiment + energy) are fully correlated ('-1:1').
+  # All LOCAL measurement groups use the pT kernel 'ptgauss:0.1' below (NOT full correlation);
+  # 'uncor' is diagonal (built-in).
   correlation_groups:
     # 'complicated' covariance (the curated_v2 treatment) on the paper-reproducing setup: per-source columns,
     # LOCAL measurement sources (sys/correlated/shape/unfolding) as ptgauss:0.1 per observable, 'uncorrelated'

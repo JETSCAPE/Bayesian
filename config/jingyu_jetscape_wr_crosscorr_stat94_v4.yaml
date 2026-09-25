@@ -1,5 +1,5 @@
 # JETSCAPE q-hat (arXiv:2408.08247) -- 'COMPLICATED' COVARIANCE on the paper-reproducing setup.
-#   identical to jingyu_jetscape_wr_statcov_stat94_v3full.yaml (tables, design, emulator, sampler) EXCEPT the covariance:
+#   identical to jingyu_jetscape_wr_statcov_stat94_v4.yaml (tables, design, emulator, sampler) EXCEPT the covariance:
 #   covariance  : per-source columns; local measurement sources (sys / correlated / shape / unfolding) 'ptgauss:0.1'
 #                 per observable; 'uncorrelated' diagonal; every NORMALIZATION source (taa / luminosity / lumi_taa /
 #                 norm / reference) FULLY CORRELATED ACROSS all observables of the same experiment+energy ('-1:1',
@@ -9,7 +9,7 @@
 #                 from the HEPData records (see curation_audit/GLOBALS_PROVENANCE.md). Design ids 13, 15, 103
 #                 are excluded so the training set stays EXACTLY STAT's 94.
 #-------------------------------------------
-output_dir: "/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/jingyu_jetscape_wr_crosscorr_stat94_v3full/"
+output_dir: "/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/jingyu_jetscape_wr_crosscorr_stat94_v4/"
 
 initialize_observables: True
 preprocess_input_data: True

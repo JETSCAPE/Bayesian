@@ -7,14 +7,14 @@
 #                 NO cross-observable correlation (every source is its own per-observable group)
 #   sampler     : emcee DE moves, 100 walkers x 40k steps
 #   result      : reproduces the paper's own chain (STAT/result/STAT20230320ExponentialRBF_N4/mcmc_chain.h5) within its noise
-#   twin config : jingyu_jetscape_wr_crosscorr_stat94_v3full.yaml = identical except the correlation groups
+#   twin config : jingyu_jetscape_wr_crosscorr_stat94_v4.yaml = identical except the correlation groups
 #   2026-09-24  : switched to data/20260924_curated_v4, which adds the R_AA normalization uncertainties missing
 #                 from the HEPData records (see curation_audit/GLOBALS_PROVENANCE.md): CMS 2.76 hadrons taa
 #                 4.1-5.8 % + luminosity 6 %; ALICE 2.76 pions taa 3.1-3.4 %; ALICE 2.76 pi0 norm 7.7/8.0 %;
 #                 ALICE 5.02 pions norm 2.51 %.  15 of 92 observables affected.  Design ids 13, 15, 103 are
 #                 excluded so the training set stays EXACTLY STAT's 94.
 #-------------------------------------------
-output_dir: "/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/jingyu_jetscape_wr_statcov_v4/"   # v4 tables (2026-09-24); the v3-table run is in jingyu_jetscape_wr_statcov_stat94_v3full
+output_dir: "/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/jingyu_jetscape_wr_statcov_v4/"   # v4 tables (2026-09-24); the v3-table run is in jingyu_jetscape_wr_statcov_stat94_v4
 
 initialize_observables: True
 preprocess_input_data: True

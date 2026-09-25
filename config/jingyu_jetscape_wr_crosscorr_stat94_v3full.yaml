@@ -5,6 +5,9 @@
 #                 norm / reference) FULLY CORRELATED ACROSS all observables of the same experiment+energy ('-1:1',
 #                 15 shared groups). This is the sharing STAT never had.
 #   result      : vs the STAT recipe -- alpha_s 0.384->0.390, Q0 1.67->1.80, tau0 0.47->0.48, c3 14.9->6.5 [0.4,42]
+#   2026-09-24  : switched to data/20260924_curated_v4, which adds the R_AA normalization uncertainties missing
+#                 from the HEPData records (see curation_audit/GLOBALS_PROVENANCE.md). Design ids 13, 15, 103
+#                 are excluded so the training set stays EXACTLY STAT's 94.
 #-------------------------------------------
 output_dir: "/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/results/jingyu_jetscape_wr_crosscorr_stat94_v3full/"
 
@@ -25,7 +28,7 @@ plot:
 
 debug_level: 0
 
-observable_table_dir: "/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/data/20230914_curated_v3/tables"   # fixed curated tables, ALL 92 observables (build_full_tables now honours PredictionExclude)
+observable_table_dir: "/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/data/20260924_curated_v4/tables"   # curated data + MC, incl. the 2026-09-24 normalization fix
 observable_config_dir: "/Users/zhanj82/Desktop/JetScapeSTAT/Bayesian/config"
 observables_filename: "observables_preprocessed.h5"
 
@@ -108,6 +111,10 @@ analyses:
     # all observables of the same experiment+energy ('-1:1'). Differs from STAT's recipe (_v3full) in exactly
     # that cross-observable sharing (STAT: diagonal blocks only; and STAT's ALICE norm at 0.1, ATLAS corr 0.2 etc.).
     default: 'ptgauss:0.1'
+    taa_2760: '-1:1'
+    luminosity_2760: '-1:1'
+    norm_alice_2760_pi0: '-1:1'
+    norm_alice_5020_pi: '-1:1'
     lumi_taa_alice_5020: '-1:1'
     lumi_taa_cms_2760: '-1:1'
     luminosity_atlas_2760: '-1:1'
@@ -125,7 +132,7 @@ analyses:
     taa_star_200: '-1:1'
   analysis_jetscape_wr_20230320:
     global_observable_exclude_list: []
-    design_points_to_exclude: [0, 4, 5, 7, 9, 10, 11, 12, 14, 16, 17, 18, 19, 21, 23, 24, 26, 27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 39, 40, 42, 43, 45, 46, 48, 49, 50, 51, 53, 54, 55, 57, 61, 65, 67, 69, 70, 71, 72, 73, 74, 75, 79, 81, 82, 87, 89, 90, 91, 92, 95, 97, 100, 102, 104, 111, 115, 116, 118, 121, 125, 128, 131, 133, 136, 137, 139, 140, 142, 143, 145, 146, 147, 151, 154, 159, 160, 166, 167, 168, 172, 173, 177, 179, 180, 183, 185, 187, 188, 189, 192, 193, 194, 198, 201, 204, 210, 211, 213, 214, 216, 219]   # keep EXACTLY STAT's 94 kept design ids (default.p designindex); ids>=200 = validation batch   # max R_AA>1.5 on pT>9 bins (98 dropped -> 107 training)
+    design_points_to_exclude: [0, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 23, 24, 26, 27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 39, 40, 42, 43, 45, 46, 48, 49, 50, 51, 53, 54, 55, 57, 61, 65, 67, 69, 70, 71, 72, 73, 74, 75, 79, 81, 82, 87, 89, 90, 91, 92, 95, 97, 100, 102, 103, 104, 111, 115, 116, 118, 121, 125, 128, 131, 133, 136, 137, 139, 140, 142, 143, 145, 146, 147, 151, 154, 159, 160, 166, 167, 168, 172, 173, 177, 179, 180, 183, 185, 187, 188, 189, 192, 193, 194, 198, 201, 204, 210, 211, 213, 214, 216, 219]   # keep EXACTLY STAT's 94 kept design ids (default.p designindex); ids>=200 = validation batch   # max R_AA>1.5 on pT>9 bins (98 dropped -> 107 training)   # +13, 15, 103: v4 carries 230 design points; excluding them keeps STAT's 94
     parameters:
       preprocessing: {<<: *default_preprocessing_parameters}
       emulators:
@@ -175,23 +182,23 @@ analyses:
             - observable: '2760__PbPb__hadron__pt_ch_atlas____5-10'
               sys_data: ['sys:2760__PbPb__hadron__pt_ch_atlas____5-10__sys']
             - observable: '2760__PbPb__hadron__pt_ch_cms____0-5'
-              sys_data: ['sys:2760__PbPb__hadron__pt_ch_cms____0-5__sys']
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_cms____0-5__sys', 'sys,taa:taa_2760', 'sys,luminosity:luminosity_2760']
             - observable: '2760__PbPb__hadron__pt_ch_cms____10-30'
-              sys_data: ['sys:2760__PbPb__hadron__pt_ch_cms____10-30__sys']
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_cms____10-30__sys', 'sys,taa:taa_2760', 'sys,luminosity:luminosity_2760']
             - observable: '2760__PbPb__hadron__pt_ch_cms____5-10'
-              sys_data: ['sys:2760__PbPb__hadron__pt_ch_cms____5-10__sys']
+              sys_data: ['sys:2760__PbPb__hadron__pt_ch_cms____5-10__sys', 'sys,taa:taa_2760', 'sys,luminosity:luminosity_2760']
             - observable: '2760__PbPb__hadron__pt_pi0_alice____0-10'
-              sys_data: ['sys:2760__PbPb__hadron__pt_pi0_alice____0-10__sys']
+              sys_data: ['sys:2760__PbPb__hadron__pt_pi0_alice____0-10__sys', 'sys,norm:norm_alice_2760_pi0']
             - observable: '2760__PbPb__hadron__pt_pi0_alice____20-50'
-              sys_data: ['sys:2760__PbPb__hadron__pt_pi0_alice____20-50__sys']
+              sys_data: ['sys:2760__PbPb__hadron__pt_pi0_alice____20-50__sys', 'sys,norm:norm_alice_2760_pi0']
             - observable: '2760__PbPb__hadron__pt_pi_alice____0-5'
-              sys_data: ['sys:2760__PbPb__hadron__pt_pi_alice____0-5__sys']
+              sys_data: ['sys:2760__PbPb__hadron__pt_pi_alice____0-5__sys', 'sys,taa:taa_2760']
             - observable: '2760__PbPb__hadron__pt_pi_alice____10-20'
-              sys_data: ['sys:2760__PbPb__hadron__pt_pi_alice____10-20__sys']
+              sys_data: ['sys:2760__PbPb__hadron__pt_pi_alice____10-20__sys', 'sys,taa:taa_2760']
             - observable: '2760__PbPb__hadron__pt_pi_alice____20-40'
-              sys_data: ['sys:2760__PbPb__hadron__pt_pi_alice____20-40__sys']
+              sys_data: ['sys:2760__PbPb__hadron__pt_pi_alice____20-40__sys', 'sys,taa:taa_2760']
             - observable: '2760__PbPb__hadron__pt_pi_alice____5-10'
-              sys_data: ['sys:2760__PbPb__hadron__pt_pi_alice____5-10__sys']
+              sys_data: ['sys:2760__PbPb__hadron__pt_pi_alice____5-10__sys', 'sys,taa:taa_2760']
             - observable: '2760__PbPb__inclusive_jet__pt_alice__R0.2__0-10'
               sys_data: ['sys,correlated:2760__PbPb__inclusive_jet__pt_alice__R0.2__0-10__correlated', 'sys,unfolding:2760__PbPb__inclusive_jet__pt_alice__R0.2__0-10__unfolding', 'sys,taa:taa_alice_2760']
             - observable: '2760__PbPb__inclusive_jet__pt_alice__R0.2__10-30'
@@ -245,17 +252,17 @@ analyses:
             - observable: '5020__PbPb__hadron__pt_ch_cms____10-30'
               sys_data: ['sys:5020__PbPb__hadron__pt_ch_cms____10-30__sys', 'sys,taa:taa_cms_5020', 'sys,luminosity:luminosity_cms_5020']
             - observable: '5020__PbPb__hadron__pt_pi_alice____0-5'
-              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____0-5__sys']
+              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____0-5__sys', 'sys,norm:norm_alice_5020_pi']
             - observable: '5020__PbPb__hadron__pt_pi_alice____10-20'
-              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____10-20__sys']
+              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____10-20__sys', 'sys,norm:norm_alice_5020_pi']
             - observable: '5020__PbPb__hadron__pt_pi_alice____20-30'
-              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____20-30__sys']
+              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____20-30__sys', 'sys,norm:norm_alice_5020_pi']
             - observable: '5020__PbPb__hadron__pt_pi_alice____30-40'
-              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____30-40__sys']
+              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____30-40__sys', 'sys,norm:norm_alice_5020_pi']
             - observable: '5020__PbPb__hadron__pt_pi_alice____40-50'
-              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____40-50__sys']
+              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____40-50__sys', 'sys,norm:norm_alice_5020_pi']
             - observable: '5020__PbPb__hadron__pt_pi_alice____5-10'
-              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____5-10__sys']
+              sys_data: ['sys:5020__PbPb__hadron__pt_pi_alice____5-10__sys', 'sys,norm:norm_alice_5020_pi']
             - observable: '5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10'
               sys_data: ['sys,correlated:5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10__correlated', 'sys,unfolding:5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10__unfolding', 'sys,lumi_taa:lumi_taa_alice_5020']
             - observable: '5020__PbPb__inclusive_jet__pt_alice__R0.4__0-10'

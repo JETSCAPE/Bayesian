@@ -14,20 +14,20 @@ source .venv-review/bin/activate
 python -m pip install -r examples/hybrid_lres/requirements.lock.txt
 ```
 
-Obtain these two private companion files from the authors:
+Obtain the single private `hybrid_lres_review_bundle.tar.xz` from the authors.
+It contains all non-code inputs for fresh training/inference and frozen-figure
+replay: accepted tables, experimental source errors/metadata, physical grid axes,
+integrity hashes, the full measured simulation covariance, and the numerical
+figure/QA/wake reference caches. The covariance retains all cross-design,
+cross-bin, cross-observable and common-pp correlations, with no precision loss.
 
-- `hybrid_lres_training_inputs.tar.gz`: accepted tables, experimental source
-  errors/metadata, native configuration, physical grid axes and integrity hashes.
-- `full_training.npz`: the full measured covariance, including cross-design,
-  cross-bin, cross-observable and common-pp correlations (335 MiB).
-
-Put both in `inputs/`, extract the small archive there, and leave
-`full_training.npz` alongside the extracted files. No collision-event files,
-cluster account, ROOT, FastJet or TeX installation is needed.
+Extract **from the repository root**. This creates `inputs/` for fresh training
+and `examples/hybrid_lres/numerical_cache/` for optional frozen-figure replay.
+Code and fonts come from the repository, not the archive. No collision-event
+files, cluster account, ROOT, FastJet or TeX installation is needed.
 
 ```bash
-mkdir -p inputs
-tar -xzf inputs/hybrid_lres_training_inputs.tar.gz -C inputs
+tar -xJf /path/to/hybrid_lres_review_bundle.tar.xz
 ```
 
 ## Baseline Run

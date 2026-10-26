@@ -12,6 +12,13 @@ Two separate entry points serve different purposes:
 
 Neither workflow generates collision events.
 
+The single private `hybrid_lres_review_bundle.tar.xz` contains all non-code
+inputs for both workflows. Extract it from the repository root with
+`tar -xJf /path/to/hybrid_lres_review_bundle.tar.xz`. It creates `inputs/`
+and `examples/hybrid_lres/numerical_cache/`. The older two-file training
+distribution and frozen-cache-only archive described below remain valid,
+but are not needed in addition to the combined bundle.
+
 This example redraws all 18 figures currently referenced by the manuscript from
 JSON/NPZ numerical results. It does not copy manuscript PDFs, deserialize
 Matplotlib figures, load model pickles, optimize kernels, run inference, or generate

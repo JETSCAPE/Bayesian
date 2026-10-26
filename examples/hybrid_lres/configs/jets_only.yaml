@@ -1,0 +1,12 @@
+# Fits scaler, PCA and actual correlated-noise REML on jets ONLY.
+schema: 1
+native_template: native_template.yaml
+selection:
+  sectors: [jets]
+  hadron_min_pt: 30
+  exclude_experiments: []
+  drop_first_angular_bins: {theta_g: 0, dR12: 0, rg: 0}
+training: {n_pc: {}, n_restarts: null, random_state: null}
+experiment: {ell: 0.2, kernel_power: 2}
+prior: {kind: uniform_physical, q: [0, 20], kappa: [0.3, 0.6]}
+grid: {mode: paper, counts: null, batch_size: 128, tv_tolerance: 0.02}

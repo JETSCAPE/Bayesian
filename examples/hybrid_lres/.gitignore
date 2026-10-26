@@ -3,3 +3,4 @@ numerical_cache/
 slim_cache/
 rendered*/
 __pycache__/
+fresh_training_validation/

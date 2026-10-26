@@ -1,0 +1,16 @@
+# Fresh own-subset all-sector fit, not frozen-result replay.
+schema: 1
+native_template: native_template.yaml
+selection:
+  sectors: [hadrons, jets, theta_g, dR12, rg]
+  hadron_min_pt: 30
+  exclude_experiments: []
+  drop_first_angular_bins: {theta_g: 0, dR12: 0, rg: 0}
+training:
+  n_pc: {}  # Inherit the explicit group counts in native_template.yaml.
+  n_restarts: null  # Inherit native 8 restarts (+ initial start), with native seeds.
+  random_state: null
+experiment: {ell: 0.2, kernel_power: 2}
+prior: {kind: uniform_physical, q: [0, 20], kappa: [0.3, 0.6]}
+grid: {mode: paper, counts: null, batch_size: 128, tv_tolerance: 0.02}
+baseline_summary: null

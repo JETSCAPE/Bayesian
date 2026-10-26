@@ -1,0 +1,666 @@
+output_dir: OUTPUT
+initialize_observables: false
+preprocess_input_data: false
+fit_emulators: false
+run_mcmc: false
+run_closure_tests: false
+plot:
+  input_data: true
+  covariance: true
+  emulators: true
+  mcmc: false
+  qhat: false
+  closure_tests: false
+  across_analyses: false
+debug_level: 0
+observable_table_dir: INPUTS
+observable_config_dir: INPUTS
+observables_filename: observables.h5
+parameters:
+  preprocessing_parameters:
+    filtering:
+      enable: false
+      method: relative_statistical_error
+      threshold: 0.03
+      problem_fraction_threshold: 0.0
+      min_design_points: 20
+      max_filtered_fraction: 0.6
+    smoothing:
+      enable: false
+      outlier_n_RMS: 5.0
+      interpolation_method: linear
+      max_n_feature_outliers_to_interpolate: 2
+  emulator_parameters:
+    force_retrain: false
+    emulator_package: sk_learn
+    kernels:
+      active:
+      - matern
+      - noise
+      matern:
+        nu: 1.5
+        length_scale_bounds_factor:
+        - 0.005
+        - 1000000
+      noise:
+        type: white
+        args:
+          noise_level: 0.5
+          noise_level_bounds:
+          - 1.0e-05
+          - 100
+    GPR:
+      n_restarts: 8
+      alpha: 1.0e-08
+    cross_validation: false
+    cross_validation_k: 5
+    independent_validation: true
+  mcmc_parameters: &id001
+    n_walkers: 50
+    n_burn_steps: 2000
+    n_sampling_steps: 40000
+    n_logging_steps: 250
+    n_processes: 2
+    random_seed: 20260926
+  closure:
+    confidence: 0.9
+analysis_base:
+  model_name: Lres-E-loss
+  parameterizations:
+  - Lres-E-loss
+  sqrts_list:
+  - 5020
+  centrality_range:
+  - - 0
+    - 10
+  recoil_scheme: negative_recominber
+  parameterization:
+    Lres-E-loss:
+      names:
+      - $u_{Lres}$
+      - $u_{kappa}$
+      min:
+      - 0.0
+      - 0.0
+      max:
+      - 1.0
+      - 1.0
+      physical_posterior_transform:
+        unit_names:
+        - u1
+        - u2
+        unit_labels:
+        - $u_{Lres}$
+        - $u_{kappa}$
+        components:
+        - name: Lres
+          axis_scale: log
+          steps:
+          - kind: multiply
+            value: 1.5707963267948966
+          - kind: tan
+          - kind: power
+            value: 3.0
+        - name: kappa_sc
+          axis_scale: linear
+          steps:
+          - kind: multiply
+            value: 0.3
+          - kind: add
+            value: 0.3
+      prior:
+        type: uniform_physical
+        bounds:
+          Lres:
+          - 0.0
+          - 20.0
+          kappa_sc:
+          - 0.3
+          - 0.6
+  alpha: 0.2
+  validation_indices:
+  - 38
+  - 39
+  cuts:
+    hadron__pt_:
+    - 10
+    - 1000
+analyses:
+  correlation_groups:
+    default: '-1:1'
+    atlas_dr12_total: '-1:1.0'
+    atlas_2018_taa_0_10: '-1:1.0'
+    atlas_2017_lumi: '-1:1.0'
+    atlas_rg_pt0_total: jetscape:0.2
+    atlas_rg_pt1_total: jetscape:0.2
+    atlas_rg_pt2_total: jetscape:0.2
+  analysis_raa_unit:
+    model_name: Lres-E-loss
+    parameterizations:
+    - Lres-E-loss
+    sqrts_list:
+    - 5020
+    centrality_range:
+    - - 0
+      - 10
+    recoil_scheme: negative_recominber
+    parameterization:
+      Lres-E-loss:
+        names:
+        - $u_{Lres}$
+        - $u_{kappa}$
+        min:
+        - 0.0
+        - 0.0
+        max:
+        - 1.0
+        - 1.0
+        physical_posterior_transform:
+          unit_names:
+          - u1
+          - u2
+          unit_labels:
+          - $u_{Lres}$
+          - $u_{kappa}$
+          components:
+          - name: Lres
+            axis_scale: log
+            steps:
+            - kind: multiply
+              value: 1.5707963267948966
+            - kind: tan
+            - kind: power
+              value: 3.0
+          - name: kappa_sc
+            axis_scale: linear
+            steps:
+            - kind: multiply
+              value: 0.3
+            - kind: add
+              value: 0.3
+        prior:
+          type: uniform_physical
+          bounds:
+            Lres:
+            - 0.0
+            - 20.0
+            kappa_sc:
+            - 0.3
+            - 0.6
+    alpha: 0.2
+    validation_indices:
+    - 38
+    - 39
+    parameters:
+      preprocessing:
+        filtering:
+          enable: false
+          method: relative_statistical_error
+          threshold: 0.03
+          problem_fraction_threshold: 0.0
+          min_design_points: 20
+          max_filtered_fraction: 0.6
+        smoothing:
+          enable: false
+          outlier_n_RMS: 5.0
+          interpolation_method: linear
+          max_n_feature_outliers_to_interpolate: 2
+      emulators:
+        alice_hadron_group:
+          force_retrain: false
+          emulator_package: sk_learn
+          kernels:
+            active:
+            - matern
+            - signal_amplitude
+            matern:
+              nu: 1.5
+              length_scale_bounds_factor:
+              - 0.005
+              - 1000000
+            noise:
+              type: white
+              args:
+                noise_level: 0.5
+                noise_level_bounds:
+                - 1.0e-05
+                - 100
+            signal_amplitude:
+              constant_value_factor: 1.0
+              constant_value_bounds_factor:
+              - 0.0001
+              - 10000.0
+          GPR:
+            n_restarts: 8
+            alpha: 1.0e-08
+          cross_validation: false
+          cross_validation_k: 5
+          independent_validation: true
+          n_pc: 1
+          observable_list:
+          - observable: 5020__PbPb__hadron__pt_ch_alice____0-5
+            sys_data:
+            - sys:alice_hadron_sum
+            - sys,norm:lhc5020
+          - observable: 5020__PbPb__hadron__pt_ch_alice____5-10
+            sys_data:
+            - sys:alice_hadron_sum
+            - sys,norm:lhc5020
+          additional_name: alice_hadron_group
+          random_state: 20260920
+          simulation_noise:
+            covariance_file: full_training.npz
+            residual_white_noise: false
+            joint_groups: true
+        alice_jet_group:
+          force_retrain: false
+          emulator_package: sk_learn
+          kernels:
+            active:
+            - matern
+            - signal_amplitude
+            matern:
+              nu: 1.5
+              length_scale_bounds_factor:
+              - 0.005
+              - 1000000
+            noise:
+              type: white
+              args:
+                noise_level: 0.5
+                noise_level_bounds:
+                - 1.0e-05
+                - 100
+            signal_amplitude:
+              constant_value_factor: 1.0
+              constant_value_bounds_factor:
+              - 0.0001
+              - 10000.0
+          GPR:
+            n_restarts: 8
+            alpha: 1.0e-08
+          cross_validation: false
+          cross_validation_k: 5
+          independent_validation: true
+          n_pc: 2
+          observable_list:
+          - observable: 5020__PbPb__inclusive_jet__pt_alice__R0.2__0-10
+            sys_data:
+            - sys,correlated:alice_jet_corr
+            - sys,unfolding:alice_jet_R02_unf
+            - sys,lumi_taa:lhc5020
+          - observable: 5020__PbPb__inclusive_jet__pt_alice__R0.4__0-10
+            sys_data:
+            - sys,correlated:alice_jet_corr
+            - sys,unfolding:alice_jet_R04_unf
+            - sys,lumi_taa:lhc5020
+          additional_name: alice_jet_group
+          random_state: 20260921
+          simulation_noise:
+            covariance_file: full_training.npz
+            residual_white_noise: false
+            joint_groups: true
+        atlas_hadron_group:
+          force_retrain: false
+          emulator_package: sk_learn
+          kernels:
+            active:
+            - matern
+            - signal_amplitude
+            matern:
+              nu: 1.5
+              length_scale_bounds_factor:
+              - 0.005
+              - 1000000
+            noise:
+              type: white
+              args:
+                noise_level: 0.5
+                noise_level_bounds:
+                - 1.0e-05
+                - 100
+            signal_amplitude:
+              constant_value_factor: 1.0
+              constant_value_bounds_factor:
+              - 0.0001
+              - 10000.0
+          GPR:
+            n_restarts: 8
+            alpha: 1.0e-08
+          cross_validation: false
+          cross_validation_k: 5
+          independent_validation: true
+          n_pc: 1
+          observable_list:
+          - observable: 5020__PbPb__hadron__pt_ch_atlas____0-5
+            sys_data:
+            - sys,track_selection:atlas_track_selection
+            - sys,momentum_bias:atlas_momentum_bias
+            - sys,track_particle_matching:atlas_track_matching
+            - sys,particle_composition:atlas_particle_composition
+            - sys,fake_secondary_tracks:atlas_fake_tracks
+            - sys,pt_resolution:atlas_pt_resolution
+            - sys,eta_resolution:atlas_eta_resolution
+            - sys,unfolding:atlas_unfolding
+            - sys,tracking_efficiency:atlas_tracking_efficiency
+            - sys,luminosity:atlas
+            - sys,taa:lhc5020
+          - observable: 5020__PbPb__hadron__pt_ch_atlas____5-10
+            sys_data:
+            - sys,track_selection:atlas_track_selection
+            - sys,momentum_bias:atlas_momentum_bias
+            - sys,track_particle_matching:atlas_track_matching
+            - sys,particle_composition:atlas_particle_composition
+            - sys,fake_secondary_tracks:atlas_fake_tracks
+            - sys,pt_resolution:atlas_pt_resolution
+            - sys,eta_resolution:atlas_eta_resolution
+            - sys,unfolding:atlas_unfolding
+            - sys,tracking_efficiency:atlas_tracking_efficiency
+            - sys,luminosity:atlas
+            - sys,taa:lhc5020
+          additional_name: atlas_hadron_group
+          random_state: 20260922
+          simulation_noise:
+            covariance_file: full_training.npz
+            residual_white_noise: false
+            joint_groups: true
+        atlas_jet_group:
+          force_retrain: false
+          emulator_package: sk_learn
+          kernels:
+            active:
+            - matern
+            - signal_amplitude
+            matern:
+              nu: 1.5
+              length_scale_bounds_factor:
+              - 0.005
+              - 1000000
+            noise:
+              type: white
+              args:
+                noise_level: 0.5
+                noise_level_bounds:
+                - 1.0e-05
+                - 100
+            signal_amplitude:
+              constant_value_factor: 1.0
+              constant_value_bounds_factor:
+              - 0.0001
+              - 10000.0
+          GPR:
+            n_restarts: 8
+            alpha: 1.0e-08
+          cross_validation: false
+          cross_validation_k: 5
+          independent_validation: true
+          n_pc: 2
+          observable_list:
+          - observable: 5020__PbPb__inclusive_jet__pt_atlas__R0.4__0-10
+            sys_data:
+            - sys:atlas_jet_sum
+            - sys,taa:lhc5020
+            - sys,luminosity:atlas
+          additional_name: atlas_jet_group
+          random_state: 20260923
+          simulation_noise:
+            covariance_file: full_training.npz
+            residual_white_noise: false
+            joint_groups: true
+        cms_hadron_group:
+          force_retrain: false
+          emulator_package: sk_learn
+          kernels:
+            active:
+            - matern
+            - signal_amplitude
+            matern:
+              nu: 1.5
+              length_scale_bounds_factor:
+              - 0.005
+              - 1000000
+            noise:
+              type: white
+              args:
+                noise_level: 0.5
+                noise_level_bounds:
+                - 1.0e-05
+                - 100
+            signal_amplitude:
+              constant_value_factor: 1.0
+              constant_value_bounds_factor:
+              - 0.0001
+              - 10000.0
+          GPR:
+            n_restarts: 8
+            alpha: 1.0e-08
+          cross_validation: false
+          cross_validation_k: 5
+          independent_validation: true
+          n_pc: 1
+          observable_list:
+          - observable: 5020__PbPb__hadron__pt_ch_cms____0-5
+            sys_data:
+            - sys:cms_hadron_sum
+            - sys,taa:lhc5020
+            - sys,luminosity:cms
+          - observable: 5020__PbPb__hadron__pt_ch_cms____5-10
+            sys_data:
+            - sys:cms_hadron_sum
+            - sys,taa:lhc5020
+            - sys,luminosity:cms
+          additional_name: cms_hadron_group
+          random_state: 20260924
+          simulation_noise:
+            covariance_file: full_training.npz
+            residual_white_noise: false
+            joint_groups: true
+        cms_jet_group:
+          force_retrain: false
+          emulator_package: sk_learn
+          kernels:
+            active:
+            - matern
+            - signal_amplitude
+            matern:
+              nu: 1.5
+              length_scale_bounds_factor:
+              - 0.005
+              - 1000000
+            noise:
+              type: white
+              args:
+                noise_level: 0.5
+                noise_level_bounds:
+                - 1.0e-05
+                - 100
+            signal_amplitude:
+              constant_value_factor: 1.0
+              constant_value_bounds_factor:
+              - 0.0001
+              - 10000.0
+          GPR:
+            n_restarts: 8
+            alpha: 1.0e-08
+          cross_validation: false
+          cross_validation_k: 5
+          independent_validation: true
+          n_pc: 2
+          observable_list:
+          - observable: 5020__PbPb__inclusive_jet__pt_cms__R0.2__0-10
+            sys_data:
+            - sys:cms_jet_sum
+            - sys,taa:lhc5020
+            - sys,luminosity:cms
+          - observable: 5020__PbPb__inclusive_jet__pt_cms__R0.3__0-10
+            sys_data:
+            - sys:cms_jet_sum
+            - sys,taa:lhc5020
+            - sys,luminosity:cms
+          - observable: 5020__PbPb__inclusive_jet__pt_cms__R0.4__0-10
+            sys_data:
+            - sys:cms_jet_sum
+            - sys,taa:lhc5020
+            - sys,luminosity:cms
+          additional_name: cms_jet_group
+          random_state: 20260925
+          simulation_noise:
+            covariance_file: full_training.npz
+            residual_white_noise: false
+            joint_groups: true
+        alice_theta_g_group:
+          force_retrain: false
+          emulator_package: sk_learn
+          kernels:
+            active:
+            - matern
+            - signal_amplitude
+            matern:
+              nu: 1.5
+              length_scale_bounds_factor:
+              - 0.005
+              - 1000000
+            noise:
+              type: white
+              args:
+                noise_level: 0.5
+                noise_level_bounds:
+                - 1.0e-05
+                - 100
+            signal_amplitude:
+              constant_value_factor: 1.0
+              constant_value_bounds_factor:
+              - 0.0001
+              - 10000.0
+          GPR:
+            n_restarts: 8
+            alpha: 1.0e-08
+          cross_validation: false
+          cross_validation_k: 5
+          independent_validation: true
+          n_pc: 3
+          observable_list:
+          - observable: 5020__PbPb__inclusive_chjet__tg_alice__R0.2_zcut0.2_beta0
+            sys_data:
+            - sys:alice_tg_sum
+          additional_name: alice_theta_g_group
+          pca_whiten: false
+          random_state: 20260930
+          simulation_noise:
+            covariance_file: full_training.npz
+            residual_white_noise: false
+            joint_groups: true
+        atlas_dr12_group:
+          force_retrain: false
+          emulator_package: sk_learn
+          kernels:
+            active:
+            - matern
+            - signal_amplitude
+            matern:
+              nu: 1.5
+              length_scale_bounds_factor:
+              - 0.005
+              - 1000000
+            noise:
+              type: white
+              args:
+                noise_level: 0.5
+                noise_level_bounds:
+                - 1.0e-05
+                - 100
+            signal_amplitude:
+              constant_value_factor: 1.0
+              constant_value_bounds_factor:
+              - 0.0001
+              - 10000.0
+          GPR:
+            n_restarts: 8
+            alpha: 1.0e-08
+          cross_validation: false
+          cross_validation_k: 5
+          independent_validation: true
+          n_pc: 4
+          observable_list:
+          - observable: 5020__PbPb__inclusive_jet__dr12_atlas__R1.0_pt200-251_trk4_zcut0.15_beta0__0-10
+            sys_data:
+            - sys:atlas_dr12_total
+            - sys,taa:atlas_2018_taa_0_10
+            - sys,luminosity:atlas_2017_lumi
+          additional_name: atlas_dr12_group
+          pca_whiten: false
+          random_state: 20261007
+          simulation_noise:
+            covariance_file: full_training.npz
+            residual_white_noise: false
+            joint_groups: true
+        atlas_rg_group:
+          force_retrain: false
+          emulator_package: sk_learn
+          kernels:
+            active:
+            - matern
+            - signal_amplitude
+            matern:
+              nu: 1.5
+              length_scale_bounds_factor:
+              - 0.005
+              - 1000000
+            noise:
+              type: white
+              args:
+                noise_level: 0.5
+                noise_level_bounds:
+                - 1.0e-05
+                - 100
+            signal_amplitude:
+              constant_value_factor: 1.0
+              constant_value_bounds_factor:
+              - 0.0001
+              - 10000.0
+          GPR:
+            n_restarts: 8
+            alpha: 1.0e-08
+          cross_validation: false
+          cross_validation_k: 5
+          independent_validation: true
+          n_pc: 3
+          observable_list:
+          - observable: 5020__PbPb__inclusive_jet__rg_atlas__R0.4_pt0__0-10
+            sys_data:
+            - sys:atlas_rg_pt0_total
+            - sys,taa:atlas_2018_taa_0_10
+            - sys,luminosity:atlas_2017_lumi
+          - observable: 5020__PbPb__inclusive_jet__rg_atlas__R0.4_pt1__0-10
+            sys_data:
+            - sys:atlas_rg_pt1_total
+            - sys,taa:atlas_2018_taa_0_10
+            - sys,luminosity:atlas_2017_lumi
+          - observable: 5020__PbPb__inclusive_jet__rg_atlas__R0.4_pt2__0-10
+            sys_data:
+            - sys:atlas_rg_pt2_total
+            - sys,taa:atlas_2018_taa_0_10
+            - sys,luminosity:atlas_2017_lumi
+          additional_name: atlas_rg_group
+          pca_whiten: false
+          random_state: 20261015
+          simulation_noise:
+            covariance_file: full_training.npz
+            residual_white_noise: false
+            joint_groups: true
+      mcmc: *id001
+      closure:
+        confidence: 0.9
+    cuts:
+      hadron__pt_:
+      - 10
+      - 1000
+atlas_rg_study:
+  binning_status: conditional_publication_reconstruction_not_verified
+  first_positive_lower_edge: 0.0
+  failed_grooming_included: false
+  particle_input: legacy_keep_pi0_not_certified_30ps
+  source: https://www.hepdata.net/download/table/ins2512925/Table%2018/2/yaml
+  warning: Conditional comparison only; no verified-edge or particle-level certification
+  baseline_residual_cross_pt: independent_assumption
+  mean_fit: unchanged_reference_wrapper

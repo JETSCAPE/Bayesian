@@ -1,0 +1,96 @@
+{
+  "status": "FRESH_TRAINING_AND_INFERENCE_VALIDATED",
+  "tests": {
+    "passed": 161,
+    "skipped": 1,
+    "skip_reason": "Optional frozen18figureintegration, validated separately"
+  },
+  "training": {
+    "all_nine_optimizer_records_exact_to_reference": true,
+    "kernel_theta_and_bounds_bitwise_equal": true,
+    "training_designs": 39,
+    "independent_holdout_id": 38,
+    "features": 138,
+    "retained_pcs": 19
+  },
+  "inference": {
+    "pi_T_Lres_16_50_84": [
+      1.4971549250150182,
+      1.9258554136111024,
+      2.453738530281363
+    ],
+    "kappa_16_50_84": [
+      0.41503718350279145,
+      0.4229025775758325,
+      0.43099554995872047
+    ],
+    "percentile_convention": "Native centered CDF",
+    "prior": "uniform_physical",
+    "physical_support": {
+      "q": [
+        0.0,
+        20.0
+      ],
+      "kappa": [
+        0.3,
+        0.6
+      ]
+    },
+    "unit_support": [
+      0.0,
+      0.7752893748567041
+    ],
+    "full_unit_prior": false,
+    "joint_fit_id": "eddbb188b8ae4652bf5f17a3fdb161d9",
+    "selected_features": 138,
+    "coarse_fine_TV": 0.00606663705711465,
+    "tv_tolerance": 0.02,
+    "converged": true,
+    "exploratory": false,
+    "paper_baseline_grid": true,
+    "predictions_scope": "Own-subset fitted targets only; no auxiliary frozen mapping"
+  },
+  "reference": {
+    "physical_pi_T_Lres_16_50_84": [
+      1.4971549250280853,
+      1.9258554136259074,
+      2.4537385303273003
+    ],
+    "kappa_16_50_84": [
+      0.4150371835024588,
+      0.4229025775755245,
+      0.43099554996013945
+    ],
+    "coarse_fine_TV": 0.006066637060752628,
+    "n_bins": 138,
+    "grid_shape": [
+      361,
+      241
+    ],
+    "remaining_cautions": [
+      "Selected-only fitted predictions; plug-in kernels and empirical PCA/omitted covariance assumptions remain",
+      "Measured finite-MC covariance and shared-MC validation do not establish independent-generator calibration",
+      "Conditional rg edges/particle definition and existing normalization qualifications are unchanged",
+      "Excluded predictive targets are auxiliary frozen-full-bank mappings, not own-model predictions or cross-model conditioning"
+    ],
+    "native_loglike_max_error": 5.684341886080802e-14
+  },
+  "differences": {
+    "pi_T_Lres_16_50_84": [
+      -1.3067102955233167e-11,
+      -1.4805046077981387e-11,
+      -4.593747604531018e-11
+    ],
+    "kappa_16_50_84": [
+      3.3267832932892816e-13,
+      3.079758670310184e-13,
+      -1.4189760477734126e-12
+    ]
+  },
+  "posterior_total_variation_vs_reference": 7.892029377640626e-10,
+  "limitations": [
+    "One full default main fit/inference verified; not a new25mask/fivefoldcampaign",
+    "Original finiteMC/jet tails/rg conventions remain; numericalreproduction is not physicscertification",
+    "Wake and original publication layouts remain separate frozenfigure replay"
+  ]
+}

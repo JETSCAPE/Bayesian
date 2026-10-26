@@ -1,6 +1,16 @@
 # Hybrid Resolution-Length Review Bundle
 
-**Scope: frozen-result/figure replay; no refitting or event-level reproduction.**
+Two separate entry points serve different purposes:
+
+- **Fresh emulator training and inference:** see [TRAINING.md](TRAINING.md).
+  Starts from accepted prediction tables and their full measured simulation
+  covariance. Editable configurations select observables, training settings,
+  experimental correlations, and priors. No saved emulator or posterior is
+  an input to the fresh fit.
+- **Frozen-result/figure replay:** `reproduce.py`, documented below. This is
+  faster, but is not a test of training or inference.
+
+Neither workflow generates collision events.
 
 This example redraws all 18 figures currently referenced by the manuscript from
 JSON/NPZ numerical results. It does not copy manuscript PDFs, deserialize
@@ -9,7 +19,7 @@ events. Source PDFs are hashed during author export, never used as drawing input
 The original scientific values, posterior support, bands, bin edges, contour
 probabilities, and view ranges are retained. Exact PDF bytes are not a goal.
 
-## Reproduce
+## Replay Frozen Figures
 
 Use Python 3.12 and install this example's minimal `requirements.txt`, then set
 `PYTHONPATH="$REPO/src${PYTHONPATH:+:$PYTHONPATH}"` to expose this checkout's
@@ -137,14 +147,13 @@ has been assigned here; do not infer one from the historical directory name.
 
 **The first 134 `central_values` entries in this covariance archive are
 moment-derived means, not the old pinned table means accepted by the analysis.**
-For genuine refit scrutiny, `data_archive/accepted_observables.h5` is an additional
-small optional supporting archive: a byte-for-byte copy of the original frozen
+For genuine refitting, `data_archive/accepted_observables.h5` is a required
+small training input: a byte-for-byte copy of the original frozen
 `local_inference/results/main/analysis_raa_unit_Lres-E-loss/observables.h5`.
 It preserves accepted `Design`, `Design_indices`, `Prediction`, validation
 tables, and experimental inputs. Its original SHA and size are recorded as
-`external_accepted_tables` in the manifest. Reproduction never opens HDF5 and
-does not require h5py; this file is evidence for deeper review, not an active
-loader or a claim of an automated refit workflow.
+`external_accepted_tables` in the manifest. The frozen-figure replay does not
+open it. The fresh-training workflow does; see [TRAINING.md](TRAINING.md).
 
 Distribution is through **private manuscript-repository release assets only**,
 not a public code release. The manuscript repository remains code-free: attach

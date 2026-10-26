@@ -504,7 +504,8 @@ def render_figures(inference, output, *, ell=.2, holdout=None, selection=None):
             title = f"{experiment} {observable}, {parts[-1]}%" + (f", {radius}" if radius else "")
             window = next((token[2:] for token in parts[4].split("_") if token.startswith("pt")), "") if len(parts) > 4 else ""
             if window:
-                title += f", jet pT {window} GeV"
+                title += (f", jet pT {window} GeV" if "-" in window
+                          else f", pT slice {window}")
             xlabel = {"hadrons": r"$p_{\mathrm{T}}$ [GeV]", "jets": r"$p_{\mathrm{T}}$ [GeV]",
                       "theta_g": r"$\theta_{\mathrm{g}}$", "dR12": r"$dR_{12}$",
                       "rg": r"$r_{\mathrm{g}}$"}[kind]

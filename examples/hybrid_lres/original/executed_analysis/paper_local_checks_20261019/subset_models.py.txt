@@ -1,0 +1,499 @@
+"""Local selected-training adapter; staging never fits or changes frozen inputs.
+
+Only inclusive79/all138 are supported. These are fresh selected-bin kernel fits,
+not a physical correction, normalization change, or certification of the rg data.
+Full native plots are deferred: the legacy manager is not the frozen ell=.2
+manager. Numerical validation retains the original native implementation.
+"""
+from __future__ import annotations
+
+import argparse
+from copy import deepcopy
+from functools import partial
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+import numpy as np
+import yaml
+
+from audit_model_usage import assert_training_matches_likelihood, expected_features
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+FROZEN = WORK / 'atlas_rg_inference_20261015/recovery_20261016/precision_continuation/timeout_completion/local_inference'
+LEGACY = WORK / 'presentation_plots_20261014/low_pt_preparation'
+NATIVE = WORK / 'Bayesian-substructure-physical-prior-20260925/src'
+SUFFIX = 'analysis_raa_unit_Lres-E-loss'
+CASES = {'inclusive': 79, 'all': 138}
+FOLDS = (None, 0, 1, 2, 3, 4)
+TRAIN_IDS = [i for i in range(40) if i != 38]
+_STUDIES = {}
+
+
+def sha(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _verify(pins):
+    for path, digest in pins.items():
+        if sha(path) != digest:
+            raise ValueError('Changed pinned input: ' + path)
+
+
+def _label(fold):
+    if fold is not None and (type(fold) is not int or fold not in range(5)):
+        raise ValueError('fold must be None (main) or 0..4')
+    return 'main' if fold is None else f'fold_{fold}'
+
+
+def _folder(case, root=None):
+    if case not in CASES:
+        raise ValueError('Unknown selected-training case: ' + str(case))
+    base = Path(ROOT if root is None else root).resolve() / 'models'
+    folder = base / case
+    if folder.resolve() != folder or folder.is_relative_to(FROZEN.resolve()):
+        raise ValueError('Selected output must be a new nonsymlinked local directory')
+    return folder
+
+
+def _paths(folder, fold):
+    label = _label(fold)
+    output = folder / 'results/main'
+    if fold is not None:
+        output = output / 'cv' / label
+    return folder / 'configs' / (label + '.yaml'), output / SUFFIX / 'observables.h5'
+
+
+def _source_h5(fold):
+    return _paths(FROZEN, fold)[1]
+
+
+def _module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    value = importlib.util.module_from_spec(spec)
+    sys.modules[name] = value
+    spec.loader.exec_module(value)
+    return value
+
+
+def _native_study(case, folder):
+    # Isolate the study's mutable config/load globals from the nominal runner.
+    sys.path[:0] = [str(NATIVE), str(LEGACY)]
+    previous = sys.modules.get('run_checks')
+    if previous is not None and Path(previous.__file__).parent != WORK / 'emulator_qa_corrected_cov_20261012':
+        del sys.modules['run_checks']
+    try:
+        name = '_selected_native_' + case + '_' + hashlib.sha256(str(folder).encode()).hexdigest()[:12]
+        study = _module(name, LEGACY / 'run_low_pt_comparison.py')
+        completion = _module(name + '_completion', LEGACY / 'resume_low_pt_qa.py')
+    finally:
+        if previous is not None:
+            sys.modules['run_checks'] = previous
+    study.omitted_maps = completion.complete_omitted_maps
+    return study
+
+
+def _groups(cfg):
+    return cfg['analyses']['analysis_raa_unit']['parameters']['emulators']
+
+
+def _matches(pattern, name):
+    return name == pattern or name.startswith(pattern + '__')
+
+
+def bin_masks(raw, case):
+    reference = [(name, float(lo), float(hi)) for name, data in raw['Data'].items()
+                 for lo, hi in zip(data['xmin'], data['xmax'], strict=True)]
+    wanted = expected_features(reference, case)
+    if len(wanted) != CASES[case] or len(set(wanted)) != len(wanted):
+        raise ValueError('Frozen selected feature coverage changed')
+    selected = set(wanted)
+    masks = {name: np.array([(name, float(a), float(b)) in selected
+                            for a, b in zip(data['xmin'], data['xmax'], strict=True)])
+             for name, data in raw['Data'].items()}
+    return {name: mask for name, mask in masks.items() if mask.any()}
+
+
+def _slice_bins(value, mask):
+    if isinstance(value, dict):
+        return {key: _slice_bins(item, mask) for key, item in value.items()}
+    if isinstance(value, np.ndarray) and value.ndim and len(value) == len(mask):
+        return value[mask].copy()
+    return deepcopy(value)
+
+
+def filter_raw(raw, masks):
+    """Select bin axes only, preserving means, errors, metadata and design rows."""
+    result = deepcopy(raw)
+    for section in ('Data', 'Prediction', 'Prediction_validation'):
+        result[section] = {name: _slice_bins(raw[section][name], mask)
+                           for name, mask in masks.items()}
+    manager = result.get('correlation_manager', {})
+    for key in ('_observable_pt', 'observable_systematics'):
+        if key in manager:
+            manager[key] = {name: (_slice_bins(item, masks[name]) if key == '_observable_pt' else item)
+                            for name, item in manager[key].items() if name in masks}
+    return result
+
+
+def assert_payload_equal(actual, expected, path='raw'):
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict) or set(actual) - set(expected):
+            raise ValueError('Payload keys differ: ' + path)
+        for key, value in expected.items():
+            if value is None:
+                if actual.get(key) is not None:
+                    raise ValueError('Optional metadata differs: ' + path + '/' + key)
+            else:
+                assert_payload_equal(actual[key], value, path + '/' + key)
+    else:
+        np.testing.assert_array_equal(actual, expected, err_msg=path)
+        if isinstance(expected, np.ndarray):
+            if actual.dtype != expected.dtype or actual.shape != expected.shape:
+                raise ValueError('Array dtype/shape changed: ' + path)
+            if expected.dtype.kind not in 'OUS' and actual.tobytes() != expected.tobytes():
+                raise ValueError('Array bytes changed: ' + path)
+
+
+def selected_config(original, output, masks):
+    cfg = deepcopy(original)
+    cfg['output_dir'] = str(output)
+    selected = {}
+    covered = []
+    for name, group in _groups(cfg).items():
+        entries = [row for row in group['observable_list']
+                   if any(_matches(row['observable'], key) for key in masks)]
+        if not entries:
+            continue
+        group['observable_list'] = entries
+        noise = group['simulation_noise']
+        if noise['residual_white_noise'] or not noise['joint_groups'] or 'noise' in group['kernels']['active']:
+            raise ValueError('Expected measured joint noise and no active WhiteKernel')
+        covered.extend(key for key in masks if any(_matches(row['observable'], key) for row in entries))
+        selected[name] = group
+    if sorted(covered) != sorted(masks):
+        raise ValueError('Selected groups must cover each observable exactly once')
+    cfg['analyses']['analysis_raa_unit']['parameters']['emulators'] = selected
+    # No cut, prior, normalization, kernel, seed, PC or noise-path changes.
+    return cfg
+
+
+def _read(study, path):
+    return study.p.ref.s.data_IO.read_dict_from_h5(path.parent, path.name, verbose=False)
+
+
+def _features(raw, names):
+    return [(name, float(a), float(b)) for name in names
+            for a, b in zip(raw['Data'][name]['xmin'], raw['Data'][name]['xmax'], strict=True)]
+
+
+def feature_policy(study, cfg_path, raw, case):
+    s = study.p.ref.s
+    settings = s.analysis.AnalysisSettings.from_config_file('analysis_raa_unit', cfg_path, 'Lres-E-loss')
+    ec = s.emulation.EmulationConfig.from_config_file(settings)
+    features = _features(raw, s.data_IO.sorted_observable_list_from_dict(raw, ec.observable_filter))
+    reference = _features(raw, raw['Data'])
+    assert_training_matches_likelihood(features, expected_features(reference, case))
+    if len(features) != CASES[case] or set(raw['Data']) != {row[0] for row in features}:
+        raise ValueError('Selected training features do not match the likelihood')
+    grouped = []
+    for name, es in ec.emulation_settings.items():
+        rows = _features(raw, s.data_IO.sorted_observable_list_from_dict(raw, es.base_settings.observable_filter))
+        if es.n_pc > min(len(rows), len(raw['Design'])):
+            raise ValueError(f'{name}: original n_pc={es.n_pc} unavailable; refusing to reduce PC count')
+        grouped.extend(rows)
+    assert_training_matches_likelihood(grouped, features)
+    return settings, ec, features, grouped
+
+
+def _noise_metadata(noise, features, grouped, ids):
+    # Read identities, not the dense covariance. The unmodified native loader
+    # takes its principal marginal in both design and selected feature axes.
+    with np.load(noise, allow_pickle=False) as z:
+        source = list(zip(z['observable_names'].astype(str), z['xmin'], z['xmax'], strict=True))
+        design = z['design_ids'].tolist()
+    if len(set(source)) != len(source) or len(set(design)) != len(design):
+        raise ValueError('Duplicate dense-noise identities')
+    return dict(native_feature_indices=[source.index(row) for row in features],
+                grouped_feature_indices=[source.index(row) for row in grouped],
+                design_indices=[design.index(int(i)) for i in ids])
+
+
+def _source_pins(study):
+    manifest_path, staged_path = FROZEN / 'manifest.json', FROZEN / 'QA/staged.json'
+    manifest = json.loads(manifest_path.read_text())
+    staged = json.loads(staged_path.read_text())
+    if staged['manifest_sha256'] != sha(manifest_path):
+        raise ValueError('Frozen staging manifest mismatch')
+    pins = dict(manifest['input_sha256'])
+    pins.update(staged['h5_sha256'])
+    if set(staged['h5_sha256']) != {str(_source_h5(f)) for f in FOLDS}:
+        raise ValueError('Frozen main/fivefold HDF5 coverage mismatch')
+    _verify(pins)
+    paths = {Path(__file__), ROOT / 'audit_model_usage.py', manifest_path, staged_path,
+             FROZEN / 'QA/experimental_covariance.npz', *FROZEN.glob('configs/*.yaml'),
+             *FROZEN.glob('results/**/joint_fit.json'), *FROZEN.glob('results/**/emulator_*.pkl')}
+    # Pin the actually imported native implementation, including load and QA.
+    for module in list(sys.modules.values()):
+        file = getattr(module, '__file__', None)
+        if file and str(file).endswith('.py'):
+            path = Path(file).resolve()
+            if path.is_relative_to(WORK) and not path.is_relative_to(ROOT):
+                paths.add(path)
+    pins.update({str(path): sha(path) for path in paths})
+    return pins
+
+
+def _fixed_json(path, value):
+    if path.exists():
+        if json.loads(path.read_text()) != value:
+            raise ValueError('Receipt differs; refuse repinning: ' + str(path))
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('x') as stream:
+        json.dump(value, stream, indent=2, allow_nan=False)
+        stream.write('\n')
+
+
+def stage(case, *, root=None):
+    """Stage selected main + exact native fivefold inputs, without loading GPs."""
+    study = configure(case, root=root)
+    folder = study.ROOT
+    if (folder / 'STAGED.json').exists():
+        study.validate_staged()
+        return study
+    if folder.exists() and any(folder.iterdir()):
+        raise ValueError('Unreceipted selected output directory; inspect instead of adopting it')
+    pins = _source_pins(study)
+    original = yaml.safe_load((FROZEN / 'configs/main.yaml').read_text())
+    source = _read(study, _source_h5(None))
+    np.testing.assert_array_equal(source['Design_indices'], TRAIN_IDS)
+    np.testing.assert_array_equal(source['Design_indices_validation'], [38])
+    masks = bin_masks(source, case)
+    selected = filter_raw(source, masks)
+    fits = {}
+    split = dict(enumerate(study.p.ref.s.KFold(5, shuffle=True, random_state=20261007).split(source['Design'])))
+    for fold in FOLDS:
+        path, h5 = _paths(folder, fold)
+        source_cfg = yaml.safe_load(_paths(FROZEN, fold)[0].read_text())
+        normalized = deepcopy(source_cfg)
+        normalized['output_dir'] = original['output_dir']
+        if normalized != original:
+            raise ValueError('Frozen CV settings differ beyond output directory')
+        before = _read(study, _source_h5(fold))
+        expected = selected
+        if fold is not None:
+            train, test = split[fold]
+            assert_payload_equal(before, study.p.ref.s.cv_subset(source, train, test))
+            expected = study.p.ref.s.cv_subset(selected, train, test)
+        assert_payload_equal(filter_raw(before, masks), expected)
+        cfg = selected_config(source_cfg, h5.parent.parent, masks)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('x') as stream:
+            yaml.safe_dump(cfg, stream, sort_keys=False)
+        settings, ec, features, grouped = feature_policy(study, path, expected, case)
+        if settings.output_dir != h5.parent:
+            raise ValueError('Native output path escaped selected directory')
+        noise_paths = {group['simulation_noise']['covariance_file'] for group in _groups(cfg).values()}
+        if noise_paths != {str(study.NOISE)}:
+            raise ValueError('Noise must remain the original dense NPZ')
+        study.p.ref.s.data_IO.write_dict_to_h5(expected, h5.parent, h5.name, verbose=False)
+        assert_payload_equal(_read(study, h5), expected)
+        ids = np.r_[expected['Design_indices'], expected['Design_indices_validation']]
+        fits[_label(fold)] = dict(config_sha256=sha(path), h5_sha256=sha(h5),
+            training_ids=expected['Design_indices'].tolist(), target_ids=expected['Design_indices_validation'].tolist(),
+            features=[list(row) for row in features], grouped_features=[list(row) for row in grouped],
+            n_pc={name: es.n_pc for name, es in ec.emulation_settings.items()},
+            noise_mapping=_noise_metadata(study.NOISE, features, grouped, ids))
+    _verify(pins)
+    receipt = dict(status='STAGED_NOT_FITTED', case=case, source_sha256=pins, fits=fits,
+        training_only_selected_bins=True, fresh_native_PCA_and_kernel_fits=True,
+        covariance_policy='Principal marginal; never condition on excluded bins; original dense measured joint NPZ',
+        preserve_cross_bin_design_group_shared_pp_and_retained_omitted_noisy_target_blocks=True,
+        split_seed=20261007, GP_coordinates='unit square',
+        prior=original['analysis_base']['parameterization']['Lres-E-loss']['prior'],
+        full_native_plots='DEFERRED: legacy manager is not frozen Gaussian ell=.2 reindexed',
+        interpretation='Subsets only, not a physical correction; precision/normalization/rg edges unchanged')
+    _fixed_json(folder / 'STAGED.json', receipt)
+    study.validate_staged()
+    return study
+
+
+def validate_staged(study, case, fold=None):
+    path = study.ROOT / 'STAGED.json'
+    if not path.is_file():
+        raise ValueError('Missing selected STAGED receipt; stage before fit/load')
+    record = json.loads(path.read_text())
+    if record.get('status') != 'STAGED_NOT_FITTED' or record.get('case') != case or set(record['fits']) != {_label(f) for f in FOLDS}:
+        raise ValueError('Mismatched selected STAGED receipt')
+    required_sources = {Path(__file__), ROOT / 'audit_model_usage.py', study.NOISE,
+        FROZEN / 'manifest.json', FROZEN / 'QA/staged.json',
+        FROZEN / 'QA/experimental_covariance.npz', LEGACY / 'run_low_pt_comparison.py',
+        LEGACY / 'resume_low_pt_qa.py', *(_source_h5(f) for f in FOLDS),
+        *(_paths(FROZEN, f)[0] for f in FOLDS)}
+    if not {str(p) for p in required_sources} <= set(record.get('source_sha256', {})):
+        raise ValueError('Incomplete selected source pins')
+    if study.ROOT.resolve() != study.ROOT or any(p.is_symlink() for p in study.ROOT.rglob('*')):
+        raise ValueError('Symlinked selected output tree is forbidden')
+    _verify(record['source_sha256'])
+    for current in FOLDS:
+        cfg, h5 = _paths(study.ROOT, current)
+        row = record['fits'][_label(current)]
+        if sha(cfg) != row['config_sha256'] or sha(h5) != row['h5_sha256']:
+            raise ValueError('Changed selected config/HDF5: ' + _label(current))
+    raw = _read(study, _paths(study.ROOT, fold)[1])
+    settings, ec, features, grouped = feature_policy(study, _paths(study.ROOT, fold)[0], raw, case)
+    row = record['fits'][_label(fold)]
+    if row['features'] != [list(v) for v in features] or row['grouped_features'] != [list(v) for v in grouped]:
+        raise ValueError('Selected feature order changed')
+    np.testing.assert_array_equal(raw['Design_indices'], row['training_ids'])
+    np.testing.assert_array_equal(raw['Design_indices_validation'], row['target_ids'])
+    return record, settings, ec
+
+
+def frozen_ell_bank(bank):
+    """Exact ordered principal experimental covariance, not a rebuilt manager."""
+    with np.load(FROZEN / 'QA/experimental_covariance.npz', allow_pickle=False) as z:
+        reference = [(str(n), float(a), float(b)) for n, a, b in z['features']]
+        indices = [reference.index(tuple(row)) for row in bank['features']]
+        if len(reference) != 170 or len(set(indices)) != len(indices):
+            raise ValueError('Frozen experimental feature coverage changed')
+        covariance = z['covariance'][np.ix_(indices, indices)].copy()
+    return dict(bank, cov=covariance, full_native_plots_deferred=True)
+
+
+def _fit_files(study, settings, ec):
+    paths = [settings.output_dir / 'joint_fit.json']
+    paths.extend(study.p.ref.s.base.IO.output_filename(es, settings) for es in ec.emulation_settings.values())
+    for path in paths:
+        if path.resolve() != path or not path.is_relative_to(study.ROOT):
+            raise ValueError('Native fit path escaped selected root')
+    return paths
+
+
+def _check_fit_receipt(study, settings, ec):
+    path = settings.output_dir / 'SELECTED_FIT.json'
+    if not path.exists():
+        raise ValueError('Missing local selected-fit receipt; cannot adopt or relabel cached fits')
+    record = json.loads(path.read_text())
+    paths = _fit_files(study, settings, ec)
+    if record['staged_sha256'] != sha(study.ROOT / 'STAGED.json') or set(record['outputs']) != {str(p) for p in paths}:
+        raise ValueError('Mismatched selected-fit receipt')
+    _verify(record['outputs'])
+
+
+def _fit_entry(case, root, fold=None):
+    return configure(case, root=root)._fit_checked(fold)
+
+
+def configure(case, *, root=None):
+    """Return an isolated original study with checked local config/load hooks."""
+    folder = _folder(case, root)
+    key = (case, str(folder))
+    if key in _STUDIES:
+        return _STUDIES[key]
+    study = _native_study(case, folder)
+    study.ROOT = folder
+    original = yaml.safe_load((FROZEN / 'configs/main.yaml').read_text())
+    noise_paths = {row['simulation_noise']['covariance_file'] for row in _groups(original).values()}
+    if len(noise_paths) != 1:
+        raise ValueError('Frozen dense-noise path is not unique')
+    study.NOISE = Path(noise_paths.pop())
+    study.BASE_CONFIG = _paths(folder, None)[0]
+    study.config = lambda fold=None: _paths(folder, fold)[0]
+    study.validate_staged = lambda fold=None: validate_staged(study, case, fold)
+    study.ell_bank = frozen_ell_bank
+    study.check_inputs = study.validate_staged
+    native_load, native_fit = study.load, study.fit
+    study._native_fit = native_fit
+    fitting = set()
+
+    def load(fold=None, experimental=True):
+        _, settings, ec = study.validate_staged(fold)
+        if fold not in fitting:
+            _check_fit_receipt(study, settings, ec)
+        bank = native_load(fold, experimental=False)
+        row = study.validate_staged(fold)[0]['fits'][_label(fold)]
+        if [list(v) for v in bank['features']] != row['features']:
+            raise ValueError('Loaded model features are not the staged selection')
+        for model in bank['models'].values():
+            gp = model['joint_pc_gp'].joint
+            if model.get('mean_aware_training') != 'REML-constant-means-v1' or not isinstance(gp, study.RestrictedMeanGP):
+                raise ValueError('Expected native constant-mean-aware REML model')
+            if any(study.p.ref.s.sn.white_variance(kernel) != 0 for kernel in gp.kernels_):
+                raise ValueError('Fitted WhiteKernel is forbidden')
+        return study.ell_bank(bank) if experimental else bank
+
+    def fit_checked(fold=None):
+        _, settings, ec = study.validate_staged(fold)
+        paths = _fit_files(study, settings, ec)
+        exists = [path.exists() for path in paths]
+        if any(exists):
+            if not all(exists):
+                raise ValueError('Partial native fit; inspect without overwriting')
+            _check_fit_receipt(study, settings, ec)
+        elif (settings.output_dir / 'SELECTED_FIT.json').exists():
+            raise ValueError('Orphan selected-fit receipt')
+        fitting.add(fold)
+        try:
+            result = study._native_fit(fold)
+        finally:
+            fitting.remove(fold)
+        study.validate_staged(fold)
+        _fixed_json(settings.output_dir / 'SELECTED_FIT.json', dict(
+            staged_sha256=sha(folder / 'STAGED.json'), outputs={str(p): sha(p) for p in paths},
+            fresh_selected_native_fit=True, native_method_unchanged=True))
+        return result
+
+    study.load = load
+    study._fit_checked = fit_checked
+    # Picklable entry preserves the original fit_all(2) implementation and QA.
+    study.fit = partial(_fit_entry, case, str(Path(ROOT if root is None else root).resolve()))
+    _STUDIES[key] = study
+    return study
+
+
+def qa(study):
+    """Native numerical metrics only. Never fit missing models or render plots."""
+    banks = [study.load(fold, experimental=False) for fold in FOLDS]
+    folds = []
+    for fold in range(5):
+        with np.load(study.ROOT / 'QA' / f'fold_{fold}_predictions.npz') as z:
+            folds.append({key: z[key].copy() for key in z.files})
+    combined = {key: np.concatenate([row[key] for row in folds]) for key in folds[0]}
+    np.testing.assert_array_equal(sorted(combined['design_ids']), TRAIN_IDS)
+    with np.load(study.ROOT / 'QA/independent_validation.npz') as z:
+        independent = {key: z[key].copy() for key in z.files}
+    np.testing.assert_array_equal(independent['design_ids'], [38])
+    result = dict(status='NUMERICAL_QA_ONLY_NOT_CERTIFICATION',
+        fivefold=study.p.ref.s.metrics(banks[0], combined), independent=study.p.ref.s.metrics(banks[0], independent),
+        full_native_plots='DEFERRED: frozen Gaussian ell=.2 source manager not reindexed')
+    study.save(study.ROOT / 'QA/selected_numerical_qa.json', result)
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--case', choices=tuple(CASES), required=True)
+    parser.add_argument('--stage', choices=('stage', 'fit', 'qa'), required=True)
+    parser.add_argument('--fold', choices=('main', '0', '1', '2', '3', '4'), default='main')
+    args = parser.parse_args(argv)
+    if args.stage == 'stage':
+        stage(args.case)
+    else:
+        study = configure(args.case)
+        if args.stage == 'fit':
+            study.fit(None if args.fold == 'main' else int(args.fold))
+        else:
+            qa(study)
+
+
+if __name__ == '__main__':
+    main()

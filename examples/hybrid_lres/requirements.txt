@@ -1,0 +1,12 @@
+# Tested on Python 3.12. Pins keep scientific artist geometry reproducible.
+numpy==1.26.4
+scipy==1.17.1
+matplotlib==3.10.8
+PyMuPDF==1.28.2
+# Only needed for --verify-state / --verify-state-only and the native repo API.
+scikit-learn==1.8.0
+attrs==26.1.0
+PyYAML==6.0.3
+silx==2.2.2
+h5py==3.14.0
+pytest>=8,<9

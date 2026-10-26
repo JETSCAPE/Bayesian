@@ -1,0 +1,82 @@
+"""Complete unused CV coordinates only; preserve all fitted kernels/retained PCs."""
+import argparse
+import numpy as np
+from scipy.linalg import null_space
+
+import run_low_pt_comparison as study
+
+
+def complete_omitted_maps(config, models, group_indices, rotate=None):
+    """Invertible coordinates for folds with fewer designs than observable bins.
+
+    The new rows span only the unobserved PCA null space. They do not create
+    retained PCs or additional signal variance; native empirical R is unchanged.
+    """
+    f = config.sort_observables_in_matrix.shape[1]
+    projections, transfers = [], []
+    for name, settings in config.emulation_settings.items():
+        cached = models[name]['PCA']
+        pca, scaler = cached['pca'], cached['scaler']
+        idx = group_indices[name]
+        basis = pca.components_
+        if len(basis) < len(idx):
+            assert not pca.whiten, 'No arbitrary whitening of zero-variance directions'
+            missing = null_space(basis).T
+            if rotate is not None:
+                missing = rotate(len(missing)) @ missing
+            basis = np.vstack([basis, missing])
+            np.testing.assert_allclose(basis @ basis.T, np.eye(len(idx)), atol=1e-12)
+        components = basis[settings.n_pc:]
+        factors = np.sqrt(pca.explained_variance_[settings.n_pc:]) if pca.whiten else np.ones(len(components))
+        assert np.all(factors > 0)
+        forward, inverse = np.zeros((len(components), f)), np.zeros((len(components), f))
+        forward[:, idx] = components/scaler.scale_/factors[:, None]
+        inverse[:, idx] = components*scaler.scale_*factors[:, None]
+        projections.append(forward)
+        transfers.append(inverse)
+    return np.vstack(projections), np.vstack(transfers)
+
+
+def verify_completion():
+    study.p.ref.configure()
+    study.check_inputs()
+    s = study.p.ref.s
+    bank = study.p.ref.BASE_LOAD(study.config(0))
+    projection, transfer, center, residual, groups = s.jg.linear_maps(bank['ec'], bank['models'])
+    truth = s.data_IO.predictions_matrix_from_h5(bank['settings'].output_dir, 'observables.h5',
+        observable_filter=bank['ec'].observable_filter)
+    noise = s.sn.load_aligned_covariance(study.NOISE, bank['raw']['Design_indices'], bank['features'])
+    gp = next(iter(bank['models'].values()))['joint_pc_gp'].joint
+    rng = np.random.default_rng(20261015)
+    def rotation(n):
+        return np.linalg.qr(rng.normal(size=(n, n)))[0]
+    points = bank['raw']['Design_validation'][:2]
+    predictions = []
+    for rotate in (None, rotation):
+        u, v = complete_omitted_maps(bank['ec'], bank['models'], groups, rotate)
+        np.testing.assert_allclose(np.vstack([projection, u]) @ np.vstack([transfer, v]).T,
+                                   np.eye(len(center)), atol=1e-10)
+        model = study.FastMeanAware(gp, truth, projection, transfer, center, residual, u, v, noise)
+        predictions.append(model.predict(points))
+    for field in predictions[0]:
+        np.testing.assert_allclose(predictions[0][field], predictions[1][field], atol=2e-10, rtol=1e-8)
+    study.save(study.ROOT/'QA/null_basis_completion.json', dict(
+        reason='CV training designs fewer than hadron feature count', retained_PC_counts_unchanged=True,
+        fitted_kernels_unchanged=True, native_empirical_residual_unchanged=True,
+        inverse_identity_checked=True, null_basis_rotation_invariance_checked=True,
+        maximum_mean_rotation_error=float(abs(predictions[0]['central_value']-predictions[1]['central_value']).max()),
+        maximum_covariance_rotation_error=float(abs(predictions[0]['cov']-predictions[1]['cov']).max())))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--workers', type=int, default=3)
+    args = parser.parse_args()
+    verify_completion()
+    study.omitted_maps = complete_omitted_maps
+    study.fit_all(args.workers)
+    study.p.verify()
+
+
+if __name__ == '__main__':
+    main()

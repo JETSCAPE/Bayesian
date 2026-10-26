@@ -1,0 +1,5 @@
+data_archive/
+numerical_cache/
+slim_cache/
+rendered*/
+__pycache__/

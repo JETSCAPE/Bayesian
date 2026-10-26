@@ -1,0 +1,156 @@
+"""Inspect actual HDF5 training features and model receipts, without model loads."""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+import h5py
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+NOMINAL = WORK/'atlas_rg_inference_20261015/recovery_20261016/precision_continuation/timeout_completion/local_inference'
+SUFFIX = 'results/main/analysis_raa_unit_Lres-E-loss'
+
+
+def sha(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream,'sha256').hexdigest()
+
+
+def expected_features(reference, selection):
+    result=[]
+    for feature in reference:
+        name,low,_=feature
+        hadron='__hadron__' in name and low>=30
+        jets='__inclusive_jet__pt_' in name
+        theta='__tg_' in name
+        dr='__dr12_' in name
+        rg='__rg_' in name
+        inclusive=hadron or jets
+        inclusive_hpt10=('__hadron__' in name and low>=10) or jets
+        selected={'hadrons':hadron,'jets':jets,'inclusive':inclusive,
+            'inclusive_plus_theta_g':inclusive or theta,'inclusive_plus_dR12':inclusive or dr,
+            'inclusive_plus_rg':inclusive or rg,'all':inclusive or theta or dr or rg,
+            'inclusive_plus_theta_g_plus_dR12':inclusive or theta or dr,
+            'inclusive_plus_theta_g_plus_rg':inclusive or theta or rg,
+            'inclusive_plus_dR12_plus_rg':inclusive or dr or rg,
+            'inclusive_hpt10':inclusive_hpt10,
+            'all_hpt10':inclusive_hpt10 or theta or dr or rg,
+            'theta_g':theta,'dR12':dr,'rg':rg,'substructure':theta or dr or rg}[selection]
+        if selected:
+            result.append(tuple(feature))
+    return result
+
+
+def assert_training_matches_likelihood(training, likelihood):
+    """Check feature membership; covariance order is separately validated by its receipt."""
+    training,likelihood=list(map(tuple,training)),list(map(tuple,likelihood))
+    if (len(set(training))!=len(training) or len(set(likelihood))!=len(likelihood)
+            or set(training)!=set(likelihood)):
+        raise ValueError('Training features differ from likelihood selection; a larger shared model is not a subset-trained fit')
+
+
+def inspect(folder, expected, selection):
+    folder = Path(folder)
+    raw = folder/SUFFIX/'observables.h5'
+    fit = folder/SUFFIX/'joint_fit.json'
+    with h5py.File(raw) as archive:
+        features = [(name,float(lo),float(hi)) for name in archive['Data']
+                    for lo,hi in zip(archive['Data'][name]['xmin'],archive['Data'][name]['xmax'])]
+        ids = np.asarray(archive['Design_indices']).tolist()
+        holdout = np.asarray(archive['Design_indices_validation']).tolist()
+    report = json.loads(fit.read_text())
+    return dict(folder=str(folder),data_h5_sha256=sha(raw),fit_json_sha256=sha(fit),
+        fit_id=report.get('joint_fit_id',report.get('fit_id')),training_features=len(features),
+        fitted_PC_counts=report['n_pc'],
+        expected_fitted_features=expected,training_ids=ids,holdout_ids=holdout,
+        includes_low_pt_hadron_training=any('__hadron__' in n and a<30 for n,a,b in features),
+        expected_selection=selection,training_matches_fitted_bin_count=len(features)==expected,
+        features=[list(row) for row in features])
+
+
+def main():
+    rows = {}
+    for key,count in (('inclusive',79),('inclusive_plus_theta_g',87),('inclusive_plus_dR12',94),
+                       ('inclusive_plus_rg',115),('all',138),('hadrons',44),('jets',35),('substructure',59),
+                       ('theta_g',8),('dR12',15),('rg',36),
+                       ('inclusive_plus_theta_g_plus_dR12',102),
+                       ('inclusive_plus_theta_g_plus_rg',123),
+                       ('inclusive_plus_dR12_plus_rg',130),
+                       ('inclusive_hpt10',111),('all_hpt10',170)):
+        rows['current_paper_'+key] = inspect(NOMINAL,count,key)
+    for family,count in (('hadrons',44),('jets',35),('substructure',59),('all',138)):
+        for endpoint in (0,1):
+            folder = WORK/'wake_subset_training_20261018'/f'{family}_a{endpoint}'
+            if (folder/'REUSED.json').exists():
+                folder = Path(json.loads((folder/'REUSED.json').read_text())['source'])
+            rows[f'wake_{family}_a{endpoint}'] = inspect(folder,count,family)
+    for family,count in (('theta_g',8),('dR12',15),('rg',36)):
+        for endpoint in (0,1):
+            rows[f'wake_{family}_a{endpoint}'] = inspect(
+                WORK/'wake_individual_substructure_20261019'/f'{family}_a{endpoint}',count,family)
+    rows['nominal_existing_jets_39'] = inspect(WORK/'jet_only_retraining_20261018/old_39',35,'jets')
+    for family,count in (('inclusive',79),('inclusive_plus_theta_g',87),('inclusive_plus_dR12',94),
+                         ('inclusive_plus_rg',115),('all',138)):
+        row=inspect(WORK/'wake_subset_training_20261018/all_a0',count,family)
+        row['usage']='Headline pages1-4; smaller selections are auxiliary common-model uses, not own-subset fits'
+        row['posterior_artifact']=str(WORK/'headline_results_20261019/data/selection_scan.npz')
+        rows['headline_common_'+family]=row
+    for endpoint in (0,1):
+        for family,count in (('inclusive',79),('substructure',59),('all',138)):
+            row=inspect(WORK/f'wake_subset_training_20261018/all_a{endpoint}',count,family)
+            row['usage']='Auxiliary common-model conditional consistency calculation, not own-subset inference'
+            row['posterior_artifact']=str(WORK/f'wake_appendix_checks_20261019/consistency/a{endpoint}/results.npz')
+            rows[f'conditional_common_{family}_a{endpoint}']=row
+    polished=WORK/'wake_appendix_checks_20261019/optimizer/polished_gp.pkl'
+    rows['wake_jets_a1']['displayed_GP_override']=dict(
+        path=str(polished),sha256=sha(polished),
+        inference_receipt=str(WORK/'wake_appendix_checks_20261019/optimizer/inference/COMPLETE.json'),
+        inference_receipt_sha256=sha(WORK/'wake_appendix_checks_20261019/optimizer/inference/COMPLETE.json'),
+        note='D5 uses the reviewed polished jet-only GP, not the original fitted parameters; original fit ID alone is insufficient')
+    reference=rows['current_paper_all']['features']
+    for row in rows.values():
+        expected=expected_features(reference,row['expected_selection'])
+        assert len(expected)==row['expected_fitted_features']
+        try:
+            assert_training_matches_likelihood(row['features'],expected)
+        except ValueError:
+            row['exact_training_feature_membership_matches']=False
+        else:
+            row['exact_training_feature_membership_matches']=True
+    rendered = json.loads((WORK/'paper_figures_20261019/v2/RENDERED.json').read_text())
+    assert str(NOMINAL/'inference/grid.npz') in rendered['source_sha256']
+    result = dict(status='NOT_SEPARATE_EVERYWHERE_PRIMARY_PAPER_ROUTING_REQUIRES_CORRECTION',
+        source_sha256={str(Path(__file__)):sha(__file__),
+            str(WORK/'paper_figures_20261019/v2/RENDERED.json'):sha(WORK/'paper_figures_20261019/v2/RENDERED.json')},
+        rows=rows,primary_new_batch_started=False,
+        definition='Separate means selected-only PCA, selected-only mean/noise coordinates and a fresh joint GP fit on that subset; not merely per-observable PCA groups or a likelihood cut',
+        plan='Reuse actual matching subset fits. Prepare missing nominal subset fits from unchanged local raw tables/noise before scans. Keep common-model directional checks auxiliary and explicit.')
+    (ROOT/'MODEL_USAGE_AUDIT.json').write_text(json.dumps(result,indent=2)+'\n')
+    lines = ['SEPARATE EMULATOR USAGE AUDIT','==============================',
+        'Current main-paper N: NOT separately subset-trained. Its170 training bins',
+        'include32 low-pT hadron bins absent from the default138-bin likelihood.',
+        'Five likelihood selections in the PRL/PRD figures are NOT five GP fits.',
+        'The prior comparison is matched within that common model, but must be',
+        'regenerated after primary subset routing is corrected.',
+        '', 'Actual inspected training sets:']
+    for key,row in rows.items():
+        lines.append(f"{key}: {row['training_features']} trained / {row['expected_fitted_features']} fitted; "
+                     f"{len(row['training_ids'])} designs; exact feature match={row['exact_training_feature_membership_matches']}")
+    lines += ['', 'Equal bin counts alone are not a feature-identity or calibration proof.',
+        'The JSON records actual features/source hashes; subset staging must assert',
+        'exact trained-feature equality with the likelihood selection.',
+        'Headline full138 and N full170/hpt10 match membership; their smaller',
+        'likelihood selections do not. Common-model consistency is auxiliary.',
+        'D5 jet-a1 provenance includes its polished-model SHA, not only source fit ID.',
+        'No models/tables/priors/covariances/figures were modified by this audit.',
+        'New shared-model primary batch is held before launch. No cluster needed.']
+    (ROOT/'MODEL_USAGE_AUDIT.txt').write_text('\n'.join(lines)+'\n')
+    print('\n'.join(lines),flush=True)
+
+
+if __name__=='__main__':
+    main()

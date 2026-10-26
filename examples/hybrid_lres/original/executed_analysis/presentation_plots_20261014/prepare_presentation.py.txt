@@ -1,0 +1,259 @@
+"""Versioned presentation inputs; frozen mean-aware emulator, no refitting."""
+import argparse
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+import numpy as np
+import matplotlib as mpl
+from scipy.interpolate import RegularGridInterpolator
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+sys.path.insert(0, str(WORK/'emulator_mean_refit_20261013'))
+import run_refit as ref
+
+INPUT = ROOT/'inputs'
+PLOTS = ROOT/'plots'
+QA = ROOT/'QA'
+SOURCE = WORK/'emulator_mean_refit_20261013/results/mean_refit/inference'
+FOUR = ('raa_hpt30_full', 'inclusive_plus_only_alice_tg', 'raa_dr12', 'raa_theta_dr12')
+EXTRA = ('raa_diagonal', 'minus_atlas', 'minus_cms', 'minus_alice', 'hadron_only', 'jets_only')
+HAND = ((0., .404), (1., .434), (2., .447), (np.inf, .475))
+
+
+def digest(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def save(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2)+'\n')
+
+
+def module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    value = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(value)
+    return value
+
+
+def setup():
+    ref.configure()
+    ref.verify()
+    bank = ref.s.ell_bank(ref.load_bank())
+    for folder in (INPUT, PLOTS, QA):
+        folder.mkdir(parents=True, exist_ok=True)
+    protected = [WORK/'emulator_mean_refit_20261013/manifest.json',
+        ref.r.matched.COVARIANCE, SOURCE/'grid_refine0.npz', SOURCE/'summary.json',
+        *bank['settings'].output_dir.glob('emulator_*.pkl'),
+        *sorted((WORK/'slide_plots_20260924/plots').glob('*.*'))]
+    hashes = {str(path): digest(path) for path in protected if path.is_file()}
+    identity = next(iter(bank['models'].values()))['joint_group_fit_id']
+    record = dict(protected_sha256=hashes, fit_id=identity,
+        model='Actual constant-mean-aware REML kernel refit; full paired measured MC covariance; no WhiteKernel',
+        prior='Uniform physical pi*T*Lres [0,20], kappa_sc [.3,.6]',
+        GP_coordinates='Unit square', hadron_pt_min=30, experimental_ell=.2,
+        kernel_power=2, inference='Direct grid quadrature and native full Gaussian likelihood',
+        original_plot_directory=str(WORK/'slide_plots_20260924/plots'),
+        pending=['pT>10 versus pT>30: user deferred; corrected bank omits low-pT hadrons'],
+        limitations=['Independent posterior-local simulation validation is still in progress',
+            'Fixed generator cross sections; finite measured MC covariance precision',
+            'Empirical PCA basis and omitted-PC covariance; plug-in GP hyperparameters',
+            'Historical infinity parameter is a GP boundary prediction, not a validated infinity extraction'],
+        no_refit_or_original_output_modification=True)
+    path = ROOT/'manifest.json'
+    if path.exists():
+        assert json.loads(path.read_text()) == record, 'Changed inputs; do not reuse presentation caches'
+    else:
+        save(path, record)
+    return bank
+
+
+def verify():
+    record = json.loads((ROOT/'manifest.json').read_text())
+    for name, checksum in record['protected_sha256'].items():
+        assert digest(name) == checksum, 'Protected input changed: '+name
+    ref.verify()
+
+
+def helpers():
+    # Legacy imports set global rcParams; numerical helpers must not restyle plots.
+    with mpl.rc_context():
+        return ref.s.ref.scan.plotter_module()
+
+
+def selections(bank):
+    names = np.array([f[0] for f in bank['features']])
+    hadron = np.char.find(names, '__hadron__') >= 0
+    jet = np.char.find(names, '__inclusive_jet__pt_') >= 0
+    raa = hadron | jet
+    result = {key: value['indices'] for key, value in ref.s.build_cases(
+        bank['names'], np.asarray([f[1] for f in bank['features']])).items()}
+    result.update(raa_diagonal=np.flatnonzero(raa), hadron_only=np.flatnonzero(hadron),
+                  jets_only=np.flatnonzero(jet))
+    for collab in ('atlas', 'cms', 'alice'):
+        result['minus_'+collab] = np.flatnonzero(raa & (np.char.find(names, '_'+collab) < 0))
+    assert len(result['raa_hpt30_full']) == 79 and len(result['raa_theta_dr12']) == 102
+    assert all(f[1] >= 30 for f, keep in zip(bank['features'], hadron) if keep)
+    return result
+
+
+def experimental_covariance(bank, key):
+    return np.diag(np.diag(bank['cov'])) if key == 'raa_diagonal' else bank['cov']
+
+
+def numerical_inputs(bank):
+    target = INPUT/'posterior_grids.npz'
+    style = helpers()
+    with np.load(SOURCE/'grid_refine0.npz') as z:
+        q, k = z['q'].copy(), z['kappa'].copy()
+        source_ll = {key: z['loglike_'+key].copy() for key in FOUR}
+        source_means = z['prediction_mean'].copy()
+        source_variances = z['prediction_variance'].copy()
+    shape = (len(q), len(k))
+    points = ref.s.core.unit(*[x.ravel() for x in np.meshgrid(q, k, indexing='ij')])
+    indices = selections(bank)
+    identity = next(iter(bank['models'].values()))['joint_group_fit_id']
+    arrays = {key: np.full(len(points), np.nan) for key in EXTRA}
+    checkpoint = INPUT/'selection_likelihood_checkpoint.npz'
+    if checkpoint.exists():
+        with np.load(checkpoint) as z:
+            assert z['fit_id'].item() == identity
+            np.testing.assert_array_equal(z['q'], q)
+            np.testing.assert_array_equal(z['kappa'], k)
+            arrays = {key: z[key].copy() for key in EXTRA}
+    if not target.exists():
+        for start in range(0, len(points), 128):
+            stop = min(start+128, len(points))
+            if all(np.isfinite(a[start:stop]).all() for a in arrays.values()):
+                continue
+            prediction = ref.predict(bank, points[start:stop])
+            np.testing.assert_allclose(prediction['central_value'], source_means[start:stop], atol=1e-11)
+            np.testing.assert_allclose(np.diagonal(prediction['cov'], axis1=1, axis2=2),
+                                       source_variances[start:stop], atol=1e-11)
+            for key in EXTRA:
+                arrays[key][start:stop] = ref.s.core.likelihood(prediction, bank,
+                    experimental_covariance(bank, key), indices[key])
+            if start % 10240 == 0 or stop == len(points):
+                np.savez_compressed(checkpoint, q=q, kappa=k, fit_id=identity, **arrays)
+                print('SELECTION_GRID', stop, len(points), flush=True)
+        values = dict(q=q, kappa=k, fit_id=identity)
+        for key in FOUR+EXTRA:
+            ll = source_ll[key] if key in FOUR else arrays[key].reshape(shape)
+            values['loglike_'+key] = ll
+            values['mass_'+key] = style.posterior_mass(ll, q, k)[0]
+        np.savez_compressed(target, **values)
+    with np.load(target) as z:
+        values = {key: z[key].copy() for key in z.files}
+    summaries = {}
+    qcoarse, kcoarse = q[::2], k[::2]
+    qq, kk = np.meshgrid(q, k, indexing='ij')
+    weight = style.trapezoid_weights(q)[:, None]*style.trapezoid_weights(k)[None, :]
+    for key in FOUR+EXTRA:
+        ll = values['loglike_'+key]
+        mass, density = style.posterior_mass(ll, q, k)
+        _, coarse_density = style.posterior_mass(ll[::2, ::2], qcoarse, kcoarse)
+        interpolated = RegularGridInterpolator((qcoarse, kcoarse), coarse_density)(
+            np.column_stack((qq.ravel(), kk.ravel()))).reshape(shape)
+        interpolated /= np.sum(interpolated*weight)
+        tv = float(.5*np.sum(abs(density-interpolated)*weight))
+        assert tv < .02, (key, 'Grid needs refinement', tv)
+        peak = np.unravel_index(ll.argmax(), shape)
+        cells = list(dict.fromkeys([peak, (0, 0), (len(q)//2, len(k)//2), (len(q)-1, len(k)-1)]))
+        pred = ref.predict(bank, ref.s.core.unit([q[i] for i, j in cells], [k[j] for i, j in cells]))
+        ix = indices[key]
+        covariance = experimental_covariance(bank, key)[np.ix_(ix, ix)]
+        native = [ref.s.core.old.log_posterior._loglikelihood(
+            pred['central_value'][i, ix]-bank['exp']['y'][ix],
+            pred['cov'][i][np.ix_(ix, ix)]+covariance) for i in range(len(cells))]
+        np.testing.assert_allclose(native, [ll[cell] for cell in cells], atol=1e-8)
+        summaries[key] = dict(n_bins=len(ix), q_16_50_84=style.weighted_quantile(mass, q, 0),
+            kappa_16_50_84=style.weighted_quantile(mass, k, 1), coarse_fine_TV=tv,
+            native_error=float(max(abs(np.array(native)-[ll[cell] for cell in cells]))),
+            contour_masses=[float(mass[density >= level].sum()) for level in style.hpd_levels(mass, density)])
+    save(INPUT/'summary.json', summaries)
+    save(QA/'inference_checks.json', summaries)
+    print('INFERENCE_QA_COMPLETE', flush=True)
+
+
+def slice_and_hand_inputs(bank):
+    path = INPUT/'fixed_parameter_predictions.npz'
+    if path.exists():
+        return
+    k = np.linspace(.3, .6, 481)
+    indices = selections(bank)
+    predictions = []
+    conditional = {}
+    for q, historical_k in HAND:
+        u = 1. if np.isinf(q) else (2/np.pi)*np.arctan(np.cbrt(q))
+        point = np.array([[u, (historical_k-.3)/.3]])
+        predictions.append(ref.predict(bank, point))
+        points = np.column_stack((np.full(len(k), u), (k-.3)/.3))
+        result = ref.predict(bank, points)
+        label = 'infinity' if np.isinf(q) else str(int(q))
+        for key in ('raa_hpt30_full', 'raa_theta_dr12'):
+            conditional['loglike_'+key+'_'+label] = ref.s.core.likelihood(result, bank, bank['cov'], indices[key])
+    np.savez_compressed(path, kappa=k, physical_points=np.asarray(HAND),
+        prediction_mean=np.concatenate([p['central_value'] for p in predictions]),
+        prediction_covariance=np.concatenate([p['cov'] for p in predictions]), **conditional)
+    print('FIXED_PARAMETER_INPUTS_COMPLETE', flush=True)
+
+
+def prior_inputs(bank):
+    path = INPUT/'unit_prior.npz'
+    if path.exists():
+        return
+    # The square prior is integrated over its full, unbounded physical support.
+    u = (np.arange(321)+.5)/321
+    v = (np.arange(241)+.5)/241
+    uu, vv = np.meshgrid(u, v, indexing='ij')
+    points = np.column_stack((uu.ravel(), vv.ravel()))
+    idx = selections(bank)['raa_hpt30_full']
+    ll = np.full(len(points), np.nan)
+    checkpoint = INPUT/'unit_prior_checkpoint.npz'
+    if checkpoint.exists():
+        with np.load(checkpoint) as z:
+            np.testing.assert_array_equal(z['u'], u)
+            np.testing.assert_array_equal(z['v'], v)
+            ll = z['loglike'].copy()
+    for start in range(0, len(points), 128):
+        stop = min(start+128, len(points))
+        if np.isfinite(ll[start:stop]).all():
+            continue
+        pred = ref.predict(bank, points[start:stop])
+        ll[start:stop] = ref.s.core.likelihood(pred, bank, bank['cov'], idx)
+        if start % 10240 == 0 or stop == len(points):
+            np.savez_compressed(checkpoint, u=u, v=v, loglike=ll)
+            print('UNIT_PRIOR_GRID', stop, len(points), flush=True)
+    ll = ll.reshape(uu.shape)
+    mass = np.exp(ll-ll.max())
+    mass /= mass.sum()
+    q = np.tan(.5*np.pi*u)**3
+    tail = float(mass[q > 20].sum())
+    np.savez_compressed(path, u=u, v=v, physical_q=q, loglike=ll, mass=mass,
+                        posterior_mass_above_20=tail)
+    save(QA/'prior_checks.json', dict(full_support_square_prior=True,
+        integration='321x241 midpoint unit-square quadrature; explicit unbounded physical transform',
+        prior_mass_above_20=float(1-(2/np.pi)*np.arctan(np.cbrt(20))),
+        posterior_mass_above_20=tail,
+        display='Physical finite-bin densities on [0,20], conditioned on displayed range; exact prior bin probabilities'))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--stage', choices=('selections', 'prior', 'fixed', 'all'), default='all')
+    args = parser.parse_args()
+    bank = setup()
+    for stage, function in (('selections', numerical_inputs), ('fixed', slice_and_hand_inputs), ('prior', prior_inputs)):
+        if args.stage in ('all', stage):
+            function(bank)
+            verify()
+    print('PRESENTATION_INPUTS_COMPLETE', args.stage, flush=True)
+
+
+if __name__ == '__main__':
+    main()

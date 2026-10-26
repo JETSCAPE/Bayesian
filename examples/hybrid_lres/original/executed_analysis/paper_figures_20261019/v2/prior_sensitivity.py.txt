@@ -1,0 +1,239 @@
+"""Matched prior-only quadrature; read frozen fits and never refit or alter them."""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+import numpy as np
+from scipy.interpolate import RegularGridInterpolator
+
+HERE = Path(__file__).resolve().parent
+WORK = HERE.parents[1]
+NOMINAL = WORK/'atlas_rg_inference_20261015/recovery_20261016/precision_continuation/timeout_completion/local_inference'
+OUT = HERE/'prior_sensitivity'
+PREFIX = 'hpt30_hadron_RAA_plus_jet_RAA'
+CASES = {'inclusive': PREFIX, 'all': PREFIX+'_plus_theta_g_plus_dR12_plus_rg'}
+
+
+def digest(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def weights(x):
+    x = np.asarray(x)
+    assert np.all(np.diff(x) > 0)
+    return np.r_[np.diff(x)[0], x[2:]-x[:-2], np.diff(x)[-1]]/2
+
+
+def unit(q):
+    return (2/np.pi)*np.arctan(np.cbrt(q))
+
+
+def physical(u):
+    u = np.asarray(u)
+    q = np.tan(.5*np.pi*u)**3
+    return np.where(u == 1, np.inf, q)
+
+
+def mass(loglike, x, kappa):
+    value = np.exp(loglike-np.max(loglike))*weights(x)[:, None]*weights(kappa)[None, :]
+    return value/value.sum()
+
+
+def quantiles(value, x, axis):
+    marginal = value.sum(axis=1-axis)
+    cdf = (np.cumsum(marginal)-.5*marginal)/marginal.sum()
+    return np.interp([.16, .5, .84], cdf, x).tolist()
+
+
+def combine(q, kappa, interior, tail_u, tail):
+    u = np.r_[unit(q), tail_u[1:]]
+    likelihood = np.vstack([interior, tail[1:]])
+    full = mass(likelihood, u, kappa)
+    conditional = mass(interior, unit(q), kappa)
+    physical_mass = mass(interior, q, kappa)
+    # Likelihood interpolation is used only for the coarse/fine quadrature check.
+    coarse_u, coarse_k = u[::2], kappa[::2]
+    if coarse_u[-1] != 1:
+        coarse_u = np.r_[coarse_u, 1.]
+    coarse_ll = RegularGridInterpolator((u, kappa), likelihood)(
+        np.stack(np.meshgrid(coarse_u, coarse_k, indexing='ij'), axis=-1))
+    coarse_density = mass(coarse_ll, coarse_u, coarse_k)/(
+        weights(coarse_u)[:, None]*weights(coarse_k)[None, :])
+    interpolated = RegularGridInterpolator((coarse_u, coarse_k), coarse_density)(
+        np.stack(np.meshgrid(u, kappa, indexing='ij'), axis=-1))
+    interpolated *= weights(u)[:, None]*weights(kappa)[None, :]
+    interpolated /= interpolated.sum()
+    tv = float(.5*np.abs(full-interpolated).sum())
+    # Split the trapezoid at exactly q=20; do not classify a boundary cell twice.
+    offset = float(likelihood.max())
+    inside_evidence = float(np.sum(np.exp(interior-offset)*weights(unit(q))[:, None]
+                                   *weights(kappa)[None, :]))
+    tail_evidence = float(np.sum(np.exp(tail-offset)*weights(tail_u)[:, None]
+                                 *weights(kappa)[None, :]))
+    total_evidence = inside_evidence+tail_evidence
+    np.testing.assert_allclose(full.sum(), 1., atol=1e-14)
+    rows = {}
+    for name, values, xx in (
+            ('physical', physical_mass, q), ('square', full, u),
+            ('square_same_support', conditional, unit(q))):
+        qs = quantiles(values, xx, 0)
+        rows[name] = dict(pi_T_Lres_16_50_84=qs if name == 'physical' else physical(qs).tolist(),
+                          kappa_16_50_84=quantiles(values, kappa, 1))
+    rows['square']['posterior_mass_above_20'] = tail_evidence/total_evidence
+    rows['square']['coarse_fine_TV_in_unit_coordinates'] = tv
+    positive_q = q[1:]
+    jacobian = (2/(3*np.pi))*positive_q**(-2/3)/(1+positive_q**(2/3))
+    square_q_density = (np.exp(interior[1:]-offset) @ weights(kappa))*jacobian/total_evidence
+    return dict(u=u, loglike=likelihood, square_mass=full,
+                physical_mass=physical_mass, square_same_support_mass=conditional,
+                square_q_density=square_q_density), rows
+
+
+def load_frozen():
+    sys.path.insert(0, str(WORK/'atlas_rg_inference_20261015/reduced'))
+    import run_inference as run
+    run.ROOT = NOMINAL
+    run.NOISE = NOMINAL.parent/'export/full_simulation_covariance_rg.npz'
+    run.TABLES = NOMINAL/'tables'
+    run.configure()
+    run.check_inputs()
+    bank = run.study.load()
+    with np.load(NOMINAL/'QA/experimental_covariance.npz') as source:
+        np.testing.assert_array_equal(bank['cov'], source['covariance'])
+    identity = next(iter(bank['models'].values()))['joint_group_fit_id']
+    complete = json.loads((NOMINAL/'inference/COMPLETE.json').read_text())
+    assert identity == complete['fit_id']
+    for path, expected in complete['output_sha256'].items():
+        assert digest(path) == expected
+    return run, bank, identity
+
+
+def refresh_summary():
+    """Apply the native percentile convention to saved masses, not new GP calls."""
+    marker = OUT/'COMPLETE.json'
+    previous = OUT/'COMPLETE_before_percentile_fix.json'
+    receipt = json.loads(previous.read_text())
+    preserved_source = OUT/'calculator_before_percentile_fix.py'
+    assert digest(preserved_source) == receipt['source_sha256'][str(Path(__file__))]
+    for path, expected in receipt['source_sha256'].items():
+        if path != str(Path(__file__)):
+            assert digest(path) == expected, path
+    assert digest(OUT/'inputs.npz') == receipt['output_sha256']
+    nominal_summary = json.loads((NOMINAL/'inference/summary.json').read_text())
+    with np.load(OUT/'inputs.npz') as source:
+        q, kappa = source['q'], source['kappa']
+        for name, key in CASES.items():
+            for prior, coordinate in (('physical', q), ('square', source[name+'_u']),
+                                       ('square_same_support', unit(q))):
+                values = source[name+'_'+prior+'_mass']
+                qs = quantiles(values, coordinate, 0)
+                row = receipt['summary'][name][prior]
+                row['pi_T_Lres_16_50_84'] = qs if prior == 'physical' else physical(qs).tolist()
+                row['kappa_16_50_84'] = quantiles(values, kappa, 1)
+            for field, native_field in (('pi_T_Lres_16_50_84', 'physical_pi_T_Lres_16_50_84'),
+                                        ('kappa_16_50_84', 'kappa_16_50_84')):
+                np.testing.assert_allclose(receipt['summary'][name]['physical'][field],
+                                           nominal_summary[key][native_field], atol=1e-12, rtol=0)
+    receipt['native_likelihood_calculator_sha256'] = digest(preserved_source)
+    receipt['percentile_convention'] = 'Native centered CDF: (cumsum(marginal)-0.5*marginal)/sum(marginal)'
+    for path in (Path(__file__), preserved_source, previous, NOMINAL/'inference/summary.json'):
+        receipt['source_sha256'][str(path)] = digest(path)
+    marker.write_text(json.dumps(receipt, indent=2)+'\n')
+    print('PRIOR_PERCENTILES_MATCH_NATIVE', json.dumps(receipt['summary']), flush=True)
+
+
+def main():
+    OUT.mkdir(exist_ok=True)
+    if (OUT/'COMPLETE.json').exists():
+        receipt = json.loads((OUT/'COMPLETE.json').read_text())
+        for path, expected in receipt['source_sha256'].items():
+            assert digest(path) == expected, path
+        assert digest(OUT/'inputs.npz') == receipt['output_sha256']
+        print('MATCHED_PRIOR_COMPARISON_ALREADY_COMPLETE', flush=True)
+        return
+    run, bank, identity = load_frozen()
+    protected = [NOMINAL/'inference/grid.npz', NOMINAL/'inference/COMPLETE.json',
+                 NOMINAL/'manifest.json', NOMINAL/'QA/PROVENANCE_ERRATUM.json',
+                 NOMINAL/'configs/main.yaml', NOMINAL/'QA/experimental_covariance.npz',
+                 *bank['settings'].output_dir.glob('emulator_*.pkl'), Path(__file__)]
+    pins = {str(path): digest(path) for path in protected}
+    with np.load(NOMINAL/'inference/grid.npz') as source:
+        q, kappa = source['q'].copy(), source['kappa'].copy()
+        interior = {name: source['loglike_'+key].copy() for name, key in CASES.items()}
+        old_mass = {name: source['mass_'+key].copy() for name, key in CASES.items()}
+    indices = run.comparison_indices(bank['features'])
+    # Verify the loaded native model at saved cells before extending support.
+    cells = [(0, 0), (len(q)//2, len(kappa)//2), (len(q)-1, len(kappa)-1)]
+    cells += [np.unravel_index(ll.argmax(), ll.shape) for ll in interior.values()]
+    points = np.array([[unit(q[i]), (kappa[j]-.3)/.3] for i, j in cells])
+    prediction = bank['mean_model'].predict(points)
+    native_errors = {}
+    for name, key in CASES.items():
+        actual = run.study.p.ref.s.core.likelihood(prediction, bank, bank['cov'], indices[key])
+        expected = np.array([interior[name][cell] for cell in cells])
+        np.testing.assert_allclose(actual, expected, atol=1e-8, rtol=0)
+        native_errors[name] = float(np.max(np.abs(actual-expected)))
+    # Only the missing tail needs emulator evaluation. u=1 is a finite GP input,
+    # representing the infinite-resolution boundary, not an infinity simulation.
+    tail_u = np.linspace(unit(20.), 1., 65)
+    uu, kk = np.meshgrid(tail_u, kappa, indexing='ij')
+    points = np.column_stack([uu.ravel(), (kk.ravel()-.3)/.3])
+    tail = {name: np.full(len(points), np.nan) for name in CASES}
+    checkpoint = OUT/'tail_checkpoint.npz'
+    if checkpoint.exists():
+        with np.load(checkpoint) as source:
+            assert source['fit_id'].item() == identity
+            np.testing.assert_array_equal(source['u'], tail_u)
+            np.testing.assert_array_equal(source['kappa'], kappa)
+            for name in CASES:
+                tail[name] = source['loglike_'+name].copy()
+    for start in range(0, len(points), 128):
+        stop = min(start+128, len(points))
+        if all(np.isfinite(values[start:stop]).all() for values in tail.values()):
+            continue
+        prediction = bank['mean_model'].predict(points[start:stop])
+        for name, key in CASES.items():
+            tail[name][start:stop] = run.study.p.ref.s.core.likelihood(
+                prediction, bank, bank['cov'], indices[key])
+        if start % 2048 == 0 or stop == len(points):
+            np.savez_compressed(checkpoint, u=tail_u, kappa=kappa, fit_id=identity,
+                                **{'loglike_'+key: value for key, value in tail.items()})
+            print('SQUARE_PRIOR_MISSING_TAIL', stop, len(points), flush=True)
+    arrays = dict(q=q, kappa=kappa, tail_u=tail_u, fit_id=identity)
+    summary = {}
+    for name in CASES:
+        ll = tail[name].reshape(uu.shape)
+        np.testing.assert_allclose(ll[0], interior[name][-1], atol=1e-8, rtol=0)
+        values, rows = combine(q, kappa, interior[name], tail_u, ll)
+        np.testing.assert_allclose(values['physical_mass'], old_mass[name], atol=2e-14, rtol=1e-12)
+        assert rows['square']['coarse_fine_TV_in_unit_coordinates'] < .02, rows
+        arrays.update({name+'_'+key: value for key, value in values.items()})
+        summary[name] = rows
+    np.savez_compressed(OUT/'inputs.npz', **arrays)
+    for path, expected in pins.items():
+        assert digest(path) == expected, path
+    receipt = dict(fit_id=identity, source_sha256=pins, output_sha256=digest(OUT/'inputs.npz'),
+        method='Same frozen likelihood and joint emulator; native tail quadrature, no fitting or sampling',
+        fixed=dict(hadron_pt_min=30, experimental_ell=.2, kernel_power=2, kappa=[.3,.6]),
+        prior_support=dict(physical=[0,20], unit_square=[0,1],
+                           square_conditioned_to_same_physical_support=[0,20]),
+        unit_square_prior_mass_above_20=float(1-unit(20.)),
+        native_cached_likelihood_max_errors=native_errors, summary=summary,
+        caveats=['Unbounded square prior uses GP extrapolation and the u_L=1 boundary, not validated infinite-resolution simulations',
+                 'Existing nominal emulator, rg definition, finite-MC and covariance qualifications remain',
+                 'Full-square density is not renormalized to the displayed physical range'])
+    (OUT/'COMPLETE.json').write_text(json.dumps(receipt, indent=2)+'\n')
+    print('MATCHED_PRIOR_COMPARISON_COMPLETE', json.dumps(summary), flush=True)
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] == ['--refresh-summary']:
+        refresh_summary()
+    elif not sys.argv[1:]:
+        main()
+    else:
+        raise SystemExit('Use no arguments, or --refresh-summary for the saved-mass summary correction')

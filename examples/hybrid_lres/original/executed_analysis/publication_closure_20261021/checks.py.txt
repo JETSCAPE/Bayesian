@@ -1,0 +1,263 @@
+"""Two bounded, read-only scientific checks; no fitting or cluster entry point."""
+from pathlib import Path
+import argparse
+import hashlib
+import json
+import sys
+
+import numpy as np
+from scipy.linalg import solve_triangular
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+QUEUE = WORK / 'paper_local_checks_20261019/queue'
+RG = WORK / 'atlas_rg_inference_20261015/recovery_20261016/precision_continuation/timeout_completion'
+VALIDATION = WORK / 'cluster-access/posterior-local-validation-20261013/validation_100k/comparison.npz'
+sys.path.insert(0, str(WORK / 'paper_local_checks_20261019'))
+sys.path.insert(0, str(WORK / 'atlas_rg_inference_20261015/reduced'))
+
+
+def read(path):
+    return json.loads(Path(path).read_text())
+
+
+def sha(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def save(path, value):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + '\n')
+
+
+def arrays(path):
+    with np.load(path, allow_pickle=False) as z:
+        return {key: z[key].copy() for key in z.files}
+
+
+def features(z):
+    if 'features' in z:
+        return [(str(n), float(a), float(b)) for n, a, b in z['features']]
+    return list(zip(z['observable_names'].astype(str), z['xmin'], z['xmax']))
+
+
+def pp_moments():
+    from export_reduced_bank import native_spectrum_map, _rg_info, fine_to_coarse_map
+    reference = read(RG / 'download/FULL_REFERENCE.json')
+    totals = {}
+    for folder in sorted((RG / 'download/batches').glob('pp_*')):
+        meta = read(folder / 'CHECKPOINT.json')
+        assert sha(folder / 'checkpoint.npz') == meta['checkpoint_sha256']
+        for key, value in arrays(folder / 'checkpoint.npz').items():
+            totals[key] = totals.get(key, 0) + value
+    bank = arrays(RG / 'export/full_simulation_covariance_rg.npz')
+    edges = bank['fine_edges']
+    transform = fine_to_coarse_map(edges, np.r_[0., edges[2:]])
+    old = native_spectrum_map()([reference['pp'][0]])
+    new = native_spectrum_map()([_rg_info(reference['pp'][0], edges)])
+    jo = old.jacobian(totals['old_total'].ravel())
+    jn = transform @ new.jacobian(totals['new_total'].ravel())
+    cross = jo @ totals['old_old'] @ jo.T
+    both = jo @ totals['old_new'] @ jn.T
+    cpp = np.block([[cross, both], [both.T, jn @ totals['new_new'] @ jn.T]])
+    pp = np.r_[old(totals['old_total'].ravel()), transform @ new(totals['new_total'].ravel())]
+    return pp, cpp, totals, reference, bank
+
+
+def partial_prediction(model, points, ix, cross_noise, target_noise):
+    """Exact native mean-aware prediction for only measured target outputs.
+
+    Other target observables need not be invented. All training observables,
+    retained/omitted coordinates and shared-pp test/train blocks remain present.
+    """
+    points, ix = np.asarray(points), np.asarray(ix)
+    m, g, n, p = len(points), len(ix), model.n, model.p
+    kernels = np.array([k(points, model.gp.X_train_) for k in model.gp.kernels_])
+    transfer = model.transfer[:, ix]
+    cross = np.zeros((m, g, p*n + model.o))
+    cross[:, :, :p*n] = np.einsum('pa,pmn->mapn', transfer, kernels).reshape(m, g, p*n)
+    cross[:, :, :p*n] += np.einsum('iajb,pb->iapj', cross_noise, model.projection).reshape(m, g, p*n)
+    cross[:, :, p*n:] += np.einsum('iab,pb->iap', cross_noise.mean(axis=2), model.omitted_projection)
+    prior = np.einsum('pa,mp,pb->mab', transfer,
+        np.column_stack([k.diag(points) for k in model.gp.kernels_]), transfer)
+    prior += model.residual[np.ix_(ix, ix)]
+    prior += target_noise
+    mean = model.center[ix] + (model.beta @ model.inverse)[ix] + (cross @ model.alpha)
+    solved = solve_triangular(model.L, cross.reshape(m*g, -1).T, lower=True, check_finite=False)
+    known = prior - np.einsum('ima,imb->mab', solved.reshape(-1, m, g), solved.reshape(-1, m, g))
+    correction = model.inverse.T[ix][None] - cross @ model.SinvH
+    cov = known + np.einsum('mai,ij,mbj->mab', correction, model.mean_covariance, correction)
+    cov = (cov + cov.swapaxes(1, 2))/2
+    assert np.linalg.eigvalsh(cov).min() > -1e-10
+    return mean, cov
+
+
+def shifted_likelihood(prediction, covariance, data, patterns):
+    total = prediction['cov'] + covariance
+    chol = np.linalg.cholesky(total)
+    residual = data - prediction['central_value']
+    result = np.empty((len(residual), 1 + 2*len(patterns)))
+    for i, factor in enumerate(chol):
+        white = solve_triangular(factor, np.column_stack([residual[i], patterns.T]), lower=True,
+                                 check_finite=False)
+        base = -.5*(white[:, 0] @ white[:, 0] + 2*np.log(factor.diagonal()).sum())
+        slope = white[:, 1:].T @ white[:, 0]
+        norm = np.sum(white[:, 1:]**2, axis=0)
+        result[i] = np.r_[base, base + slope - .5*norm, base - slope - .5*norm]
+    return result
+
+
+def definitions():
+    pp, cpp, pools, reference, bank = pp_moments()
+    from export_reduced_bank import native_spectrum_map, _rg_info, fine_to_coarse_map
+    edges = bank['fine_edges']
+    zero = fine_to_coarse_map(edges, np.r_[0., edges[2:]])
+    cut = fine_to_coarse_map(edges, edges[1:])
+    new = native_spectrum_map()([_rg_info(reference['pp'][0], edges)])
+    raw_pp = new(pools['new_total'].ravel())
+    aa = []
+    for tag in ('aa05', 'aa510'):
+        total = sum(arrays(folder / 'checkpoint.npz')['new_total']
+                    for folder in (RG / 'download/batches').glob(tag + '_*'))
+        aa.append(total.reshape(40, -1))
+    baseline, alternative = [], []
+    for i in range(40):
+        mapper = native_spectrum_map()([_rg_info(reference[tag][i], edges) for tag in ('aa05', 'aa510')])
+        raw = mapper(np.r_[aa[0][i], aa[1][i]])
+        baseline.append((zero @ raw)/(zero @ raw_pp))
+        alternative.append((cut @ raw)/(cut @ raw_pp))
+    baseline, alternative = np.array(baseline), np.array(alternative)
+    np.testing.assert_allclose(baseline, bank['central_values'][:, 134:], rtol=1e-12, atol=1e-13)
+    rest = np.setdiff1d(np.arange(36), [0, 12, 24])
+    np.testing.assert_array_equal(baseline[:, rest], alternative[:, rest])
+    controls = {}
+    for case in ('all', 'all_without_first_rg', 'all_without_first_dR12', 'all_without_first_rg_and_dR12'):
+        controls[case] = read(QUEUE / f'results/{case}/inference/summary.json')['cases']['ell_0p2']
+        controls[case] = {k: controls[case][k] for k in ('physical_pi_T_Lres_16_50_84', 'kappa_16_50_84', 'coarse_fine_TV')}
+    np.savez_compressed(ROOT / 'definition_bins.npz', baseline=baseline, alternate_003=alternative,
+                        first_bins=[0, 12, 24], design_ids=bank['design_ids'])
+    save(ROOT / 'definitions.json', dict(controls=controls,
+        first_bin_alternate_relative_range=(alternative[:, [0,12,24]]/baseline[:, [0,12,24]]-1).ravel()[
+            [np.argmin(alternative[:, [0,12,24]]/baseline[:, [0,12,24]]-1),
+             np.argmax(alternative[:, [0,12,24]]/baseline[:, [0,12,24]]-1)]].tolist(),
+        unchanged_other_bins=33, mean_reproduction_max_error=float(np.max(abs(baseline-bank['central_values'][:,134:]))),
+        particle_definition='Confirmed legacy pi0/lifetime mismatch; absent ancestry prevents exact local restoration. No arbitrary decay correction adopted.',
+        centrality='dR12 separately normalized 50:50, rg legacy pooled. Matching generator geometry weights are not recorded in these summaries; do not invent or double-count TAA.',
+        conclusion='Existing own-trained first-bin leaveouts test inference dependence; they do not certify particle-definition equivalence.'))
+    print('DEFINITION_CHECK_COMPLETE', flush=True)
+
+
+def impact(case):
+    import queue_models as api
+    import remaining_inference as infer
+    bank = api.load_bank(case, experimental=False)
+    identity = api.model_identity(case)
+    model = bank['mean_model']
+    own = list(map(tuple, bank['features']))
+    covariance_cache = arrays(QUEUE / 'covariances.npz')
+    full_features = features(covariance_cache)
+    selected = [full_features.index(row) for row in own]
+    covariance = covariance_cache['covariance_ell_0p2'][np.ix_(selected, selected)]
+    validation = arrays(VALIDATION)
+    vf = features(validation)
+    jets = [i for i, row in enumerate(own) if '__inclusive_jet__pt_' in row[0]]
+    assert len(jets) == 35
+    source = [vf.index(own[i]) for i in jets]
+    pp, cpp, _, _, noise_bank = pp_moments()
+    nf = features(noise_bank)
+    positions = [nf.index(row) for row in own]
+    train = [noise_bank['design_ids'].tolist().index(int(i)) for i in bank['raw']['Design_indices']]
+    all_noise = noise_bank['covariance'][train][:, positions][:, :, train][:, :, :, positions]
+    if hasattr(model, 'noise'):
+        np.testing.assert_array_equal(model.noise, all_noise)
+    else:
+        p,n=model.p,model.n
+        rr=np.einsum('pa,iajb,qb->piqj',model.projection,all_noise,model.projection,optimize=True).reshape(p*n,p*n)
+        ro=np.einsum('pa,iajb,qb->piq',model.projection,all_noise/n,model.omitted_projection,optimize=True).reshape(p*n,model.o)
+        oo=model.omitted_projection@all_noise.mean(axis=(0,2))@model.omitted_projection.T
+        cached=arrays(bank['settings'].output_dir/'projected_noise.npz')['training']
+        np.testing.assert_allclose(np.block([[rr,ro],[ro.T,oo]]),cached,rtol=1e-10,atol=1e-12)
+    target_positions = [positions[i] for i in jets]
+    np.testing.assert_allclose(pp[target_positions], validation['pp'][source], rtol=1e-12)
+    np.testing.assert_allclose(cpp[np.ix_(target_positions, target_positions)],
+                               validation['pp_covariance'][np.ix_(source, source)], rtol=1e-10, atol=1e-13)
+    truth = validation['truth'][:, source]
+    old = noise_bank['central_values'][np.ix_(train, positions)]
+    cross_noise = np.einsum('ia,ab,jb->iajb', truth/pp[target_positions],
+        cpp[np.ix_(target_positions, positions)], old/pp[positions])
+    f = len(vf)
+    target_noise = np.stack([validation['mc_covariance'][np.ix_(i*f+np.array(source), i*f+np.array(source))]
+                             for i in range(2)])
+    points = validation['unit_points']
+    noisy_mean, noisy_cov = partial_prediction(model, points, jets, cross_noise, target_noise)
+    latent = model.predict(points)
+    zero_mean, zero_cov = partial_prediction(model, points, jets, np.zeros_like(cross_noise), np.zeros_like(target_noise))
+    np.testing.assert_allclose(zero_mean, latent['central_value'][:, jets], rtol=1e-9, atol=2e-10)
+    np.testing.assert_allclose(zero_cov, latent['cov'][:, jets][:,:,jets], rtol=1e-8, atol=2e-10)
+    delta = truth-noisy_mean
+    exp_sigma = np.sqrt(covariance.diagonal()[jets])
+    latent_sigma = np.sqrt(np.diagonal(latent['cov'][:, jets][:,:,jets], axis1=1, axis2=2))
+    patterns = np.zeros((4, len(own)))
+    patterns[:2, jets] = delta
+    # Retain full bin correlations, testing both the full and smooth-PC parts.
+    projector = model.transfer.T @ model.projection
+    patterns[2:] = patterns[:2] @ projector.T
+    np.testing.assert_allclose(patterns[2:, np.setdiff1d(np.arange(len(own)), jets)], 0, atol=1e-12)
+    names = ['full_joint_target', 'full_inclusive_target', 'retained_joint_target', 'retained_inclusive_target']
+    labels = ['baseline'] + [name+'_'+sign for sign in ('plus', 'minus') for name in names]
+    folder = ROOT / case
+    folder.mkdir(exist_ok=True)
+    save(folder / 'validation.json', dict(fit_id=api.model_identity(case)['fit_id'],
+        targets_physical=[[2.31556,.4339648],[9.59085,.4375639]],
+        full_measured_shared_pp_train_target_cross_covariance=True, old_training_noise_bitwise_unchanged=True,
+        largest_pull=(abs(delta)/np.sqrt(np.diagonal(noisy_cov,axis1=1,axis2=2))).max(axis=1).tolist(),
+        median_MC_to_latent_sigma=np.median(np.sqrt(np.diagonal(target_noise,axis1=1,axis2=2))/latent_sigma,axis=1).tolist(),
+        median_absolute_residual_over_experimental_sigma=np.median(abs(delta)/exp_sigma,axis=1).tolist(),
+        warning='Residual patterns include finite validation MC; +/- fixed shifts are stress tests, NOT measured bias or an added covariance. No rg target was generated.'))
+    np.savez_compressed(folder / 'validation.npz', truth=truth, noisy_mean=noisy_mean, noisy_cov=noisy_cov,
+        latent_mean=latent['central_value'][:, jets], latent_cov=latent['cov'][:,jets][:,:,jets],
+        patterns=patterns, features=np.asarray(own,dtype=str), jets=jets, experimental_sigma=exp_sigma)
+    grid = arrays(QUEUE / f'results/{case}/inference/grid.npz')
+    q, kappa = grid['q'], grid['kappa']
+    if len(q) == 361:
+        q, kappa = q[::2], kappa[::2]
+    points = infer.physical_points(q, kappa)
+    filename = folder / 'stress_grid.npz'
+    likelihood = np.empty((len(points), len(labels)))
+    for start in range(0, len(points), 128):
+        stop = min(start+128, len(points))
+        pred = model.predict(points[start:stop])
+        likelihood[start:stop] = shifted_likelihood(pred, covariance, bank['exp']['y'], patterns)
+        if start % 4096 == 0:
+            print(case, 'STRESS', stop, '/', len(points), flush=True)
+    expected = grid.get('loglike_ell_0p2', grid.get('loglike'))
+    if expected.shape != (len(q),len(kappa)):
+        expected = expected[::2,::2]
+    np.testing.assert_allclose(likelihood[:,0].reshape(len(q),len(kappa)), expected, atol=1e-7, rtol=0)
+    np.savez_compressed(filename, q=q,kappa=kappa,loglike=likelihood,labels=labels)
+    prior = infer._helper(infer.PRIOR_PATH)
+    report, masses = {}, []
+    for i,label in enumerate(labels):
+        ll = likelihood[:,i].reshape(len(q),len(kappa))
+        mass, tv = infer.convergence(ll,q,kappa)
+        masses.append(mass)
+        report[label] = dict(q=prior.quantiles(mass,q,0),
+                             kappa=prior.quantiles(mass,kappa,1),
+                             coarse_fine_TV=tv)
+    np.savez_compressed(folder/'posteriors.npz',q=q,kappa=kappa,mass=np.array(masses),labels=labels)
+    save(folder/'summary.json',report)
+    assert api.model_identity(case) == identity
+    save(folder/'PROVENANCE.json',dict(model=identity,script_sha256=sha(__file__),
+        validation_sha256=sha(VALIDATION), unchanged_model_identity_after_check=True,
+        new_fits=0, primary_results_changed=False,
+        interpretation='A median shift of half the baseline 68% half-width is a materiality flag, not a calibrated error bound. Check grid convergence before interpreting.'))
+    print(case,'IMPACT_COMPLETE',flush=True)
+
+
+if __name__ == '__main__':
+    parser=argparse.ArgumentParser()
+    parser.add_argument('check',choices=['definitions','all','inclusive','jets'])
+    args=parser.parse_args()
+    ROOT.mkdir(exist_ok=True)
+    definitions() if args.check=='definitions' else impact(args.check)

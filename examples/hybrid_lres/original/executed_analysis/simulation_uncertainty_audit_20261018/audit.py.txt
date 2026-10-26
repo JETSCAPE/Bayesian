@@ -1,0 +1,251 @@
+"""Local diagnostic controls; never modify nominal fits or optimize a new kernel."""
+from pathlib import Path
+import hashlib
+import importlib.util
+import json
+import sys
+import time
+
+import numpy as np
+from scipy.linalg import solve_triangular
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+sys.path[:0] = [str(WORK/'wake_baseline_control_20261018'), str(WORK),
+               str(WORK/'emulator_mean_refit_20261013'),
+               str(WORK/'emulator_mean_check_20261013'),
+               str(WORK/'Bayesian-substructure-physical-prior-20260925/src')]
+import run_control as control
+
+
+def save(path, data):
+    control.save(path, data)
+
+
+def selected_predict(model, points, indices):
+    """Exact marginal of the existing latent prediction, not a smaller GP."""
+    points, indices = np.asarray(points), np.asarray(indices, int)
+    transfer = model.transfer[:, indices]
+    kernels = np.array([k(points, model.gp.X_train_) for k in model.gp.kernels_])
+    mean_pc = np.einsum('pmn,pn->mp', kernels, model.alpha[:model.p*model.n].reshape(model.p, model.n))
+    mean = (model.center+model.beta@model.inverse)[indices]+mean_pc@transfer
+    cross_pc = np.zeros((len(points), model.p, len(model.y)))
+    for i in range(model.p):
+        cross_pc[:, i, i*model.n:(i+1)*model.n] = kernels[i]
+    solved = solve_triangular(model.L, cross_pc.reshape(-1,len(model.y)).T,
+        lower=True, check_finite=False).reshape(len(model.y),len(points),model.p)
+    pc_cov = -np.einsum('ima,imb->mab',solved,solved,optimize=True)
+    for i,kernel in enumerate(model.gp.kernels_):
+        pc_cov[:,i,i] += kernel.diag(points)
+    covariance = np.einsum('pa,mpq,qb->mab',transfer,pc_cov,transfer,optimize=True)
+    covariance += model.residual[np.ix_(indices,indices)]
+    cross_h = np.einsum('pmn,pnf->mpf',kernels,
+        model.SinvH[:model.p*model.n].reshape(model.p,model.n,model.f),optimize=True)
+    correction = model.inverse.T[indices][None,:,:]-np.einsum('pa,mpf->maf',transfer,cross_h,optimize=True)
+    mean_part = np.einsum('mai,ij,mbj->mab',correction,model.mean_covariance,correction,optimize=True)
+    covariance += mean_part
+    covariance = (covariance+covariance.swapaxes(1,2))/2
+    if np.linalg.eigvalsh(covariance).min() < -1e-9:
+        raise ValueError('Selected latent covariance is not PSD')
+    return dict(central_value=mean,cov=covariance,fitted_mean_covariance=mean_part)
+
+
+def likelihood_parts(mean,covariance,data,experimental):
+    covariance = covariance+experimental
+    chol = np.linalg.cholesky(covariance)
+    residual = mean-data
+    whitened = np.linalg.solve(chol,residual[...,None])[...,0]
+    chi2 = np.sum(whitened**2,axis=1)
+    logdet = 2*np.log(np.diagonal(chol,axis1=1,axis2=2)).sum(1)
+    return -.5*(chi2+logdet),chi2,logdet
+
+
+def load_banks():
+    _, trainer = control.setup()
+    full = trainer.load()
+    driver = control.module('_uncertainty_reduced_context',control.REDUCED.parent/'local_dimension_repair/resume.py')
+    value = driver.context()
+    if json.loads((driver.HERE/'CONTEXT.json').read_text()) != value:
+        raise ValueError('Changed reduced-fit repair identity')
+    pipeline = driver.configure_pipeline(value)
+    stage, reduced_trainer = pipeline.configure(0,control.REDUCED.parent)
+    reduced = reduced_trainer.load()
+    if full['features'] != reduced['features']:
+        raise ValueError('Full/reduced feature identities differ')
+    for name in ('Design','Design_indices','Design_indices_validation'):
+        np.testing.assert_array_equal(full['raw'][name],reduced['raw'][name])
+    np.testing.assert_array_equal(full['exp']['y'],reduced['exp']['y'])
+    np.testing.assert_array_equal(full['cov'],reduced['cov'])
+    return full,reduced,trainer,reduced_trainer,stage
+
+
+def reconstruct_fixed_model(template,truth,noise):
+    """Recondition with fixed fitted kernels, basis and residual; no optimization."""
+    from refit_model import RestrictedMeanGP
+    from projected_mean import FastProjectedMeanAware
+    old = template.gp
+    kernels = [k.clone_with_theta(k.theta) for k in old.kernels_]
+    targets = (truth-template.center)@template.projection.T
+    gp = RestrictedMeanGP(kernels,jitter=old.jitter,n_restarts=0,random_state=0)
+    gp.fit(old.X_train_,targets,noise[:template.p*template.n,:template.p*template.n],optimize=False)
+    np.testing.assert_array_equal(np.concatenate([k.theta for k in gp.kernels_]),
+                                  np.concatenate([k.theta for k in old.kernels_]))
+    if gp.optimization_:
+        raise ValueError('Diagnostic unexpectedly optimized a kernel')
+    return FastProjectedMeanAware(gp,truth,template.projection,template.transfer,template.center,
+        template.residual,template.omitted_projection,template.omitted_transfer,noise)
+
+
+def contexts(full,reduced):
+    sources = [Path(__file__),WORK/'wake_baseline_control_20261018/run_control.py',
+        WORK/'wake_nuisance_20261017/full_bank/projected_mean.py',
+        WORK/'emulator_mean_refit_20261013/refit_model.py']
+    for bank in (full,reduced):
+        folder = bank['settings'].output_dir
+        report = json.loads((folder/'joint_fit.json').read_text())
+        sources += [folder/'joint_fit.json',folder/'projected_noise.npz',folder/'projected_noise.json',folder/'observables.h5']
+        sources += [Path(p) for p in report['output_sha256']]
+    return {str(p):control.sha(p) for p in sources}
+
+
+def prepare(full,reduced,trainer,reduced_trainer,stage):
+    template = full['mean_model']
+    source = reduced_trainer.FullBank(stage.DATA_ROOT,pp_source=control.LEGACY/'pp_reuse')
+    identity = dict(inputs=contexts(full,reduced),purpose='Diagnostic, no optimization or nominal-setting changes',
+        all_frozen_maps_and_fitted_kernel_values_from_full_30_control=True)
+    save(ROOT/'CONTEXT.json',identity)
+    path = ROOT/'reduced_noise_in_full_basis.npz'
+    marker = ROOT/'reduced_noise_in_full_basis.json'
+    if marker.exists():
+        record = json.loads(marker.read_text())
+        if record['context_sha256'] != control.sha(ROOT/'CONTEXT.json') or record['sha256'] != control.sha(path):
+            raise ValueError('Changed diagnostic projected noise')
+        with np.load(path) as z:
+            noise_reduced = z['training'].copy()
+    else:
+        if path.exists():
+            raise ValueError('Uncommitted diagnostic noise')
+        order = [source.features.index(f) for f in full['features']]
+        print('AUDIT_PROJECT_REDUCED_NOISE_IN_FULL_BASIS',flush=True)
+        noise_reduced,target = source.project_noise(template.projection,template.omitted_projection,
+            full['raw']['Design_indices'],full['raw']['Design_indices_validation'],order)
+        trainer.publish_npz(path,training=noise_reduced,**target)
+        save(marker,dict(context_sha256=control.sha(ROOT/'CONTEXT.json'),sha256=control.sha(path)))
+    with np.load(full['settings'].output_dir/'projected_noise.npz') as z:
+        noise_full = z['training'].copy()
+    truth_full = trainer.data_IO.predictions_matrix_from_h5(full['settings'].output_dir,'observables.h5',
+        observable_filter=full['ec'].observable_filter)
+    truth_reduced = trainer.data_IO.predictions_matrix_from_h5(reduced['settings'].output_dir,'observables.h5',
+        observable_filter=reduced['ec'].observable_filter)
+    frozen = dict(
+        frozen_mean_change=reconstruct_fixed_model(template,truth_reduced,noise_full),
+        frozen_noise_change=reconstruct_fixed_model(template,truth_full,noise_reduced),
+        frozen_mean_and_noise_change=reconstruct_fixed_model(template,truth_reduced,noise_reduced))
+    inflated = reconstruct_fixed_model(template,truth_full,10*noise_full)
+    reconstruction = reconstruct_fixed_model(template,truth_full,noise_full)
+    points = np.vstack([full['raw']['Design'][::3],[[.35,.35],[.65,.4],[.76,.4],[.78,.4]]])
+    indices = np.flatnonzero(np.char.find(full['names'],'__inclusive_jet__pt_') >= 0)
+    tests = {}
+    for name,model in dict(full=template,reduced=reduced['mean_model'],reconstruction=reconstruction,**frozen).items():
+        actual = selected_predict(model,points,indices)
+        native = model.predict(points)
+        for key in actual:
+            expected = native[key][:,indices] if key=='central_value' else native[key][:,indices][:,:,indices]
+            np.testing.assert_allclose(actual[key],expected,atol=2e-10,rtol=1e-8)
+        tests[name] = float(abs(actual['cov']-native['cov'][:,indices][:,:,indices]).max())
+    a,b = selected_predict(template,points,indices),selected_predict(reconstruction,points,indices)
+    np.testing.assert_allclose(a['central_value'],b['central_value'],atol=2e-9,rtol=1e-8)
+    np.testing.assert_allclose(a['cov'],b['cov'],atol=2e-9,rtol=1e-8)
+    inflated_prediction = selected_predict(inflated,points,indices)
+    change = inflated_prediction['cov']-a['cov']
+    eigen = np.linalg.eigvalsh(change)
+    if eigen.min() < -2e-9:
+        raise ValueError('Increasing supplied MC noise shrank latent uncertainty with fixed model')
+    save(ROOT/'PROPAGATION_TESTS.json',dict(selected_vs_native_max_cov_error=tests,
+        fixed_model_tenfold_MC_noise_min_variance_change_eigenvalue=float(eigen.min()),
+        fixed_model_tenfold_noise_diagonal_variance_ratio_percentiles=np.percentile(
+            np.diagonal(inflated_prediction['cov'],axis1=1,axis2=2)/np.diagonal(a['cov'],axis1=1,axis2=2),[0,50,100]).tolist(),
+        no_nominal_fit_changes=True,no_kernel_optimization=True,
+        original_measured_projected_noise_difference_min_eigenvalue=float(np.linalg.eigvalsh(noise_reduced-noise_full).min()),
+        original_measured_projected_noise_difference_negative_eigenvalues=int(np.sum(np.linalg.eigvalsh(noise_reduced-noise_full)<-1e-10))))
+    return frozen,indices
+
+
+def evaluate(full,reduced,frozen,indices):
+    p,helper = control.context_helpers()
+    with np.load(control.ROOT/'inference/grid.npz') as z:
+        q,k = z['q'].copy(),z['kappa'].copy()
+        expected_full = z['loglike_jet_RAA'].copy()
+    with np.load(control.REDUCED/'inference/grid.npz') as z:
+        expected_reduced_mass = z['mass_jet_RAA'].copy()
+    points = p.ref.s.core.unit(*[v.ravel() for v in np.meshgrid(q,k,indexing='ij')])
+    names = ['full','reduced','full_mean_reduced_cov','reduced_mean_full_cov',*frozen]
+    values = {name:np.full(len(points),np.nan) for name in names}
+    diagnostics = {name:np.full((len(points),35),np.nan) for name in ('full_mean','reduced_mean','full_variance','reduced_variance')}
+    parts = {name:np.full(len(points),np.nan) for name in ('full_chi2','full_logdet','reduced_chi2','reduced_logdet','min_cov_difference_eigenvalue')}
+    checkpoint = ROOT/'checkpoint.npz'
+    if checkpoint.exists():
+        with np.load(checkpoint) as z:
+            if z['context_sha256'].item()!=control.sha(ROOT/'CONTEXT.json'):
+                raise ValueError('Changed audit checkpoint identity')
+            values = {name:z['loglike_'+name].copy() for name in names}
+            diagnostics = {name:z[name].copy() for name in diagnostics}
+            parts = {name:z[name].copy() for name in parts}
+    experimental = full['cov'][np.ix_(indices,indices)]
+    data = full['exp']['y'][indices]
+    started = time.monotonic()
+    for start in range(0,len(points),256):
+        stop=min(start+256,len(points))
+        if all(np.isfinite(a[start:stop]).all() for a in values.values()):
+            continue
+        a=selected_predict(full['mean_model'],points[start:stop],indices)
+        b=selected_predict(reduced['mean_model'],points[start:stop],indices)
+        for name,pred in (('full',a),('reduced',b)):
+            values[name][start:stop],parts[name+'_chi2'][start:stop],parts[name+'_logdet'][start:stop] = likelihood_parts(
+                pred['central_value'],pred['cov'],data,experimental)
+            diagnostics[name+'_mean'][start:stop]=pred['central_value']
+            diagnostics[name+'_variance'][start:stop]=np.diagonal(pred['cov'],axis1=1,axis2=2)
+        values['full_mean_reduced_cov'][start:stop]=likelihood_parts(a['central_value'],b['cov'],data,experimental)[0]
+        values['reduced_mean_full_cov'][start:stop]=likelihood_parts(b['central_value'],a['cov'],data,experimental)[0]
+        parts['min_cov_difference_eigenvalue'][start:stop]=np.linalg.eigvalsh(b['cov']-a['cov'])[:,0]
+        for name,model in frozen.items():
+            pred=selected_predict(model,points[start:stop],indices)
+            values[name][start:stop]=likelihood_parts(pred['central_value'],pred['cov'],data,experimental)[0]
+        if start%10240==0 or stop==len(points):
+            temporary=ROOT/'checkpoint.pending.npz'
+            np.savez_compressed(temporary,context_sha256=control.sha(ROOT/'CONTEXT.json'),
+                **{'loglike_'+key:value for key,value in values.items()},**diagnostics,**parts)
+            temporary.replace(checkpoint)
+            print('AUDIT_GRID',stop,len(points),'seconds',round(time.monotonic()-started,1),flush=True)
+    np.testing.assert_allclose(values['full'].reshape(len(q),len(k)),expected_full,atol=2e-7,rtol=0)
+    arrays=dict(q=q,kappa=k,**diagnostics,**parts)
+    summaries={}
+    for name,ll in values.items():
+        ll=ll.reshape(len(q),len(k))
+        mass,density=helper.posterior_mass(ll,q,k)
+        summaries[name]=dict(pi_T_Lres_16_50_84=helper.weighted_quantile(mass,q,0),
+            kappa_sc_16_50_84=helper.weighted_quantile(mass,k,1),
+            mass_above16p172=float(mass[q>16.172].sum()))
+        arrays['mass_'+name]=mass
+        arrays['loglike_'+name]=ll
+    np.testing.assert_allclose(arrays['mass_reduced'],expected_reduced_mass,atol=2e-10,rtol=1e-6)
+    control.setup()[1].publish_npz(ROOT/'grid.npz',**arrays)
+    save(ROOT/'SUMMARY.json',dict(cases=summaries,
+        hybrid_mean_cov_cases='Diagnostic attribution only, not alternative nominal likelihoods',
+        frozen_cases='Fixed full-statistics PCA, residual, and fitted kernel values; recondition on selected means/noise without any optimization',
+        uncertainty_scope='Conditional on empirical PCA/residual and plug-in kernels, not marginal uncertainty in those estimates'))
+    print('AUDIT_GRID_COMPLETE',flush=True)
+
+
+def main():
+    ROOT.mkdir(exist_ok=True)
+    full,reduced,trainer,reduced_trainer,stage=load_banks()
+    frozen,indices=prepare(full,reduced,trainer,reduced_trainer,stage)
+    evaluate(full,reduced,frozen,indices)
+    save(ROOT/'COMPLETE.json',dict(status='NUMERICAL_DIAGNOSTICS_COMPLETE_REVIEW_REQUIRED',
+        source_sha256=control.sha(__file__),context_sha256=control.sha(ROOT/'CONTEXT.json'),
+        summary_sha256=control.sha(ROOT/'SUMMARY.json'),grid_sha256=control.sha(ROOT/'grid.npz')))
+
+
+if __name__=='__main__':
+    main()

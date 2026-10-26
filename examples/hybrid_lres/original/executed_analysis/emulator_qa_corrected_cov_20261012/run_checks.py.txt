@@ -1,0 +1,397 @@
+"""One-choice-at-a-time emulator checks with the exact paired MC covariance."""
+import argparse
+import copy
+import gc
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import json
+import logging
+from pathlib import Path
+import shutil
+import sys
+import time
+import traceback
+from unittest.mock import patch
+
+import matplotlib
+matplotlib.use('Agg')
+import numpy as np
+from sklearn.model_selection import KFold
+import yaml
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+if __name__ == '__main__':
+    sys.modules['run_checks'] = sys.modules[__name__]
+sys.path.insert(0, str(WORK/'emulator_sensitivity_ell02_20261010'))
+sys.path.insert(0, str(WORK/'resolution_universality_20261011'))
+import run_pc_checks as s
+import run_matched_option1 as matched
+from raw_target_qa import observed_targets
+from residual_variance import calibrate
+
+BASE = matched.MATCH/'configs/paired/main.yaml'
+BASE_RESULT = matched.RESULT
+BASE_GRID = Path(json.loads((BASE_RESULT/'inference/summary.json').read_text())['grid'])
+VARIANTS = {
+    'reference': {'family': 'reference'},
+    'hadron_pc2': {'family': 'hadron', 'count': 2},
+    'jet_pc3': {'family': 'jet', 'count': 3},
+    'dr12_pc3': {'family': 'dr12', 'count': 3},
+    'dr12_pc5': {'family': 'dr12', 'count': 5},
+    'theta_pc1': {'family': 'theta', 'count': 1},
+    'optimizer_seed1': {'family': 'optimizer', 'seed_offset': 101},
+    'optimizer_local': {'family': 'optimizer', 'local': True},
+    'residual_measured': {'family': 'residual', 'residual_calibration': True},
+}
+ORIGINAL_LOAD = s.load
+ORIGINAL_PREDICT = s.predict
+ORIGINAL_NATIVE_PREDICT = s.emulation.predict
+
+
+def configure():
+    s.ROOT, s.CONFIG, s.FROZEN = ROOT, BASE, BASE_RESULT/'analysis_raa_unit_Lres-E-loss'
+    s.ELL_GRID = BASE_GRID
+    s.VARIANTS = VARIANTS
+    s.config_for = config_for
+    s.ref.COVARIANCE = matched.COVARIANCE
+    s.load, s.predict, s.ref.predict = load, predict, predict
+
+
+def baseline_config(fold=None):
+    return BASE if fold is None else BASE.with_name(f'fold_{fold}.yaml')
+
+
+def config_for(key, fold=None):
+    if key == 'reference':
+        return baseline_config(fold)
+    original = yaml.safe_load(BASE.read_text())
+    cfg = copy.deepcopy(original)
+    target = ROOT/'results'/key
+    if fold is not None:
+        target = target/'cv'/f'fold_{fold}'
+    cfg['output_dir'] = str(target)
+    trial = VARIANTS[key]
+    groups = cfg['analyses']['analysis_raa_unit']['parameters']['emulators']
+    for name, group in groups.items():
+        if ('_'+trial['family']+'_' in name or
+                trial['family'] == 'theta' and '_theta_' in name):
+            group['n_pc'] = trial['count']
+        if 'seed_offset' in trial:
+            group['random_state'] += trial['seed_offset']
+    normalized = copy.deepcopy(cfg)
+    normalized['output_dir'] = original['output_dir']
+    for name, group in normalized['analyses']['analysis_raa_unit']['parameters']['emulators'].items():
+        before = original['analyses']['analysis_raa_unit']['parameters']['emulators'][name]
+        group['n_pc'], group['random_state'] = before['n_pc'], before['random_state']
+    if normalized != original:
+        raise RuntimeError('Unexpected change beyond PC count/restart seeds/output paths')
+    path = ROOT/'configs'/key/('main.yaml' if fold is None else f'fold_{fold}.yaml')
+    s.fixed_config(path, cfg)
+    return path
+
+
+def load(config):
+    bank = ORIGINAL_LOAD(config)
+    file = bank['settings'].output_dir/'residual_calibration.npz'
+    if file.exists():
+        with np.load(file) as z:
+            bank['additional'] = {name: z[name].copy() for name in z.files}
+    return bank
+
+
+def predict(bank, points):
+    if 'additional' in bank:
+        return s.jg.predict(points, bank['ec'], bank['settings'], bank['models'], bank['additional'])
+    return ORIGINAL_PREDICT(bank, points)
+
+
+def calibrate_training(bank):
+    covariance = s.sn.load_aligned_covariance(matched.COVARIANCE,
+        bank['raw']['Design_indices'], bank['features'])
+    additional, report = calibrate(bank, covariance)
+    np.savez_compressed(bank['settings'].output_dir/'residual_calibration.npz', **additional)
+    s.save(bank['settings'].output_dir/'residual_calibration.json', report)
+    bank['additional'] = additional
+    return bank
+
+
+def fit_bank(key, fold=None, raw=None):
+    path = config_for(key, fold)
+    if key == 'reference':
+        return load(path)
+    settings = s.stage_inputs(path, raw)
+    ec = s.emulation.EmulationConfig.from_config_file(settings)
+    files = [s.base.IO.output_filename(es, settings) for es in ec.emulation_settings.values()]
+    if any(p.exists() for p in files) and not all(p.exists() for p in files):
+        raise RuntimeError('Partial caches require inspection, not silent replacement')
+    trial = VARIANTS[key]
+    if all(p.exists() for p in files):
+        bank = load(path)
+    elif trial.get('residual_calibration'):
+        origin = load(baseline_config(fold))
+        for name, es in ec.emulation_settings.items():
+            source = s.base.IO.output_filename(origin['ec'].emulation_settings[name], origin['settings'])
+            dest = s.base.IO.output_filename(es, settings)
+            shutil.copy2(source, dest)
+            assert matched.digest(source) == matched.digest(dest)
+        shutil.copy2(origin['settings'].output_dir/'joint_fit.json', settings.output_dir/'joint_fit.json')
+        bank = load(path)
+    elif trial.get('local'):
+        bank = s.fit_local(path, load(baseline_config(fold)))
+    else:
+        bank = s.ref.fit_config(path)
+    if trial.get('residual_calibration') and 'additional' not in bank:
+        bank = calibrate_training(bank)
+    s.jg.validate_results(bank['ec'], bank['models'], check_file=True)
+    gp = next(iter(bank['models'].values()))['joint_pc_gp'].joint
+    if any(s.sn.white_variance(k) != 0 for k in gp.kernels_):
+        raise RuntimeError('Unexpected fitted WhiteKernel')
+    return bank
+
+
+def validation(bank):
+    raw = bank['raw']
+    train, test = raw['Design_indices'], raw['Design_indices_validation']
+    projection, transfer, center, residual, mapping = s.jg.linear_maps(
+        bank['ec'], bank['models'], bank.get('additional'))
+    covariance = s.sn.load_aligned_covariance(matched.COVARIANCE,
+        np.r_[train, test], bank['features'])
+    gp = next(iter(bank['models'].values()))['joint_pc_gp'].joint
+    mean, cov = observed_targets(gp, raw['Design_validation'], projection, transfer,
+        center, residual, covariance)
+    latent = predict(bank, raw['Design_validation'])
+    truth = s.data_IO.predictions_matrix_from_h5(bank['settings'].output_dir,
+        bank['settings'].io.observables_filename, validation_set=True,
+        observable_filter=bank['ec'].observable_filter)
+    reconstructed = (truth-center) @ projection.T @ transfer + center
+    return dict(design_ids=test, design_unit=raw['Design_validation'], truth=truth,
+        latent_mean=latent['central_value'], latent_covariance=latent['cov'],
+        observed_mean=mean, observed_covariance=cov,
+        pca_reconstruction=reconstructed,
+        truncation_error=reconstructed-truth,
+        interpolation_error=latent['central_value']-reconstructed)
+
+
+def regional_metrics(bank, result):
+    q = np.tan(np.pi*result['design_unit'][:, 0]/2)**3
+    k = .3+.3*result['design_unit'][:, 1]
+    masks = {'all': np.ones(len(q), dtype=bool),
+        'physical_prior': (q <= 20) & (k >= .3) & (k <= .6),
+        'joint_posterior_neighborhood': (q >= .5) & (q <= 5) & (k >= .39) & (k <= .48),
+        'RAA_posterior_neighborhood': (q >= 4) & (q <= 16) & (k >= .40) & (k <= .48)}
+    groups = s.jg.linear_maps(bank['ec'], bank['models'])[-1]
+    report = {}
+    for label, mask in masks.items():
+        selected = {key: value[mask] for key, value in result.items()}
+        counts = dict(designs=int(mask.sum()), design_ids=result['design_ids'][mask].tolist())
+        if mask.any():
+            counts['groups'] = s.metrics(bank, selected)
+            for name, idx in groups.items():
+                entry = counts['groups'][name]
+                entry['PCA_truncation_RMSE'] = float(np.sqrt(np.mean(selected['truncation_error'][:, idx]**2)))
+                entry['GP_interpolation_RMSE_against_noisy_PCA_target'] = float(np.sqrt(np.mean(selected['interpolation_error'][:, idx]**2)))
+                truth = selected['truth'][:, idx]
+                sigma2 = np.diagonal(selected['observed_covariance'], axis1=1, axis2=2)[:, idx]
+                delta = selected['observed_mean'][:, idx]-truth
+                entry['marginal_negative_log_predictive_density'] = float(np.mean(.5*(np.log(2*np.pi*sigma2)+delta**2/sigma2)))
+                covariance = selected['observed_covariance'][:, idx][:, :, idx]
+                try:
+                    chol = np.linalg.cholesky(covariance)
+                    whitened = np.linalg.solve(chol, delta[:, :, None])[:, :, 0]
+                    quadratic = np.square(whitened).sum(axis=1)
+                    score = (.5*(len(idx)*np.log(2*np.pi)+quadratic)
+                        + np.log(np.diagonal(chol, axis1=1, axis2=2)).sum(axis=1))/len(idx)
+                    entry['joint_negative_log_predictive_density_per_bin'] = float(score.mean())
+                    entry['mean_Mahalanobis_squared_per_bin'] = float(quadratic.mean()/len(idx))
+                except np.linalg.LinAlgError:
+                    entry['joint_score_status'] = 'Singular/non-PD target block; no extra regularization applied'
+        report[label] = counts
+    rows = []
+    pulls = (result['observed_mean']-result['truth'])/np.sqrt(np.diagonal(result['observed_covariance'], axis1=1, axis2=2))
+    for i, pid in enumerate(result['design_ids']):
+        rows.append(dict(design_id=int(pid), pi_T_Lres=float(q[i]), kappa_sc=float(k[i]),
+            groups={name: dict(maximum_absolute_pull=float(abs(pulls[i, idx]).max()),
+                feature=list(bank['features'][int(idx[np.argmax(abs(pulls[i, idx]))])]))
+                for name, idx in groups.items()}))
+    report['by_design'] = rows
+    report['cautions'] = ['Regions descriptive and predeclared, not a replacement for global QA.',
+        'Bins correlated; noisy-target coverage is not independent latent-mean accuracy.',
+        'PCA and GP errors compare to noisy held-out simulations, using training-only PCA.',
+        'Joint scores condition on plug-in fitted PCA/hyperparameters; designs still share MC noise.']
+    return report
+
+
+def holdout(key, bank):
+    target = ROOT/'results'/key/'QA'
+    target.mkdir(parents=True, exist_ok=True)
+    if all((target/name).exists() for name in ('independent_validation.npz',
+            'fivefold_predictions.npz', 'validation_summary.json', 'regional_validation.json')):
+        print(f'{key}: reuse completed fivefold/held-out QA', flush=True)
+        return
+    independent = validation(bank)
+    np.savez_compressed(target/'independent_validation.npz', **independent)
+    folds = []
+    for fold, (train, test) in enumerate(KFold(5, shuffle=True, random_state=20261007).split(bank['raw']['Design'])):
+        current = fit_bank(key, fold, s.cv_subset(bank['raw'], train, test))
+        np.testing.assert_array_equal(current['raw']['Design_indices'], bank['raw']['Design_indices'][train])
+        np.testing.assert_array_equal(current['raw']['Design_indices_validation'], bank['raw']['Design_indices'][test])
+        result = validation(current)
+        folds.append(result)
+        if key != 'reference':
+            s.save(current['settings'].output_dir/'pc_audit.json', audit(current))
+        print(f'{key}: fold {fold+1}/5 complete', flush=True)
+    combined = {name: np.concatenate([r[name] for r in folds]) for name in folds[0]}
+    assert sorted(combined['design_ids']) == sorted(bank['raw']['Design_indices'])
+    np.savez_compressed(target/'fivefold_predictions.npz', **combined)
+    s.save(target/'validation_summary.json', dict(independent=s.metrics(bank, independent),
+        fivefold=s.metrics(bank, combined), independent_design_ids=independent['design_ids'].tolist(),
+        method='Full raw noisy-target conditioning, including measured test/train cross-noise',
+        fold_seed=20261007, correlated_bin_caution=True))
+    s.save(target/'regional_validation.json', regional_metrics(bank, combined))
+    s.ref.OUT = ROOT/'results'/key
+    s.ref.validation_figures(bank, combined, 'fivefold')
+    s.ref.validation_figures(bank, independent, 'independent')
+
+
+def audit(bank):
+    report = s.pc_audit(bank)
+    gp = next(iter(bank['models'].values()))['joint_pc_gp'].joint
+    _, transfer, _, residual, mapping = s.jg.linear_maps(bank['ec'], bank['models'], bank.get('additional'))
+    original = json.loads((BASE_RESULT/'inference/summary.json').read_text())['cases']['raa_theta_dr12']
+    point = s.core.unit([original['q_16_50_84'][1]], [original['kappa_16_50_84'][1]])
+    _, pc_cov = gp.predict(point)
+    retained = np.einsum('pa,npq,qb->nab', transfer, pc_cov, transfer)[0]
+    n = len(gp.X_train_)
+    for name, settings in bank['ec'].emulation_settings.items():
+        model = bank['models'][name]
+        ratios = []
+        for pc, component in enumerate(model['joint_pc_gp'].indices):
+            block = gp.noise_[component*n:(component+1)*n, component*n:(component+1)*n]
+            contrast = (np.trace(block)-block.sum()/n)/(n-1)
+            variance = np.var(model['PCA']['Y_pca_truncated'][:, pc], ddof=1)
+            ratios.append(float(contrast/variance))
+        idx = mapping[name]
+        report['groups'][name]['centered_noise_to_score_variance'] = ratios
+        report['groups'][name]['omitted_fraction_of_emulator_trace_at_reference_median'] = float(
+            np.trace(residual[np.ix_(idx, idx)])/np.trace((residual+retained)[np.ix_(idx, idx)]))
+    report['reference_point_pi_T_Lres_kappa'] = [original['q_16_50_84'][1], original['kappa_16_50_84'][1]]
+    return report
+
+
+def native_qa(key, bank):
+    if key == 'reference':
+        s.save(ROOT/'results'/key/'QA/native_QA_COMPLETE.json', dict(frozen_source=str(BASE_RESULT), reused=True))
+        return
+    s.ref.OUT = ROOT/'results'/key
+    additional = bank.get('additional')
+    def adapted(points, config, *args, **kwargs):
+        kwargs['emulator_results'] = bank['models']
+        if additional is None:
+            return ORIGINAL_NATIVE_PREDICT(points, config, *args, **kwargs)
+        return s.jg.predict(points, config, bank['settings'], bank['models'], additional,
+            merge=kwargs.get('merge_predictions_over_groups', True))
+    from matplotlib import pyplot as plt
+    from matplotlib.figure import Figure
+    from bayesian import plot_input_data
+    original_save = Figure.savefig
+    def close_after_save(fig, *args, **kwargs):
+        result = original_save(fig, *args, **kwargs)
+        plt.close(fig)
+        gc.collect()
+        return result
+    def reuse_input_figures(config):
+        assert matched.digest(bank['settings'].output_dir/'observables.h5') == matched.digest(s.FROZEN/'observables.h5')
+        shutil.copytree(s.FROZEN/'plot_input_data', bank['settings'].output_dir/'plot_input_data', dirs_exist_ok=True)
+    plt.close('all')
+    with patch.object(s.emulation, 'predict', adapted), \
+            patch.object(Figure, 'savefig', close_after_save), \
+            patch.object(plot_input_data, 'plot', reuse_input_figures), \
+            patch.object(s.ref, 'covariance_qa', lambda current: None):
+        s.native_qa(key, bank)
+    plt.close('all')
+
+
+def trial(key):
+    configure()
+    started = time.monotonic()
+    target = ROOT/'results'/key
+    target.mkdir(parents=True, exist_ok=True)
+    with (target/'runner.log').open('a', buffering=1) as stream:
+        with patch.object(sys, 'stdout', stream), patch.object(sys, 'stderr', stream):
+            logging.basicConfig(level=logging.ERROR, force=True)
+            try:
+                bank = fit_bank(key)
+                s.save(target/'QA/pc_audit.json', audit(bank))
+                holdout(key, bank)
+                if key == 'reference':
+                    s.save(target/'inference/summary.json', json.loads((BASE_RESULT/'inference/summary.json').read_text()))
+                else:
+                    s.inference(key, bank)
+                verify_lock()
+                s.save(target/'RUN_COMPLETE.json', dict(variant=VARIANTS[key], seconds=time.monotonic()-started,
+                    covariance_sha256=matched.digest(matched.COVARIANCE), default_changed=False,
+                    native_rendering_pending=key != 'reference', visually_reviewed=False))
+                return key, True, time.monotonic()-started
+            except Exception:
+                traceback.print_exc()
+                s.save(target/'FAILED.json', dict(traceback=traceback.format_exc()))
+                return key, False, time.monotonic()-started
+
+
+def verify_lock():
+    manifest = json.loads((ROOT/'manifest.json').read_text())
+    for path, checksum in manifest['hashes'].items():
+        if matched.digest(Path(path)) != checksum:
+            raise RuntimeError(f'Frozen input/source/baseline changed: {path}')
+
+
+def setup():
+    configure()
+    paths = [BASE, matched.COVARIANCE, s.ELL_COV, BASE_GRID, s.FROZEN/'observables.h5',
+        s.FROZEN/'observables_preprocessed.h5', WORK/'resolution_universality_20261011/residual_variance.py',
+        *sorted((WORK/'Bayesian-substructure-physical-prior-20260925/src/bayesian').rglob('*.py')),
+        *sorted(s.FROZEN.glob('emulator_*.pkl'))]
+    paths.extend(sorted(BASE_RESULT.glob('cv/fold_*/analysis_raa_unit_Lres-E-loss/emulator_*.pkl')))
+    manifest = dict(variants=VARIANTS, hashes={str(p): matched.digest(p) for p in paths},
+        baseline=str(BASE), prior='uniform physical pi*T*Lres [0,20], kappa [0.3,0.6]',
+        hadron_pt_min=30, experimental_ell=.2, covariance_sha256=matched.digest(matched.COVARIANCE),
+        analysis_source_modified=False, residual_trial='training-only fixed-basis omitted covariance amplitude, no cap',
+        fold_seed=20261007, reference_default_changed=False)
+    path = ROOT/'manifest.json'
+    if path.exists():
+        assert json.loads(path.read_text()) == manifest
+    else:
+        s.save(path, manifest)
+    return manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--workers', type=int, default=2)
+    parser.add_argument('--keys', nargs='+', choices=list(VARIANTS))
+    parser.add_argument('--render-only', action='store_true')
+    args = parser.parse_args()
+    setup()
+    if not args.render_only:
+        keys = args.keys or list(VARIANTS)
+        keys = [key for key in keys if not (ROOT/'results'/key/'RUN_COMPLETE.json').exists()]
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(trial, key): key for key in keys}
+            for future in as_completed(futures):
+                result = future.result()
+                print('TRIAL_FINISHED', result, flush=True)
+                s.save(ROOT/'status.json', dict(
+                    finished=[k for k in VARIANTS if (ROOT/'results'/k/'RUN_COMPLETE.json').exists()],
+                    failed=[k for k in VARIANTS if (ROOT/'results'/k/'FAILED.json').exists()],
+                    defaults_changed=False))
+        if not all((ROOT/'results'/k/'RUN_COMPLETE.json').exists() for k in keys):
+            raise RuntimeError('Failed trial: inspect logs before resuming')
+    if all((ROOT/'results'/k/'RUN_COMPLETE.json').exists() for k in VARIANTS):
+        from render_checks import render
+        render()
+        verify_lock()
+        s.save(ROOT/'RUN_COMPLETE.json', dict(variants=list(VARIANTS), defaults_changed=False, visually_reviewed=False))
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,622 @@
+"""Checkpointed local own-subset inference. Never stage, fit, or retune a GP.
+
+The queue owns model/covariance routing. Only excluded predictive targets use
+the frozen full-bank emulator, explicitly as an auxiliary mapping, never as a
+replacement likelihood or a cross-model conditional law.
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+from functools import lru_cache
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+import numpy as np
+from scipy.interpolate import RegularGridInterpolator
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+PRIOR_PATH = WORK / 'paper_figures_20261019/v2/prior_sensitivity.py'
+MIXTURE_PATH = WORK / 'resolution_universality_20261011/consistency_mean_refit_20261013/run_consistency.py'
+DEFAULT = 'ell_0p2'
+FULL_SOURCE_KEY = 'hpt10_hadron_RAA_plus_jet_RAA_plus_theta_g_plus_dR12_plus_rg'
+CAUTIONS = [
+    'Selected-only fitted predictions; plug-in kernels and empirical PCA/omitted covariance assumptions remain',
+    'Measured finite-MC covariance and shared-MC validation do not establish independent-generator calibration',
+    'Conditional rg edges/particle definition and existing normalization qualifications are unchanged',
+    'Excluded predictive targets are auxiliary frozen-full-bank mappings, not own-model predictions or cross-model conditioning',
+]
+
+
+@dataclass(frozen=True)
+class Settings:
+    initial_shape: tuple = (181, 121)
+    final_shape: tuple = (361, 241)
+    batch_size: int = 128
+    tail_points: int = 65
+    tv_tolerance: float = .02
+    band_tolerance: float = .05
+
+
+def sha(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _json(value):
+    if isinstance(value, dict):
+        return {str(k): _json(v) for k, v in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return _json(value.tolist())
+    if isinstance(value, np.generic):
+        return _json(value.item())
+    if isinstance(value, float) and not np.isfinite(value):
+        if np.isnan(value):
+            raise ValueError('NaN is not valid receipt metadata')
+        return 'infinity' if value > 0 else '-infinity'
+    return value
+
+
+def _identity(value):
+    return hashlib.sha256(json.dumps(_json(value), sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def save_json(path, value, *, fixed=False):
+    value = _json(value)
+    if fixed and path.exists():
+        if json.loads(path.read_text()) != value:
+            raise ValueError('Changed inference/checkpoint identity: ' + str(path))
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_name(path.name + '.pending')
+    pending.write_text(json.dumps(value, indent=2, allow_nan=False) + '\n')
+    pending.replace(path)
+
+
+def save_npz(path, **arrays):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_name(path.stem + '.pending.npz')
+    np.savez_compressed(pending, **arrays)
+    pending.replace(path)
+
+
+@lru_cache(None)
+def _helper(path):
+    name = '_remaining_math_' + hashlib.sha256(str(path).encode()).hexdigest()[:12]
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _features(rows):
+    result = [(str(name), float(a), float(b)) for name, a, b in rows]
+    if not result or len(set(result)) != len(result):
+        raise ValueError('Empty or duplicate inference feature layout')
+    if any(not np.isfinite([a, b]).all() or a >= b for _, a, b in result):
+        raise ValueError('Invalid inference feature edges')
+    return result
+
+
+def _array_digest(*arrays):
+    digest = hashlib.sha256()
+    for array in arrays:
+        value = np.ascontiguousarray(array)
+        digest.update(str((value.shape, value.dtype.str)).encode())
+        digest.update(value.tobytes())
+    return digest.hexdigest()
+
+
+def physical_points(q, kappa):
+    uu, kk = np.meshgrid(_helper(PRIOR_PATH).unit(q), (kappa - .3) / .3, indexing='ij')
+    return np.column_stack((uu.ravel(), kk.ravel()))
+
+
+def grid_axes(api, settings):
+    """Preserve the frozen nonuniform physical-q quadrature, including endpoints."""
+    path = Path(api.manifest()['source_grid']).resolve()
+    with np.load(path, allow_pickle=False) as archive:
+        q, kappa = archive['q'].copy(), archive['kappa'].copy()
+    if q.shape != (settings.final_shape[0],) or kappa.shape != (settings.final_shape[1],):
+        raise ValueError('Frozen grid template shape differs from the native final grid')
+    for axis, bounds in ((q, (0., 20.)), (kappa, (.3, .6))):
+        if not np.isfinite(axis).all() or np.any(np.diff(axis) <= 0) or (axis[0], axis[-1]) != bounds:
+            raise ValueError('Frozen grid template axes differ from the physical prior support')
+    if (len(q[::2]), len(kappa[::2])) != settings.initial_shape:
+        raise ValueError('Frozen grid template does not supply the requested nested grid')
+    return q, kappa, path
+
+
+def _full_fit_id(bank):
+    identities = {row.get('joint_group_fit_id') for row in bank['models'].values()}
+    if len(identities) != 1 or None in identities:
+        raise ValueError('Frozen full bank lacks one checked joint fit identity')
+    return identities.pop()
+
+
+def exact_grid_indices(source_q, source_kappa, q, kappa):
+    """Return exact cache rows, or None for genuinely non-native new axes."""
+    rows = []
+    for source, wanted in ((source_q, q), (source_kappa, kappa)):
+        lookup = {float(value): i for i, value in enumerate(source)}
+        if any(float(value) not in lookup for value in wanted):
+            return None
+        indices = np.array([lookup[float(value)] for value in wanted], dtype=int)
+        if not np.array_equal(source[indices], wanted):
+            return None
+        rows.append(indices)
+    return np.ravel_multi_index(np.meshgrid(*rows, indexing='ij'), (len(source_q), len(source_kappa))).ravel()
+
+
+@dataclass
+class FrozenCache:
+    q: np.ndarray
+    kappa: np.ndarray
+    mean: np.ndarray
+    variance: np.ndarray
+    fit_id: str
+    checked_cells: np.ndarray
+    checked_prediction: dict
+    loglike: np.ndarray | None = None
+    mass: np.ndarray | None = None
+
+
+def load_frozen_cache(api, full_bank, *, include_likelihood=False):
+    """Read fixed N170 cache; only three GP cells verify its exact identity."""
+    manifest = api.manifest()
+    features = _features(full_bank['features'])
+    if len(features) != 170 or features != _features(manifest['full_features']):
+        raise ValueError('Frozen cache feature order differs from checked full N170 bank')
+    fit_id = _full_fit_id(full_bank)
+    with np.load(manifest['source_grid'], allow_pickle=False) as archive:
+        if archive['fit_id'].item() != fit_id:
+            raise ValueError('Frozen prediction cache has a different full-bank fit ID')
+        q, kappa = archive['q'].copy(), archive['kappa'].copy()
+        mean, variance = archive['prediction_mean'].copy(), archive['prediction_variance'].copy()
+        ll = archive['loglike_' + FULL_SOURCE_KEY].copy() if include_likelihood else None
+        mass = archive['mass_' + FULL_SOURCE_KEY].copy() if include_likelihood else None
+    count = len(q) * len(kappa)
+    if mean.shape != (count, 170) or variance.shape != mean.shape:
+        raise ValueError('Frozen prediction cache has a wrong shape')
+    if not np.isfinite(mean).all() or not np.isfinite(variance).all() or np.any(variance < 0):
+        raise ValueError('Frozen prediction cache has invalid moments')
+    cells = np.array([0, (len(q) // 2) * len(kappa) + len(kappa) // 2, count - 1])
+    prediction = full_bank['mean_model'].predict(physical_points(q, kappa)[cells])
+    actual_mean, actual_variance = validate_prediction(prediction, 3, 170)
+    np.testing.assert_allclose(actual_mean, mean[cells], atol=1e-11, rtol=1e-10)
+    np.testing.assert_allclose(actual_variance, variance[cells], atol=1e-11, rtol=1e-10)
+    if include_likelihood:
+        if ll.shape != (len(q), len(kappa)) or mass.shape != ll.shape or not np.isfinite(ll).all():
+            raise ValueError('Frozen full-model likelihood cache has a wrong shape/values')
+        np.testing.assert_allclose(mass, _helper(PRIOR_PATH).mass(ll, q, kappa), atol=2e-14, rtol=1e-12)
+    return FrozenCache(q, kappa, mean, variance, fit_id, cells, prediction, ll, mass)
+
+
+def convergence(loglike, q, kappa):
+    """Same centered-CDF/trapezoid mass and nested TV gate as native checks."""
+    prior = _helper(PRIOR_PATH)
+    if not np.isfinite(loglike).all():
+        raise ValueError('Nonfinite likelihood grid')
+    mass = prior.mass(loglike, q, kappa)
+    cq, ck = q[::2], kappa[::2]
+    if cq[-1] != q[-1] or ck[-1] != kappa[-1]:
+        raise ValueError('Nested grid must include both endpoints')
+    coarse = prior.mass(loglike[::2, ::2], cq, ck)
+    coarse_density = coarse / (prior.weights(cq)[:, None] * prior.weights(ck)[None, :])
+    mesh = np.stack(np.meshgrid(q, kappa, indexing='ij'), axis=-1)
+    interpolated = RegularGridInterpolator((cq, ck), coarse_density)(mesh)
+    weight = prior.weights(q)[:, None] * prior.weights(kappa)[None, :]
+    interpolated /= np.sum(interpolated * weight)
+    return mass, float(.5 * np.sum(np.abs(mass / weight - interpolated) * weight))
+
+
+def validate_prediction(prediction, rows, n_features):
+    mean = np.asarray(prediction['central_value'])
+    covariance = np.asarray(prediction['cov'])
+    if mean.shape != (rows, n_features) or covariance.shape != (rows, n_features, n_features):
+        raise ValueError('Emulator prediction shape mismatch')
+    if not np.isfinite(mean).all() or not np.isfinite(covariance).all():
+        raise ValueError('Nonfinite emulator prediction')
+    np.testing.assert_allclose(covariance, covariance.swapaxes(-1, -2), atol=1e-11, rtol=1e-10)
+    scale = np.maximum(np.max(np.abs(covariance), axis=(-1, -2)), 1.)
+    minimum = np.linalg.eigvalsh(covariance)[:, 0]
+    if np.any(minimum < -1e-10 * scale):
+        raise ValueError('Latent emulator covariance is not PSD; no repair is allowed')
+    variance = np.diagonal(covariance, axis1=1, axis2=2).copy()
+    if np.any(variance < 0):
+        raise ValueError('Negative latent marginal variance; no clipping is allowed')
+    return mean, variance
+
+
+class Checkpoint:
+    """Atomic, self-digested prediction/likelihood shards bound to one identity."""
+
+    def __init__(self, folder, identity, n_points, n_features, lengths=(), seed=None):
+        self.folder = Path(folder)
+        self.lengths = tuple(lengths)
+        self.header = _json(dict(identity=identity, n_points=n_points, n_features=n_features, lengths=self.lengths))
+        self.token = _identity(self.header)
+        save_json(self.folder / 'IDENTITY.json', self.header, fixed=True)
+        self.mean = np.full((n_points, n_features), np.nan)
+        self.variance = np.full_like(self.mean, np.nan)
+        self.loglike = {key: np.full(n_points, np.nan) for key in self.lengths}
+        self.done = np.zeros(n_points, bool)
+        if seed is not None:
+            indices, before = seed
+            self.mean[indices], self.variance[indices] = before.mean, before.variance
+            for key in self.lengths:
+                self.loglike[key][indices] = before.loglike[key]
+            self.done[indices] = before.done
+        for path in sorted(self.folder.glob('batch_*.npz')):
+            if path.name.endswith('.pending.npz'):
+                continue
+            with np.load(path, allow_pickle=False) as archive:
+                indices = archive['indices']
+                mean, variance = archive['mean'], archive['variance']
+                likelihood = archive['likelihood']
+                if archive['identity'].item() != self.token or archive['digest'].item() != _array_digest(indices, mean, variance, likelihood):
+                    raise ValueError('Changed or mismatched prediction checkpoint: ' + str(path))
+                if (indices.ndim != 1 or indices.dtype.kind not in 'iu' or len(set(indices)) != len(indices)
+                        or np.any(indices < 0) or np.any(indices >= n_points) or self.done[indices].any()):
+                    raise ValueError('Overlapping/invalid prediction checkpoint indices')
+                self._assign(indices, mean, variance, likelihood)
+
+    def _assign(self, indices, mean, variance, likelihood):
+        if mean.shape != (len(indices), self.mean.shape[1]) or variance.shape != mean.shape or likelihood.shape != (len(self.lengths), len(indices)):
+            raise ValueError('Checkpoint array shape mismatch')
+        if not all(np.isfinite(v).all() for v in (mean, variance, likelihood)) or np.any(variance < 0):
+            raise ValueError('Invalid checkpoint arrays')
+        self.mean[indices], self.variance[indices] = mean, variance
+        for key, value in zip(self.lengths, likelihood):
+            self.loglike[key][indices] = value
+        self.done[indices] = True
+
+    def put(self, indices, mean, variance, likelihood):
+        indices = np.asarray(indices, dtype=np.int64)
+        if self.done[indices].any():
+            raise ValueError('Attempt to overwrite a completed prediction checkpoint')
+        values = np.asarray([likelihood[key] for key in self.lengths], dtype=float).reshape(len(self.lengths), len(indices))
+        self._assign(indices, mean, variance, values)
+        path = self.folder / f'batch_{int(indices[0]):09d}.npz'
+        if path.exists():
+            raise ValueError('Checkpoint filename collision')
+        save_npz(path, indices=indices, mean=mean, variance=variance, likelihood=values,
+                 identity=np.asarray(self.token), digest=np.asarray(_array_digest(indices, mean, variance, values)))
+
+
+def evaluate(checkpoint, points, bank, covariances, native, settings):
+    indices = np.flatnonzero(~checkpoint.done)
+    for start in range(0, len(indices), settings.batch_size):
+        ix = indices[start:start + settings.batch_size]
+        prediction = bank['mean_model'].predict(points[ix])
+        mean, variance = validate_prediction(prediction, len(ix), len(bank['features']))
+        likelihood = {key: native.likelihood(prediction, bank, covariance, np.arange(len(bank['features'])))
+                      for key, covariance in covariances.items()}
+        checkpoint.put(ix, mean, variance, likelihood)
+        if start % (settings.batch_size * 16) == 0 or start + settings.batch_size >= len(indices):
+            print('OWN_SUBSET_INFERENCE', checkpoint.folder.name, int(checkpoint.done.sum()), len(points), flush=True)
+    if not checkpoint.done.all():
+        raise ValueError('Incomplete selected inference checkpoint')
+
+
+def native_checks(checkpoint, points, bank, covariances, native, cells):
+    cells = np.unique(np.asarray(cells, dtype=int))
+    prediction = bank['mean_model'].predict(points[cells])
+    mean, variance = validate_prediction(prediction, len(cells), len(bank['features']))
+    np.testing.assert_allclose(mean, checkpoint.mean[cells], atol=1e-11, rtol=1e-10)
+    np.testing.assert_allclose(variance, checkpoint.variance[cells], atol=1e-11, rtol=1e-10)
+    errors = {}
+    for key, covariance in covariances.items():
+        scalar = np.asarray([native.old.log_posterior._loglikelihood(
+            prediction['central_value'][i] - bank['exp']['y'], prediction['cov'][i] + covariance)
+            for i in range(len(cells))])
+        expected = checkpoint.loglike[key][cells]
+        np.testing.assert_allclose(scalar, expected, atol=1e-7, rtol=0)
+        errors[key] = float(np.max(np.abs(scalar - expected)))
+    return errors
+
+
+def prior_result(q, kappa, interior, tail, tail_u):
+    prior = _helper(PRIOR_PATH)
+    ll = tail.loglike[DEFAULT].reshape(len(tail_u), len(kappa))
+    np.testing.assert_allclose(ll[0], interior[-1], atol=1e-8, rtol=0)
+    values, summary = prior.combine(q, kappa, interior, tail_u, ll)
+    return dict(q=q, kappa=kappa, tail_u=tail_u, tail_loglike=ll, **values), summary
+
+
+def _file_pins(bank):
+    directory = getattr(bank.get('settings'), 'output_dir', None)
+    if directory is None:
+        return {}
+    directory = Path(directory)
+    paths = [directory / 'joint_fit.json', directory / 'observables.h5', *directory.glob('emulator_*.pkl')]
+    return {str(path): sha(path) for path in paths if path.is_file()}
+
+
+def _verify_pins(pins):
+    for path, digest in pins.items():
+        if sha(path) != digest:
+            raise ValueError('Changed inference source: ' + path)
+
+
+def _required_artifacts(prior_scan):
+    artifacts = ['INPUTS.json', 'grid.npz', 'summary.json', 'predictive.npz']
+    if prior_scan:
+        artifacts.extend(['prior.npz', 'prior_summary.json'])
+    return artifacts
+
+
+def predictive(checkpoint, q, kappa, masses, full_bank, own_features, folder, identity, settings, frozen_cache):
+    """Own model on every fitted bin; separate auxiliary excluded-target route."""
+    full_features = _features(full_bank['features'])
+    if len(full_features) != 170:
+        raise ValueError('Predictive mapping requires the frozen 170-feature layout')
+    own_to_full = np.array([full_features.index(row) for row in own_features], dtype=int)
+    excluded = np.setdiff1d(np.arange(170), own_to_full)
+    mean = np.empty((len(checkpoint.mean), 170))
+    variance = np.empty_like(mean)
+    mean[:, own_to_full], variance[:, own_to_full] = checkpoint.mean, checkpoint.variance
+    route = np.full(170, 'auxiliary_frozen_N170_excluded_target', dtype='<U64')
+    route[own_to_full] = 'own_subset_model'
+    source_rows = exact_grid_indices(frozen_cache.q, frozen_cache.kappa, q, kappa)
+    auxiliary_source = 'none_all_targets_fitted'
+    if len(excluded):
+        if source_rows is not None:
+            mean[:, excluded] = frozen_cache.mean[np.ix_(source_rows, excluded)]
+            variance[:, excluded] = frozen_cache.variance[np.ix_(source_rows, excluded)]
+            auxiliary_source = 'frozen_N170_source_grid_exact_nested_indices_no_interpolation'
+        else:
+            # Only a genuinely new, non-native axis may need fresh auxiliary
+            # predictions. Corrupt/mismatched caches fail before this branch.
+            auxiliary_source = 'fresh_frozen_N170_prediction_non_native_axes_only'
+            auxiliary = Checkpoint(folder / 'checkpoints' / f'auxiliary_{len(q)}x{len(kappa)}',
+                                   dict(identity=identity, route=route.tolist(), excluded=excluded.tolist()),
+                                   len(mean), len(excluded))
+            points = physical_points(q, kappa)
+            pending = np.flatnonzero(~auxiliary.done)
+            for start in range(0, len(pending), settings.batch_size):
+                ix = pending[start:start + settings.batch_size]
+                prediction = full_bank['mean_model'].predict(points[ix])
+                mm, vv = validate_prediction(prediction, len(ix), 170)
+                auxiliary.put(ix, mm[:, excluded], vv[:, excluded], {})
+            mean[:, excluded], variance[:, excluded] = auxiliary.mean, auxiliary.variance
+    mixture = _helper(MIXTURE_PATH).mixture_quantiles
+    quantiles, discarded = mixture(mean, variance, masses[DEFAULT].ravel())
+    shape = (len(q), len(kappa), 170)
+    coarse_mean = mean.reshape(shape)[::2, ::2].reshape(-1, 170)
+    coarse_variance = variance.reshape(shape)[::2, ::2].reshape(-1, 170)
+    ll = checkpoint.loglike[DEFAULT].reshape(len(q), len(kappa))
+    coarse_mass = _helper(PRIOR_PATH).mass(ll[::2, ::2], q[::2], kappa[::2])
+    half_quantiles, half_discarded = mixture(coarse_mean, coarse_variance, coarse_mass.ravel())
+    sigma = np.sqrt(np.diag(full_bank['cov']))
+    if sigma.shape != (170,) or not np.isfinite(sigma).all() or np.any(sigma <= 0):
+        raise ValueError('Invalid experimental scale for predictive precision')
+    shift = np.abs(quantiles - half_quantiles) / sigma
+    precision = dict(method='Existing deterministic Gaussian-mixture quantiles, 48 bisections, omitted mass <=1e-10',
+        quantile_discarded_mass=discarded, half_quantile_discarded_mass=half_discarded,
+        half_full_max_shift_in_experimental_sigma=float(shift.max()),
+        half_full_max_shift_fitted_bins=float(shift[:, own_to_full].max()),
+        tolerance_in_experimental_sigma=settings.band_tolerance,
+        predictive_band_converged=bool(shift.max() <= settings.band_tolerance),
+        auxiliary_prediction_source=auxiliary_source, frozen_full_fit_id=frozen_cache.fit_id,
+        full_cache_GP_identity_cells=frozen_cache.checked_cells.tolist(),
+        no_new_prediction_noise_added=True, source='latent emulator mixture under own-model physical posterior')
+    inverse = np.full(170, -1, int)
+    inverse[own_to_full] = np.arange(len(own_features))
+    save_npz(folder / 'predictive.npz', features170=np.asarray(full_features, dtype=str),
+        features=np.asarray(full_features, dtype=str), quantiles=quantiles, half_quantiles=half_quantiles,
+        probabilities=np.array([.025, .16, .5, .84, .975]), emulator_route_per_feature=route,
+        own_feature_indices_in_full=own_to_full, full_to_own_feature_indices=inverse,
+        auxiliary_excluded_feature_indices=excluded, precision_json=np.asarray(json.dumps(_json(precision))))
+    return precision
+
+
+def _validate_settings(settings):
+    if settings.batch_size < 1 or settings.tail_points < 3 or settings.tail_points % 2 != 1:
+        raise ValueError('Invalid inference batch/tail configuration')
+    first, final = settings.initial_shape, settings.final_shape
+    if len(first) != 2 or len(final) != 2 or any(n < 5 or n % 2 != 1 for n in (*first, *final)):
+        raise ValueError('Nested inference grids must have odd sizes >=5')
+    if tuple(2 * (n - 1) + 1 for n in first) != tuple(final):
+        raise ValueError('Final grid must double each initial interval')
+
+
+def run(case, *, api=None, settings=None):
+    """Run one completed own-model queue node; no production work on import."""
+    if api is None:
+        import queue_models as api
+    settings = settings or Settings()
+    _validate_settings(settings)
+    fine_q, fine_kappa, template_path = grid_axes(api, settings)
+    spec = api.spec(case)
+    full_run, full_bank = api.full_bank()
+    study = api.configure(case)
+    bank = api.load_bank(case, experimental=True)
+    features = _features(bank['features'])
+    if features != _features(spec['features']) or len(features) != spec['n_features']:
+        raise ValueError('Own-model bank features/order differ from queue spec')
+    full_features = _features(full_bank['features'])
+    selected = [full_features.index(row) for row in features]
+    np.testing.assert_array_equal(bank['exp']['y'], np.asarray(full_bank['exp']['y'])[selected])
+    covariances = api.selected_covariances(case, bank)
+    lengths = tuple(spec['lengths'])
+    if DEFAULT not in lengths or len(set(lengths)) != len(lengths) or set(covariances) != set(lengths):
+        raise ValueError('Queue covariance lengths do not match the requested scan')
+    covariances = {key: np.asarray(covariances[key]) for key in lengths}
+    for key, value in covariances.items():
+        if value.shape != (len(features), len(features)) or not np.isfinite(value).all():
+            raise ValueError('Invalid selected experimental covariance: ' + key)
+        np.testing.assert_allclose(value, value.T, atol=1e-14, rtol=1e-12)
+        np.linalg.cholesky(value)
+    np.testing.assert_allclose(covariances[DEFAULT], bank['cov'], atol=1e-14, rtol=1e-12)
+    folder = Path(api.results(case)).absolute()
+    expected_folder = Path(spec['inference_root']).resolve()
+    queue = Path(api.QUEUE).resolve()
+    if folder != folder.resolve() or folder != expected_folder or not folder.is_relative_to(queue) or folder == queue:
+        raise ValueError('Inference output must be the exact queue-owned results directory')
+    if folder.exists() and any(p.is_symlink() for p in folder.rglob('*')):
+        raise ValueError('Symlinked inference output tree is forbidden')
+    pins = {str(path): sha(path) for path in (Path(__file__), PRIOR_PATH, MIXTURE_PATH, template_path)}
+    api_file = getattr(api, '__file__', None)
+    if api_file:
+        pins[str(Path(api_file).resolve())] = sha(api_file)
+    native = study.p.ref.s.core
+    for function in (native.likelihood, native.old.log_posterior._loglikelihood):
+        filename = getattr(getattr(function, '__code__', None), 'co_filename', None)
+        if filename and Path(filename).is_file():
+            path = Path(filename).resolve()
+            pins[str(path)] = sha(path)
+    for filename in ('MANIFEST.json', 'COVARIANCES.json', 'covariances.npz'):
+        path = queue / filename
+        if path.is_file():
+            pins[str(path)] = sha(path)
+    pins.update(_file_pins(full_bank))
+    pins.update(_file_pins(bank))
+    model_identity = _json(api.model_identity(case))
+    identity = _json(dict(case=case, model_identity=model_identity, spec=spec,
+        source_sha256=pins, settings=asdict(settings), features=features,
+        grid_template_sha256=_array_digest(fine_q, fine_kappa),
+        covariance_sha256={key: _array_digest(value) for key, value in covariances.items()},
+        physical_prior=dict(pi_T_Lres=[0., 20.], kappa_sc=[.3, .6]), no_fits=True))
+    save_json(folder / 'INPUTS.json', identity, fixed=True)
+    complete_path = folder / 'COMPLETE.json'
+    if complete_path.exists():
+        complete = json.loads(complete_path.read_text())
+        if complete['input_identity'] != _identity(identity):
+            raise ValueError('Completed inference has a different model/source identity')
+        required = {str(folder / name) for name in _required_artifacts(spec['prior_scan'])}
+        if set(complete['output_sha256']) != required:
+            raise ValueError('Completed inference is missing required artifact bindings')
+        _verify_pins(complete['output_sha256'])
+        _verify_pins(pins)
+        return complete
+    previous = None
+    summary = None
+    prior_arrays, prior_summary = None, None
+    refinement = []
+    frozen_full = spec['model_kind'] == 'frozen_full'
+    if frozen_full and (features != full_features or lengths != (DEFAULT,) or spec['prior_scan']):
+        raise ValueError('Frozen primary-cache reuse is restricted to the full170 default likelihood')
+    frozen_cache = load_frozen_cache(api, full_bank, include_likelihood=frozen_full)
+    np.testing.assert_array_equal(frozen_cache.q, fine_q)
+    np.testing.assert_array_equal(frozen_cache.kappa, fine_kappa)
+    if frozen_full and model_identity['fit_id'] != frozen_cache.fit_id:
+        raise ValueError('Frozen primary likelihood and own-model fit identities differ')
+    shapes = (settings.final_shape,) if frozen_full else (settings.initial_shape, settings.final_shape)
+    for shape in shapes:
+        q, kappa = (fine_q[::2], fine_kappa[::2]) if shape == settings.initial_shape else (fine_q, fine_kappa)
+        points = physical_points(q, kappa)
+        seed = None
+        if previous is not None:
+            seed_indices = np.arange(len(points)).reshape(shape)[::2, ::2].ravel()
+            seed = seed_indices, previous
+        grid = Checkpoint(folder / 'checkpoints' / f'physical_{shape[0]}x{shape[1]}',
+                          identity, len(points), len(features), lengths, seed=seed)
+        if frozen_full:
+            # Reuse only this actual full170 model's native default likelihood.
+            # No other mask is ever permitted to read source likelihoods.
+            grid.mean[:], grid.variance[:] = frozen_cache.mean, frozen_cache.variance
+            grid.loglike[DEFAULT][:] = frozen_cache.loglike.ravel()
+            grid.done[:] = True
+        else:
+            evaluate(grid, points, bank, covariances, native, settings)
+        masses, summary = {}, {}
+        cells = [0, len(points) // 2, len(points) - 1]
+        for key in lengths:
+            ll = grid.loglike[key].reshape(shape)
+            masses[key], tv = convergence(ll, q, kappa)
+            cells.append(int(ll.argmax()))
+            summary[key] = dict(physical_pi_T_Lres_16_50_84=_helper(PRIOR_PATH).quantiles(masses[key], q, 0),
+                kappa_16_50_84=_helper(PRIOR_PATH).quantiles(masses[key], kappa, 1),
+                coarse_fine_TV=tv, n_bins=len(features), grid_shape=shape,
+                fit_source_identity=model_identity, remaining_cautions=CAUTIONS)
+        if frozen_full:
+            residual = frozen_cache.checked_prediction['central_value'] - bank['exp']['y']
+            scalar = np.array([native.old.log_posterior._loglikelihood(delta, covariance + covariances[DEFAULT])
+                               for delta, covariance in zip(residual, frozen_cache.checked_prediction['cov'])])
+            expected = grid.loglike[DEFAULT][frozen_cache.checked_cells]
+            np.testing.assert_allclose(scalar, expected, atol=1e-7, rtol=0)
+            errors = {DEFAULT: float(np.max(np.abs(scalar - expected)))}
+            np.testing.assert_allclose(masses[DEFAULT], frozen_cache.mass, atol=2e-14, rtol=1e-12)
+        else:
+            errors = native_checks(grid, points, bank, covariances, native, cells)
+        for key in lengths:
+            summary[key]['native_loglike_max_error'] = errors[key]
+        failures = [key for key in lengths if summary[key]['coarse_fine_TV'] > settings.tv_tolerance]
+        if spec['prior_scan']:
+            tail_u = np.linspace(float(_helper(PRIOR_PATH).unit(20.)), 1., settings.tail_points)
+            uu, kk = np.meshgrid(tail_u, (kappa - .3) / .3, indexing='ij')
+            tail_points = np.column_stack((uu.ravel(), kk.ravel()))
+            tail = Checkpoint(folder / 'checkpoints' / f'prior_tail_{shape[1]}',
+                              identity, len(tail_points), len(features), (DEFAULT,))
+            evaluate(tail, tail_points, bank, {DEFAULT: covariances[DEFAULT]}, native, settings)
+            tail_errors = native_checks(tail, tail_points, bank, {DEFAULT: covariances[DEFAULT]}, native,
+                                        [0, len(tail_points) // 2, len(tail_points) - 1])
+            prior_arrays, prior_summary = prior_result(q, kappa, grid.loglike[DEFAULT].reshape(shape), tail, tail_u)
+            prior_summary['native_tail_loglike_max_error'] = tail_errors[DEFAULT]
+            np.testing.assert_allclose(prior_arrays['physical_mass'], masses[DEFAULT], atol=2e-14, rtol=1e-12)
+            if prior_summary['square']['coarse_fine_TV_in_unit_coordinates'] > settings.tv_tolerance:
+                failures.append('prior_square_native_TV')
+        save_json(folder / 'GRID_STATUS.json', dict(shape=shape, failed_TV=failures, cases=summary))
+        if not failures:
+            break
+        refinement.append(dict(shape=shape, failed_TV=failures))
+        if shape == settings.final_shape:
+            raise ValueError('Maximum native nested grid still fails TV: ' + str(failures))
+        previous = grid
+    precision = predictive(grid, q, kappa, masses, full_bank, features, folder, identity, settings, frozen_cache)
+    numerical_warnings = []
+    if not precision['predictive_band_converged']:
+        numerical_warnings.append('Predictive half/full-grid quantile shift exceeds the recorded tolerance; review before interpretation')
+    arrays = dict(q=q, kappa=kappa, mass=masses[DEFAULT], loglike=grid.loglike[DEFAULT].reshape(shape),
+        prediction_mean=grid.mean, prediction_variance=grid.variance, features=np.asarray(features, dtype=str),
+        input_identity=np.asarray(_identity(identity)), fit_id=np.asarray(model_identity.get('fit_id', 'see_INPUTS.json')))
+    for key in lengths:
+        arrays['mass_' + key] = masses[key]
+        arrays['loglike_' + key] = grid.loglike[key].reshape(shape)
+    save_npz(folder / 'grid.npz', **arrays)
+    save_json(folder / 'summary.json', dict(cases=summary, predictive_precision=precision,
+        fit_source_identity=model_identity, refinement=refinement, remaining_cautions=CAUTIONS,
+        model_kind=spec['model_kind'], no_fits=True, numerical_warnings=numerical_warnings,
+        primary_likelihood_route='validated_frozen_full170_native_grid' if frozen_full else 'fresh_own_subset_model_only'))
+    artifacts = _required_artifacts(spec['prior_scan'])
+    if spec['prior_scan']:
+        save_npz(folder / 'prior.npz', **prior_arrays)
+        save_json(folder / 'prior_summary.json', dict(cases={case: prior_summary},
+            fit_source_identity=model_identity,
+            method='Original prior_sensitivity.combine; own-model likelihood including full-square u=unit(20)..1 tail',
+            supports=dict(physical=[0, 20], square=[0, 1], square_same_support=[0, 20]),
+            remaining_cautions=CAUTIONS + ['Square-prior tail is GP extrapolation through u=1, not an infinity simulation']))
+    _verify_pins(pins)
+    if _json(api.model_identity(case)) != model_identity:
+        raise ValueError('Own-model source/fit identity changed during inference')
+    complete = dict(status='NUMERICAL_INFERENCE_COMPLETE_NOT_PHYSICS_CERTIFICATION', case=case,
+        input_identity=_identity(identity), fit_source_identity=model_identity,
+        output_sha256={str(folder / name): sha(folder / name) for name in artifacts},
+        source_sha256=pins, no_fits=True, production_visual_review_pending=True,
+        predictive_precision=precision, numerical_warnings=numerical_warnings, remaining_cautions=CAUTIONS)
+    save_json(complete_path, complete)
+    return complete
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--case', required=True)
+    args = parser.parse_args(argv)
+    run(args.case)
+
+
+if __name__ == '__main__':
+    main()

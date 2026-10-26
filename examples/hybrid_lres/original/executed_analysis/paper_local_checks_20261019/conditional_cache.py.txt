@@ -1,0 +1,498 @@
+"""Conditional diagnostics fed by the runner's single frozen-model prediction pass.
+
+This module never loads, fits, changes, or predicts with a GP. Native indices
+refer to the full physical q-by-kappa grid, flattened in C order. Outputs are
+namespaced under conditional_cache/ and conditional_{summary.json,results.npz}.
+This shared nominal-model diagnostic is auxiliary, not a separately trained
+subset posterior or a replacement for the main separate-emulator analysis.
+"""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+import numpy as np
+from scipy.interpolate import RegularGridInterpolator
+from scipy.special import logsumexp
+from scipy.stats import beta, chi2
+
+
+MATH_PATH = (Path(__file__).resolve().parents[1]
+             / "resolution_universality_20261011/consistency_mean_refit_20261013/run_consistency.py")
+_spec = importlib.util.spec_from_file_location("_paper_conditional_original_math", MATH_PATH)
+_math = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _math
+_spec.loader.exec_module(_math)
+conditional = _math.conditional
+gaussian_stats = _math.gaussian_stats
+mixture_quantiles = _math.mixture_quantiles
+predictive_distance = _math.predictive_distance
+
+PREFIX = "hpt30_hadron_RAA_plus_jet_RAA"
+SUBSTRUCTURE = "theta_g_plus_dR12_plus_rg"
+JOINT = PREFIX + "_plus_theta_g_plus_dR12_plus_rg"
+CASES = {"inclusive": PREFIX, "substructure": SUBSTRUCTURE, "joint": JOINT}
+DIRECTIONS = ("inclusive_to_substructure", "substructure_to_inclusive")
+SEED, MOMENT_DRAWS, REPLICAS = 20261013, 4096, 32768
+BAND_TOLERANCE = .05  # Numerical half-resolution band tolerance in experimental sigma.
+INTERPRETATION = (
+    "Auxiliary common nominal-model diagnostic, not the main separately trained subset "
+    "posteriors. Directional model-conditional Bayesian predictive tails, not formal compatibility "
+    "probabilities, calibrated frequentist significances, or a common-versus-separate "
+    "parameter test. Frozen experimental and full latent emulator covariance retained. "
+    "MC intervals cover replica counting error only; plug-in kernels, empirical PCA/"
+    "omitted-PC assumptions, measured-noise precision and rg qualifications remain."
+)
+
+
+def pack(covariance):
+    rows, columns = np.tril_indices(covariance.shape[-1])
+    return covariance[..., rows, columns]
+
+
+def unpack(packed, dimension):
+    rows, columns = np.tril_indices(dimension)
+    result = np.empty((*packed.shape[:-1], dimension, dimension))
+    result[..., rows, columns] = packed
+    result[..., columns, rows] = packed
+    return result
+
+
+def stats(residual, covariance):
+    ll, distance = gaussian_stats(residual, covariance)
+    logdet = -2 * ll - distance - residual.shape[-1] * np.log(2 * np.pi)
+    return np.column_stack((ll, distance, logdet))
+
+
+def _hash(*arrays):
+    digest = hashlib.sha256()
+    for value in arrays:
+        value = np.ascontiguousarray(value)
+        digest.update(str((value.shape, value.dtype.str)).encode())
+        digest.update(value.tobytes())
+    return digest.hexdigest()
+
+
+def _save_json(path, value):
+    pending = path.with_name(path.name + ".pending")
+    pending.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+    pending.replace(path)
+
+
+def _save_npz(path, **arrays):
+    pending = path.with_name(path.stem + ".pending.npz")
+    np.savez_compressed(pending, **arrays)
+    pending.replace(path)
+
+
+def _bank_data(bank):
+    features = np.asarray(bank["features"], dtype=str)
+    observed = np.asarray(bank["exp"]["y"], dtype=float)
+    experimental = np.asarray(bank["cov"], dtype=float)
+    if features.shape != (len(observed), 3) or experimental.shape != (len(observed),) * 2:
+        raise ValueError("Misaligned experimental features/covariance")
+    if not np.isfinite(observed).all() or not np.isfinite(experimental).all():
+        raise ValueError("Nonfinite experimental inputs")
+    np.testing.assert_allclose(experimental, experimental.T, atol=1e-13, rtol=1e-12)
+    if np.any(np.diag(experimental) <= 0):
+        raise ValueError("Experimental marginal variances must be positive")
+    return features, observed, experimental
+
+
+def tail_stats(observed_distance, replica_distance):
+    """Original binomial calculation; failed numerical checks remain visible."""
+    n = len(replica_distance)
+    count = int(np.sum(replica_distance >= observed_distance))
+    tail = count / n
+    interval = [0. if count == 0 else float(beta.ppf(.025, count, n-count+1)),
+                1. if count == n else float(beta.ppf(.975, count+1, n-count))]
+    half = float(np.mean(replica_distance[:n//2] >= observed_distance))
+    tolerance = float(5 * np.sqrt(max(tail*(1-tail), 1/n) / n) + 1/n)
+    return dict(predictive_tail=tail, exceedances=count, replicas=n,
+                predictive_tail_MC_95=interval,
+                binomial_MC_standard_error=float(np.sqrt(tail*(1-tail)/n)),
+                half_replica_tail=half, half_full_tail_difference=abs(half-tail),
+                half_full_tail_5sigma_tolerance=tolerance,
+                replica_tail_converged=bool(abs(half-tail) <= tolerance),
+                observed_distance=float(observed_distance),
+                replica_distance_16_50_84=np.quantile(replica_distance, [.16, .5, .84]).tolist())
+
+
+class Cache:
+    def __init__(self, root: Path, bank, q, kappa, source_grid, helper):
+        self.root = Path(root)
+        self.directory = self.root / "conditional_cache"
+        self.helper = helper
+        self.q, self.kappa = np.array(q, dtype=float), np.array(kappa, dtype=float)
+        for axis in (self.q, self.kappa):
+            if (axis.ndim != 1 or len(axis) < 5 or len(axis) % 4 != 1
+                    or not np.isfinite(axis).all() or not np.all(np.diff(axis) > 0)):
+                raise ValueError("Axes must be increasing, finite, and length 4m+1")
+        self.shape = (len(self.q), len(self.kappa))
+        for key, axis in (("q", self.q), ("kappa", self.kappa)):
+            if key in source_grid:
+                np.testing.assert_array_equal(source_grid[key], axis)
+        self.coarse_q, self.coarse_kappa = self.q[::2], self.kappa[::2]
+        self.coarse_shape = (len(self.coarse_q), len(self.coarse_kappa))
+        self.full_indices = (np.arange(0, self.shape[0], 2)[:, None] * self.shape[1]
+                             + np.arange(0, self.shape[1], 2)[None, :]).ravel()
+        self._lookup = np.full(np.prod(self.shape), -1, dtype=int)
+        self._lookup[self.full_indices] = np.arange(len(self.full_indices))
+        self.features, self.observed, self.experimental = [v.copy() for v in _bank_data(bank)]
+        self._bank_hash = _hash(self.features, self.observed, self.experimental)
+        names, lower = self.features[:, 0], self.features[:, 1].astype(float)
+        hadron = np.array(["__hadron__" in name for name in names])
+        jet = np.array(["__inclusive_jet__pt_" in name for name in names])
+        sub = np.array([any(tag in name for tag in ("__tg_", "__dr12_", "__rg_")) for name in names])
+        if not np.all(hadron.astype(int) + jet + sub == 1):
+            raise ValueError("Every feature must belong to exactly one known family")
+        self.inclusive = np.flatnonzero((hadron & (lower >= 30)) | jet)
+        self.substructure = np.flatnonzero(sub)
+        self.selected = np.sort(np.r_[self.inclusive, self.substructure])
+        self.excluded = np.flatnonzero(hadron & (lower < 30))
+        if not len(self.inclusive) or not len(self.substructure):
+            raise ValueError("Both conditioning sectors must be nonempty")
+        if len(names) == 170:
+            counts = (len(self.inclusive), len(self.substructure), len(self.excluded),
+                      int(np.sum(hadron & (lower >= 30))), int(jet.sum()),
+                      *(sum(tag in name for name in names) for tag in ("__tg_", "__dr12_", "__rg_")))
+            if counts != (79, 59, 32, 44, 35, 8, 15, 36):
+                raise ValueError("Nominal 170-feature likelihood partition changed")
+        self.layout = {}
+        for direction, fit, held, sector in (
+                (DIRECTIONS[0], self.inclusive, self.substructure, "inclusive"),
+                (DIRECTIONS[1], self.substructure, self.inclusive, "substructure")):
+            observables = [(str(name), np.flatnonzero(names[held] == name))
+                           for name in dict.fromkeys(names[held])]
+            self.layout[direction] = dict(fit=fit, heldout=held, sector=sector, observables=observables)
+
+        self.loglike, self.mass, self.baseline = {}, {}, {}
+        source_arrays = []
+        for sector, key in CASES.items():
+            ll = np.array(source_grid["loglike_" + key], dtype=float, copy=True)
+            if ll.shape != self.shape or not np.isfinite(ll).all():
+                raise ValueError("Invalid saved native likelihood: " + key)
+            self.loglike[sector] = ll
+            full_mass, _ = helper.posterior_mass(ll, self.q, self.kappa)
+            saved = source_grid.get("mass_" + key)
+            saved_error = None
+            if saved is not None:
+                saved = np.asarray(saved)
+                np.testing.assert_allclose(saved, full_mass, atol=1e-11, rtol=1e-8)
+                saved_error = float(.5 * np.abs(saved-full_mass).sum())
+            mass, _ = helper.posterior_mass(ll[::2, ::2], self.coarse_q, self.coarse_kappa)
+            self.mass[sector] = mass
+            tv = self._grid_tv(ll, self.q, self.kappa)
+            self.baseline[sector] = dict(
+                saved_mass_checked=saved is not None, saved_mass_TV=saved_error,
+                full_vs_coarse_TV=tv, posterior_grid_converged=tv < .02,
+                full_pi_T_Lres_16_50_84=helper.weighted_quantile(full_mass, self.q, 0),
+                coarse_pi_T_Lres_16_50_84=helper.weighted_quantile(mass, self.coarse_q, 0),
+                full_kappa_16_50_84=helper.weighted_quantile(full_mass, self.kappa, 1),
+                coarse_kappa_16_50_84=helper.weighted_quantile(mass, self.coarse_kappa, 1))
+            source_arrays.extend((ll, full_mass, mass))
+        identity = dict(version=1, bank_sha256=self._bank_hash,
+                        source_sha256=_hash(self.q, self.kappa, *source_arrays),
+                        math_sha256=hashlib.sha256(MATH_PATH.read_bytes()).hexdigest(),
+                        fit_id=str(np.asarray(source_grid.get("fit_id", "unavailable")).item()),
+                        full_shape=list(self.shape), coarse_shape=list(self.coarse_shape),
+                        seed=SEED, moment_draws=MOMENT_DRAWS, replicas=REPLICAS,
+                        band_tolerance_experimental_sigma=BAND_TOLERANCE)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        manifest = self.directory / "manifest.json"
+        if manifest.exists():
+            if json.loads(manifest.read_text()) != identity:
+                raise ValueError("Conditional cache belongs to different frozen inputs/settings")
+        else:
+            if any(self.directory.iterdir()):
+                raise ValueError("Unidentified existing conditional cache")
+            _save_json(manifest, identity)
+        self.identity = identity
+        self.plan = self._make_plan()
+        self.arrays = {}
+        self.completed = self._open("completed", (len(self.full_indices),), np.bool_, False)
+        self._pending = np.zeros(len(self.full_indices), dtype=bool)
+        self._open("native_likelihood_errors", (len(self.full_indices), 3))
+        self._open("factorization_errors", (len(self.full_indices), 2, 3))
+        for direction, layout in self.layout.items():
+            d, n = len(layout["heldout"]), len(self.full_indices)
+            self._open(direction + "_mean", (n, d))
+            self._open(direction + "_variance", (n, d))
+            self._open(direction + "_stats", (n, 3))
+            self._open(direction + "_observable_Q_logdet", (n, len(layout["observables"]), 2))
+            self._open(direction + "_covariance_packed",
+                       (len(self.plan[direction + "_sampled_indices"]), d*(d+1)//2))
+        self._validate_completed()
+
+    def _validate_completed(self):
+        # Completion is authoritative only if all dependent rows survived.
+        valid = np.ones(len(self.completed), dtype=bool)
+        for name, value in self.arrays.items():
+            if name == "completed":
+                continue
+            finite = np.isfinite(value).reshape(len(value), -1).all(axis=1)
+            if name.endswith("_covariance_packed"):
+                direction = name.removesuffix("_covariance_packed")
+                valid[self.plan[direction + "_sampled_indices"]] &= finite
+            else:
+                valid &= finite
+            if name.endswith("_variance"):
+                valid &= (value > 0).all(axis=1)
+        invalid = self.completed & ~valid
+        if invalid.any():
+            self.completed[invalid] = False
+            self.completed.flush()
+
+    def _grid_tv(self, ll, q, kappa):
+        _, fine = self.helper.posterior_mass(ll, q, kappa)
+        _, coarse = self.helper.posterior_mass(ll[::2, ::2], q[::2], kappa[::2])
+        points = np.column_stack([v.ravel() for v in np.meshgrid(q, kappa, indexing="ij")])
+        interpolated = RegularGridInterpolator((q[::2], kappa[::2]), coarse)(points).reshape(ll.shape)
+        weights = self.helper.trapezoid_weights(q)[:, None] * self.helper.trapezoid_weights(kappa)[None, :]
+        interpolated /= np.sum(interpolated * weights)
+        return float(.5 * np.sum(np.abs(fine-interpolated) * weights))
+
+    def _make_plan(self):
+        rng, plan = np.random.default_rng(SEED), {}
+        for direction, layout in self.layout.items():
+            mass = self.mass[layout["sector"]].ravel()
+            moment = rng.choice(len(mass), size=MOMENT_DRAWS, p=mass)
+            replica = rng.choice(len(mass), size=REPLICAS, p=mass)
+            plan[direction + "_moment_indices"] = moment
+            plan[direction + "_replica_indices"] = replica
+            plan[direction + "_sampled_indices"] = np.union1d(moment, replica)
+            plan[direction + "_normals"] = rng.normal(size=(REPLICAS, len(layout["heldout"])))
+        path = self.directory / "plan.npz"
+        if path.exists():
+            with np.load(path, allow_pickle=False) as archive:
+                if set(archive.files) != set(plan):
+                    raise ValueError("Incomplete conditional RNG plan")
+                for key, value in plan.items():
+                    np.testing.assert_array_equal(archive[key], value, err_msg=key)
+        else:
+            _save_npz(path, **plan)
+        return plan
+
+    def _open(self, name, shape, dtype=np.float64, fill=np.nan):
+        path = self.directory / (name + ".npy")
+        if path.exists():
+            value = np.load(path, mmap_mode="r+")
+            if value.shape != shape or value.dtype != np.dtype(dtype):
+                raise ValueError("Wrong cache array layout: " + name)
+        else:
+            if hasattr(self, "completed") and self.completed.any():
+                raise ValueError("Completed cache is missing array: " + name)
+            value = np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
+            value[:] = fill
+            value.flush()
+        self.arrays[name] = value
+        return value
+
+    def _rows(self, native_indices):
+        indices = np.asarray(native_indices)
+        if indices.ndim != 1 or (indices.size and not np.issubdtype(indices.dtype, np.integer)):
+            raise ValueError("Native indices must be a one-dimensional integer array")
+        indices = indices.astype(int, copy=False)
+        if np.any(indices < 0) or np.any(indices >= len(self._lookup)):
+            raise ValueError("Native grid index outside full grid")
+        return self._lookup[indices]
+
+    def _check_bank(self, bank):
+        if _hash(*_bank_data(bank)) != self._bank_hash:
+            raise ValueError("Frozen bank feature/data/covariance identity changed")
+
+    def need(self, native_indices):
+        rows = self._rows(native_indices)
+        result = np.zeros(len(rows), dtype=bool)
+        inside = rows >= 0
+        result[inside] = ~(self.completed[rows[inside]] | self._pending[rows[inside]])
+        return result
+
+    def evaluate(self, native_indices, prediction, bank):
+        self._check_bank(bank)
+        rows = self._rows(native_indices)
+        mean, latent = np.asarray(prediction["central_value"]), np.asarray(prediction["cov"])
+        f = len(self.features)
+        if mean.shape != (len(rows), f) or latent.shape != (len(rows), f, f):
+            raise ValueError("Expected full native-feature latent predictions aligned to native_indices")
+        take = self.need(native_indices)
+        if not take.any():
+            return
+        rows, mean, latent = rows[take], mean[take], latent[take]
+        if len(np.unique(rows)) != len(rows):
+            raise ValueError("Duplicate incomplete coarse cells in prediction batch")
+        if not np.isfinite(mean).all() or not np.isfinite(latent).all():
+            raise ValueError("Nonfinite latent prediction")
+        np.testing.assert_allclose(latent, latent.swapaxes(1, 2), atol=1e-12, rtol=1e-10)
+        covariance = latent + self.experimental
+        residual = self.observed - mean
+        sector_stats = {}
+        errors = []
+        for sector, indices in (("inclusive", self.inclusive), ("substructure", self.substructure),
+                                ("joint", self.selected)):
+            values = stats(residual[:, indices], covariance[:, indices][:, :, indices])
+            sector_stats[sector] = values
+            saved = self.loglike[sector].ravel()[self.full_indices[rows]]
+            error = np.abs(values[:, 0] - (saved - .5*len(indices)*np.log(2*np.pi)))
+            if np.max(error) >= 1e-7:
+                raise AssertionError(f"Frozen native {sector} likelihood mismatch: {np.max(error):g}")
+            errors.append(error)
+        prepared, factorization = {}, []
+        for direction, layout in self.layout.items():
+            fit, held = layout["fit"], layout["heldout"]
+            predicted, schur = conditional(mean, covariance, self.observed, fit, held)
+            values = stats(self.observed[held]-predicted, schur)
+            error = np.abs(sector_stats[layout["sector"]] + values - sector_stats["joint"])
+            if np.max(error) >= 1e-7:
+                raise AssertionError("Conditional Gaussian factorization failed")
+            factorization.append(error)
+            per_observable = np.empty((len(rows), len(layout["observables"]), 2))
+            for j, (_, local) in enumerate(layout["observables"]):
+                per_observable[:, j] = stats(self.observed[held[local]]-predicted[:, local],
+                                            schur[:, local][:, :, local])[:, 1:]
+            prepared[direction] = predicted, schur, values, per_observable
+        # No completion bits change until every calculation and write succeeds.
+        for direction, (predicted, schur, values, per_observable) in prepared.items():
+            self.arrays[direction + "_mean"][rows] = predicted
+            self.arrays[direction + "_variance"][rows] = np.diagonal(schur, axis1=1, axis2=2)
+            self.arrays[direction + "_stats"][rows] = values
+            self.arrays[direction + "_observable_Q_logdet"][rows] = per_observable
+            sampled = self.plan[direction + "_sampled_indices"]
+            wanted = np.isin(rows, sampled)
+            positions = np.searchsorted(sampled, rows[wanted])
+            self.arrays[direction + "_covariance_packed"][positions] = pack(schur[wanted])
+        self.arrays["native_likelihood_errors"][rows] = np.column_stack(errors)
+        self.arrays["factorization_errors"][rows] = np.stack(factorization, axis=1)
+        self._pending[rows] = True
+
+    def flush(self):
+        for name, value in self.arrays.items():
+            if name != "completed":
+                value.flush()
+        self.completed[self._pending] = True
+        self.completed.flush()
+        self._pending[:] = False
+
+    def _calibrate(self, direction, mass):
+        layout = self.layout[direction]
+        held = layout["heldout"]
+        means = self.arrays[direction + "_mean"]
+        mean = mass @ means
+        centered = means - mean
+        between = centered.T @ (mass[:, None] * centered)
+        sampled = self.plan[direction + "_sampled_indices"]
+        moment = self.plan[direction + "_moment_indices"]
+        replica = self.plan[direction + "_replica_indices"]
+        normals = self.plan[direction + "_normals"]
+        frequency = np.bincount(moment, minlength=len(mass))[sampled]
+        half_frequency = np.bincount(moment[:MOMENT_DRAWS//2], minlength=len(mass))[sampled]
+        packed = self.arrays[direction + "_covariance_packed"]
+        within, half_within = np.zeros_like(between), np.zeros_like(between)
+        replicas = np.empty_like(normals)
+        order = np.argsort(replica)
+        ordered = replica[order]
+        for first in range(0, len(sampled), 128):
+            indices = sampled[first:first+128]
+            covariance = unpack(packed[first:first+len(indices)], len(held))
+            within += np.einsum("m,mij->ij", frequency[first:first+len(indices)], covariance) / MOMENT_DRAWS
+            half_within += np.einsum("m,mij->ij", half_frequency[first:first+len(indices)], covariance) / (MOMENT_DRAWS//2)
+            chol = np.linalg.cholesky(covariance)
+            lo = np.searchsorted(ordered, indices[0], side="left")
+            hi = np.searchsorted(ordered, indices[-1], side="right")
+            positions = order[lo:hi]
+            lookup = np.searchsorted(indices, replica[positions])
+            replicas[positions] = means[indices[lookup]] + np.einsum("mij,mj->mi", chol[lookup], normals[positions])
+        covariance = within + between
+        diagnostics = {}
+        for name, local in [("all_heldout", np.arange(len(held)))] + layout["observables"]:
+            block = np.ix_(local, local)
+            qa, qr = predictive_distance(self.observed[held[local]], mean[local], covariance[block], replicas[:, local])
+            qhalf, _ = predictive_distance(self.observed[held[local]], mean[local],
+                                           (between+half_within)[block], replicas[:1, local])
+            change = float(abs(qhalf-qa)/max(1, qa))
+            diagnostics[name] = dict(tail_stats(qa, qr), bins=len(local),
+                                     moment_half_full_distance_relative_change=change,
+                                     moment_converged=change < .02)
+        result = diagnostics.pop("all_heldout")
+        result.update(observables=diagnostics, seed=SEED, moment_draws=MOMENT_DRAWS,
+                      exact_grid_mean_and_between_covariance=True)
+        arrays = dict(predictive_mean=mean, predictive_covariance=covariance,
+                      within_covariance=within, half_within_covariance=half_within,
+                      between_covariance=between, replicas=replicas)
+        return result, arrays
+
+    def summarize(self, bank):
+        self._check_bank(bank)
+        self.flush()
+        if not self.completed.all():
+            raise RuntimeError(f"Incomplete conditional cache: {int(self.completed.sum())}/{len(self.completed)}")
+        for name, value in self.arrays.items():
+            if name != "completed" and not np.isfinite(value).all():
+                raise RuntimeError("Incomplete/nonfinite conditional array: " + name)
+        summary = dict(interpretation=INTERPRETATION, identity=self.identity,
+                       model_scope="auxiliary_common_nominal_not_separately_trained_subsets",
+                       bins=dict(native=len(self.features), inclusive=len(self.inclusive),
+                                 substructure=len(self.substructure), likelihood=len(self.selected),
+                                 excluded_low_hadron=len(self.excluded)),
+                       quadrature="q[::2], kappa[::2]; uniform physical prior, unchanged support",
+                       baseline=self.baseline, directions={},
+                       max_native_likelihood_error=float(self.arrays["native_likelihood_errors"].max()),
+                       max_factorization_error=float(self.arrays["factorization_errors"].max()),
+                       band_check="Half-resolution of the coarse grid, not full361x241 conditional predictions",
+                       band_tolerance_experimental_sigma=BAND_TOLERANCE)
+        output = dict(q=self.coarse_q, kappa=self.coarse_kappa, full_indices=self.full_indices,
+                      features=self.features, observed=self.observed, experimental_covariance=self.experimental)
+        numerical_flags = [item["posterior_grid_converged"] for item in self.baseline.values()]
+        for sector, mass in self.mass.items():
+            output["mass_" + sector] = mass
+        for direction, layout in self.layout.items():
+            mass = self.mass[layout["sector"]].ravel()
+            means, variance = [self.arrays[direction + suffix] for suffix in ("_mean", "_variance")]
+            quantiles, discarded = mixture_quantiles(means, variance, mass)
+            half_mass, _ = self.helper.posterior_mass(self.loglike[layout["sector"]][::4, ::4],
+                                                     self.q[::4], self.kappa[::4])
+            half_means = means.reshape((*self.coarse_shape, -1))[::2, ::2].reshape(-1, means.shape[-1])
+            half_variance = variance.reshape((*self.coarse_shape, -1))[::2, ::2].reshape(-1, means.shape[-1])
+            half_quantiles, half_discarded = mixture_quantiles(half_means, half_variance, half_mass.ravel())
+            ratio = np.abs(half_quantiles-quantiles) / np.sqrt(np.diag(self.experimental)[layout["heldout"]])
+            mixture, predictive = self._calibrate(direction, mass)
+            values = self.arrays[direction + "_stats"]
+            diagnostic = dict(heldout_bins=len(layout["heldout"]),
+                conditional_log_predictive_density=float(logsumexp(np.log(mass, where=mass>0, out=np.full_like(mass, -np.inf)) + values[:, 0])),
+                posterior_mean_conditional_Q=float(mass @ values[:, 1]),
+                posterior_mean_conditional_logdet=float(mass @ values[:, 2]),
+                parameterwise_chi2_tail_AUXILIARY_ONLY=float(mass @ chi2.sf(values[:, 1], len(layout["heldout"]))),
+                quantile_discarded_mass=discarded, half_quantile_discarded_mass=half_discarded,
+                half_full_band_max_difference_over_experimental_sigma=float(ratio.max()),
+                predictive_bands_converged=bool((ratio < BAND_TOLERANCE).all()),
+                coarse_vs_half_posterior_TV=self._grid_tv(self.loglike[layout["sector"]][::2, ::2], self.coarse_q, self.coarse_kappa),
+                sampled_covariance_cells=len(self.plan[direction + "_sampled_indices"]), mixture=mixture)
+            update = np.log(mass, where=mass>0, out=np.full_like(mass, -np.inf)) + values[:, 0]
+            updated = np.exp(update-logsumexp(update))
+            update_tv = float(.5*np.abs(updated-self.mass["joint"].ravel()).sum())
+            if update_tv >= 1e-8:
+                raise AssertionError("Conditional posterior update differs from saved joint grid")
+            diagnostic["conditional_update_joint_mass_TV"] = update_tv
+            per_observable = self.arrays[direction + "_observable_Q_logdet"]
+            for j, (name, _) in enumerate(layout["observables"]):
+                mixture["observables"][name].update(
+                    posterior_mean_conditional_Q=float(mass @ per_observable[:, j, 0]),
+                    posterior_mean_conditional_logdet=float(mass @ per_observable[:, j, 1]))
+            numerical_flags.extend((diagnostic["predictive_bands_converged"],
+                                    diagnostic["coarse_vs_half_posterior_TV"] < .02))
+            for check in [mixture] + list(mixture["observables"].values()):
+                numerical_flags.extend((check["moment_converged"], check["replica_tail_converged"]))
+            summary["directions"][direction] = diagnostic
+            output.update({direction + "_" + key: value for key, value in predictive.items()})
+            output[direction + "_heldout_indices"] = layout["heldout"]
+            output[direction + "_measurement_quantiles"] = quantiles
+            output[direction + "_half_measurement_quantiles"] = half_quantiles
+            output[direction + "_band_difference_over_experimental_sigma"] = ratio
+        summary["all_numerical_checks_passed"] = bool(all(numerical_flags))
+        summary["failed_checks_are_reported_not_overridden"] = True
+        _save_npz(self.root / "conditional_results.npz", **output)
+        _save_json(self.root / "conditional_summary.json", summary)
+        return summary

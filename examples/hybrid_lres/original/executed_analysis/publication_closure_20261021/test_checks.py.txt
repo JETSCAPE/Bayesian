@@ -1,0 +1,58 @@
+from types import SimpleNamespace
+import sys
+from pathlib import Path
+
+import numpy as np
+from sklearn.gaussian_process.kernels import Matern
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'emulator_mean_check_20261013'))
+from mean_model import MeanAware
+from checks import partial_prediction, shifted_likelihood
+
+
+def fixture():
+    rng=np.random.default_rng(41)
+    n,f,m=4,3,2
+    raw=rng.normal(size=((n+m)*f,(n+m)*f))*.02
+    noise=(raw@raw.T+.002*np.eye((n+m)*f)).reshape(n+m,f,n+m,f)
+    truth=rng.normal(size=(n,f))
+    x=np.column_stack([np.linspace(0,1,n),np.linspace(.1,.8,n)])
+    gp=SimpleNamespace(kernels_=[Matern(.4,nu=1.5)],X_train_=x,Y_train_=truth[:,:1],jitter=1e-10)
+    model=MeanAware(gp,truth,np.eye(f)[:1],np.eye(f)[:1],np.zeros(f),
+                    np.diag([0,.02,.03]),np.eye(f)[1:],np.eye(f)[1:],noise[:n,:,:n,:])
+    points=np.array([[.3,.4],[.7,.8]])
+    return model,points,noise
+
+
+def test_partial_noisy_matches_native():
+    model,points,noise=fixture()
+    native=model.predict(points,noise)
+    for ix in (np.arange(3),np.array([2,0]),np.array([1])):
+        cross=noise[model.n:,ix,:model.n,:]
+        target=np.stack([noise[model.n+i,:,model.n+i,:][np.ix_(ix,ix)] for i in range(2)])
+        mean,cov=partial_prediction(model,points,ix,cross,target)
+        np.testing.assert_allclose(mean,native['central_value'][:,ix],atol=1e-12)
+        np.testing.assert_allclose(cov,native['cov'][:,ix][:,:,ix],atol=1e-12)
+
+
+def test_zero_target_noise_matches_latent():
+    model,points,_=fixture()
+    mean,cov=partial_prediction(model,points,[0,2],np.zeros((2,2,4,3)),np.zeros((2,2,2)))
+    native=model.predict(points)
+    np.testing.assert_allclose(mean,native['central_value'][:,[0,2]],atol=1e-12)
+    np.testing.assert_allclose(cov,native['cov'][:,[0,2]][:,:,[0,2]],atol=1e-12)
+
+
+def test_shifted_likelihood_against_direct_correlated_gaussian():
+    model,points,_=fixture()
+    prediction=model.predict(points)
+    covariance=np.array([[.2,.03,.02],[.03,.3,-.01],[.02,-.01,.1]])
+    data=np.array([.1,-.2,.3])
+    patterns=np.array([[.2,-.3,.1],[.01,.02,.03]])
+    actual=shifted_likelihood(prediction,covariance,data,patterns)
+    for i in range(2):
+        total=covariance+prediction['cov'][i]
+        for j,shift in enumerate([np.zeros(3),*patterns,*(-patterns)]):
+            residual=data-prediction['central_value'][i]-shift
+            expected=-.5*(residual@np.linalg.solve(total,residual)+np.linalg.slogdet(total)[1])
+            np.testing.assert_allclose(actual[i,j],expected,atol=1e-12)

@@ -1,0 +1,327 @@
+"""Frozen-model directional conditional posterior-predictive consistency test."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import sys
+import time
+
+import numpy as np
+from scipy.interpolate import RegularGridInterpolator
+from scipy.special import logsumexp, ndtr
+from scipy.stats import chi2
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent.parent
+REFERENCE = WORK/'emulator_mean_refit_20261013'
+GRID = REFERENCE/'results/mean_refit/inference/grid_refine0.npz'
+sys.path.insert(0, str(REFERENCE))
+
+
+def digest(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def save(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2)+'\n')
+
+
+def setup():
+    import run_refit as ref
+    ref.configure()
+    ref.verify()
+    bank = ref.s.ell_bank(ref.load_bank())
+    with np.load(GRID) as z:
+        grid = {name: z[name].copy() for name in z.files}
+    identity = next(iter(bank['models'].values()))['joint_group_fit_id']
+    assert grid['fit_id'].item() == identity
+    names = np.asarray([feature[0] for feature in bank['features']])
+    inclusive = np.flatnonzero(np.array(['__hadron__' in name or '__inclusive_jet__pt_' in name for name in names]))
+    substructure = np.setdiff1d(np.arange(len(names)), inclusive)
+    assert len(inclusive) == 79 and len(substructure) == 23
+    assert all('__tg_' in name or '__dr12_' in name for name in names[substructure])
+    return ref, bank, grid, inclusive, substructure
+
+
+def gaussian_stats(residual, covariance):
+    """Normalized log density and Mahalanobis distance; no covariance repair."""
+    chol = np.linalg.cholesky(covariance)
+    solved = np.linalg.solve(chol, residual[..., None])[..., 0]
+    distance = np.square(solved).sum(-1)
+    logdet = 2*np.log(np.diagonal(chol, axis1=-2, axis2=-1)).sum(-1)
+    return -.5*(distance+logdet+residual.shape[-1]*np.log(2*np.pi)), distance
+
+
+def conditional(mean, covariance, observed, fit, heldout):
+    """p(y_heldout | y_fit, theta), including emulator and experimental blocks."""
+    aa = covariance[:, fit][:, :, fit]
+    ab = covariance[:, fit][:, :, heldout]
+    bb = covariance[:, heldout][:, :, heldout]
+    residual = observed[fit]-mean[:, fit]
+    chol = np.linalg.cholesky(aa)
+    rhs = np.concatenate([residual[..., None], ab], axis=-1)
+    solved = np.linalg.solve(chol, rhs)
+    solved = np.linalg.solve(chol.transpose(0, 2, 1), solved)
+    predicted = mean[:, heldout]+np.einsum('mab,ma->mb', ab, solved[:, :, 0])
+    schur = bb-np.einsum('mab,mac->mbc', ab, solved[:, :, 1:])
+    schur = .5*(schur+schur.transpose(0, 2, 1))
+    return predicted, schur
+
+
+def fit_grid():
+    ref, bank, grid, a, b = setup()
+    ROOT.mkdir(exist_ok=True)
+    manifest = dict(fit_id=grid['fit_id'].item(), reference_grid_sha256=digest(GRID),
+        reference_manifest_sha256=digest(REFERENCE/'manifest.json'),
+        experimental_covariance_sha256=digest(ref.s.ELL_COV),
+        simulation_covariance_sha256=digest(ref.r.matched.COVARIANCE),
+        frozen='Same data, emulator, covariance, PC counts, ell=0.2, pThadron>30 and uniform physical prior',
+        additions='Substructure-only likelihood and conditional held-out diagnostics; no refit',
+        prior=dict(pi_T_Lres=[0, 20], kappa_sc=[.3, .6], density='uniform physical'),
+        groups={name: settings.n_pc for name, settings in bank['ec'].emulation_settings.items()},
+        directions={'raa_to_substructure': {'fit': a.tolist(), 'heldout': b.tolist()},
+                    'substructure_to_raa': {'fit': b.tolist(), 'heldout': a.tolist()}},
+        interpretation='Conditional Bayesian posterior-predictive tail areas, not calibrated frequentist p-values or probability of model compatibility')
+    manifest_path = ROOT/'manifest.json'
+    if manifest_path.exists():
+        assert json.loads(manifest_path.read_text()) == manifest
+    else:
+        save(manifest_path, manifest)
+    n = len(grid['prediction_mean'])
+    files = {'loglike_substructure': (n,), 'q_joint': (n,)}
+    for direction, indices in [('raa_to_substructure', b), ('substructure_to_raa', a)]:
+        files[direction+'_mean'] = (n, len(indices))
+        files[direction+'_variance'] = (n, len(indices))
+        files[direction+'_distance'] = (n,)
+        for start, stop, name in bank['exp']['observable_ranges']:
+            if start in indices:
+                files[direction+'_distance_'+name] = (n,)
+    cache = ROOT/'cache'
+    cache.mkdir(exist_ok=True)
+    arrays = {}
+    for name, shape in files.items():
+        path = cache/(name+'.npy')
+        arrays[name] = np.lib.format.open_memmap(path, mode='r+' if path.exists() else 'w+', dtype='float64', shape=shape)
+        if not (cache/'progress.json').exists():
+            arrays[name][:] = np.nan
+    progress_path = cache/'progress.json'
+    progress = json.loads(progress_path.read_text()) if progress_path.exists() else {'completed': 0, 'max_saved_loglike_difference': 0.}
+    qq, kk = np.meshgrid(grid['q'], grid['kappa'], indexing='ij')
+    points = ref.s.core.unit(qq.ravel(), kk.ravel())
+    t0 = time.monotonic()
+    for start in range(progress['completed'], n, 128):
+        stop = min(start+128, n)
+        prediction = ref.predict(bank, points[start:stop])
+        np.testing.assert_allclose(prediction['central_value'], grid['prediction_mean'][start:stop], rtol=1e-10, atol=1e-11)
+        np.testing.assert_allclose(np.diagonal(prediction['cov'], axis1=1, axis2=2), grid['prediction_variance'][start:stop], rtol=1e-10, atol=1e-11)
+        covariance = prediction['cov']+bank['cov']
+        residual = bank['exp']['y']-prediction['central_value']
+        la, qa = gaussian_stats(residual[:, a], covariance[:, a][:, :, a])
+        lb, _ = gaussian_stats(residual[:, b], covariance[:, b][:, :, b])
+        arrays['loglike_substructure'][start:stop] = lb
+        for direction, fit, heldout in [('raa_to_substructure', a, b), ('substructure_to_raa', b, a)]:
+            means, schur = conditional(prediction['central_value'], covariance, bank['exp']['y'], fit, heldout)
+            target_residual = bank['exp']['y'][heldout]-means
+            lc, distance = gaussian_stats(target_residual, schur)
+            arrays[direction+'_mean'][start:stop] = means
+            arrays[direction+'_variance'][start:stop] = np.diagonal(schur, axis1=1, axis2=2)
+            arrays[direction+'_distance'][start:stop] = distance
+            joint = (la if direction == 'raa_to_substructure' else lb)+lc
+            saved = grid['loglike_raa_theta_dr12'].ravel()[start:stop]-.5*len(bank['features'])*np.log(2*np.pi)
+            error = float(np.max(abs(joint-saved)))
+            assert error < 1e-8, error
+            progress['max_saved_loglike_difference'] = max(progress['max_saved_loglike_difference'], error)
+            if direction == 'raa_to_substructure':
+                arrays['q_joint'][start:stop] = qa+distance
+            for lo, hi, name in bank['exp']['observable_ranges']:
+                local = np.flatnonzero((heldout >= lo) & (heldout < hi))
+                if len(local):
+                    _, dist = gaussian_stats(target_residual[:, local], schur[:, local][:, :, local])
+                    arrays[direction+'_distance_'+name][start:stop] = dist
+        for array in arrays.values():
+            array.flush()
+        progress['completed'] = stop
+        save(progress_path, progress)
+        if start % 10240 == 0 or stop == n:
+            print(f'CONDITIONAL_GRID {stop}/{n}, elapsed {time.monotonic()-t0:.1f}s', flush=True)
+    ref.verify()
+    save(ROOT/'GRID_COMPLETE.json', dict(points=n, normalized_joint_likelihood_identity_max_error=progress['max_saved_loglike_difference'],
+        model_predictions_match_frozen_grid=True, no_settings_or_reference_changes=True))
+
+
+def mixture_quantiles(mean, variance, weights):
+    """Deterministic Gaussian mixture quantiles; omitted mass <= 1e-10."""
+    order = np.argsort(weights)[::-1]
+    keep = order[:np.searchsorted(np.cumsum(weights[order]), 1-1e-10)+1]
+    weight = weights[keep]
+    discarded = float(1-weight.sum())
+    weight = weight/weight.sum()
+    means, sigma = mean[keep], np.sqrt(variance[keep])
+    assert np.all(sigma > 0)
+    left = np.min(means-10*sigma, axis=0)
+    right = np.max(means+10*sigma, axis=0)
+    values = []
+    for probability in (.025, .16, .5, .84, .975):
+        lo, hi = left.copy(), right.copy()
+        for _ in range(48):
+            middle = (lo+hi)/2
+            cdf = weight @ ndtr((middle-means)/sigma)
+            lo = np.where(cdf < probability, middle, lo)
+            hi = np.where(cdf >= probability, middle, hi)
+        values.append((lo+hi)/2)
+    return np.asarray(values), discarded
+
+
+def summarize():
+    ref, bank, grid, a, b = setup()
+    style = ref.s.ref.scan.plotter_module()
+    q, k = grid['q'], grid['kappa']
+    cache = ROOT/'cache'
+    load = lambda name: np.load(cache/(name+'.npy'), mmap_mode='r')
+    lb = load('loglike_substructure').reshape(len(q), len(k))
+    assert np.isfinite(lb).all()
+    mass_b, density_b = style.posterior_mass(lb, q, k)
+    masses = {'raa': grid['mass_raa_hpt30_full'], 'substructure': mass_b, 'joint': grid['mass_raa_theta_dr12']}
+    summary = {'parameters': {}, 'directions': {}}
+    output = dict(q=q, kappa=k, mass_substructure=mass_b, loglike_substructure=lb)
+    for name, mass in masses.items():
+        summary['parameters'][name] = dict(pi_T_Lres_16_50_84=style.weighted_quantile(mass, q, 0),
+            kappa_sc_16_50_84=style.weighted_quantile(mass, k, 1))
+    output['joint_latent_quantiles'], joint_discarded = mixture_quantiles(
+        grid['prediction_mean'], grid['prediction_variance'], masses['joint'].ravel())
+    summary['joint_predictive_discarded_mass'] = joint_discarded
+    iq, ik = np.arange(0, len(q), 2), np.arange(0, len(k), 2)
+    _, coarse = style.posterior_mass(lb[np.ix_(iq, ik)], q[iq], k[ik])
+    qq, kk = np.meshgrid(q, k, indexing='ij')
+    interpolated = RegularGridInterpolator((q[iq], k[ik]), coarse)(np.column_stack([qq.ravel(), kk.ravel()])).reshape(mass_b.shape)
+    weights = style.trapezoid_weights(q)[:, None]*style.trapezoid_weights(k)[None, :]
+    interpolated /= np.sum(interpolated*weights)
+    tv = float(.5*np.sum(abs(density_b-interpolated)*weights))
+    assert tv < .02, tv
+    summary['substructure_coarse_fine_TV'] = tv
+    for direction, mass, fit, heldout in [('raa_to_substructure', masses['raa'], a, b), ('substructure_to_raa', masses['substructure'], b, a)]:
+        m = mass.ravel()
+        means, variance = load(direction+'_mean'), load(direction+'_variance')
+        quantiles, discarded = mixture_quantiles(means, variance, m)
+        output[direction+'_measurement_quantiles'] = quantiles
+        latent, _ = mixture_quantiles(grid['prediction_mean'][:, heldout], grid['prediction_variance'][:, heldout], m)
+        output[direction+'_latent_quantiles'] = latent
+        distance = load(direction+'_distance')
+        base = grid['loglike_raa_hpt30_full'].ravel() if direction == 'raa_to_substructure' else lb.ravel()+.5*len(b)*np.log(2*np.pi)
+        conditional_loglike = grid['loglike_raa_theta_dr12'].ravel()-base-.5*len(heldout)*np.log(2*np.pi)
+        log_predictive = float(logsumexp(np.log(m, where=m>0, out=np.full_like(m, -np.inf))+conditional_loglike))
+        lo, hi = quantiles[1], quantiles[3]
+        diagnostic = dict(heldout_bins=len(heldout), parameterwise_tail_diagnostic=float(m @ chi2.sf(distance, len(heldout))),
+            posterior_mean_mahalanobis=float(m @ distance), conditional_log_predictive_density=log_predictive,
+            bins_outside_marginal_68=int(np.sum((bank['exp']['y'][heldout]<lo) | (bank['exp']['y'][heldout]>hi))),
+            bins_outside_marginal_95=int(np.sum((bank['exp']['y'][heldout]<quantiles[0]) | (bank['exp']['y'][heldout]>quantiles[4]))),
+            mixture_discarded_mass=discarded, observables={})
+        for start, stop, name in bank['exp']['observable_ranges']:
+            if start in heldout:
+                dist = load(direction+'_distance_'+name)
+                diagnostic['observables'][name] = dict(bins=stop-start,
+                    parameterwise_tail_diagnostic=float(m @ chi2.sf(dist, stop-start)), posterior_mean_mahalanobis=float(m @ dist))
+        summary['directions'][direction] = diagnostic
+    summary['interpretation'] = ('Directional posterior-predictive diagnostics conditional on the fitted sector. '
+        'Parameterwise tail is only an auxiliary diagnostic: it can be misleading for broad parameter posteriors. '
+        'Primary compatibility diagnostic is the separately simulated full posterior-predictive mixture tail, including between-parameter spread. '
+        'Neither is a probability of compatibility or formal common-versus-separate-parameter test. '
+        'Bands for measurements include experimental errors, emulator covariance and conditioning shifts; latent bands do not include experimental errors. '
+        'Experimental covariance assumptions and unresolved independent emulator validation limit any physical conclusion.')
+    np.savez_compressed(ROOT/'results.npz', **output)
+    save(ROOT/'summary.json', summary)
+    print(json.dumps(summary, indent=2), flush=True)
+    ref.verify()
+
+
+def predictive_distance(observed, mean, covariance, replicas):
+    """A fixed discrepancy for data and replicas, NOT recentered at each theta."""
+    chol = np.linalg.cholesky(covariance)
+    residual = np.linalg.solve(chol, observed-mean)
+    simulated = np.linalg.solve(chol, (replicas-mean).T).T
+    return float(residual @ residual), np.square(simulated).sum(1)
+
+
+def calibrate_predictive():
+    ref, bank, grid, a, b = setup()
+    with np.load(ROOT/'results.npz') as z:
+        mass_b = z['mass_substructure'].copy()
+    summary = json.loads((ROOT/'summary.json').read_text())
+    rng = np.random.default_rng(20261013)
+    qq, kk = np.meshgrid(grid['q'], grid['kappa'], indexing='ij')
+    unit_points = ref.s.core.unit(qq.ravel(), kk.ravel())
+    counts_moment, counts_replica = 4096, 32768
+    for direction, mass, fit, heldout in [('raa_to_substructure', grid['mass_raa_hpt30_full'], a, b),
+                                        ('substructure_to_raa', mass_b, b, a)]:
+        m = mass.ravel()
+        means = np.load(ROOT/'cache'/(direction+'_mean.npy'), mmap_mode='r')
+        mean = m @ means
+        centered = means-mean
+        between = centered.T @ (m[:, None]*centered)
+        moment_indices = rng.choice(len(m), size=counts_moment, p=m)
+        replica_indices = rng.choice(len(m), size=counts_replica, p=m)
+        unique = np.union1d(moment_indices, replica_indices)
+        frequency = np.bincount(moment_indices, minlength=len(m))
+        half_frequency = np.bincount(moment_indices[:counts_moment//2], minlength=len(m))
+        order = np.argsort(replica_indices)
+        ordered_indices = replica_indices[order]
+        normals = rng.normal(size=(counts_replica, len(heldout)))
+        replicas = np.empty_like(normals)
+        within, half_within = np.zeros_like(between), np.zeros_like(between)
+        for start in range(0, len(unique), 128):
+            indices = unique[start:start+128]
+            prediction = ref.predict(bank, unit_points[indices])
+            conditional_mean, covariance = conditional(prediction['central_value'], prediction['cov']+bank['cov'], bank['exp']['y'], fit, heldout)
+            np.testing.assert_allclose(conditional_mean, means[indices], atol=1e-11, rtol=1e-10)
+            within += np.einsum('m,mij->ij', frequency[indices], covariance)/counts_moment
+            half_within += np.einsum('m,mij->ij', half_frequency[indices], covariance)/(counts_moment//2)
+            chol = np.linalg.cholesky(covariance)
+            lo, hi = np.searchsorted(ordered_indices, [indices[0], indices[-1]], side='left')
+            hi = np.searchsorted(ordered_indices, indices[-1], side='right')
+            positions = order[lo:hi]
+            lookup = np.searchsorted(indices, replica_indices[positions])
+            replicas[positions] = conditional_mean[lookup]+np.einsum('mij,mj->mi', chol[lookup], normals[positions])
+        covariance = between+within
+        observed = bank['exp']['y'][heldout]
+        qobserved, qreplica = predictive_distance(observed, mean, covariance, replicas)
+        half_observed, _ = predictive_distance(observed, mean, between+half_within, replicas[:1])
+        exceedances = int(np.sum(qreplica >= qobserved))
+        tail = exceedances/counts_replica
+        from scipy.stats import beta
+        interval = [0. if exceedances == 0 else float(beta.ppf(.025, exceedances, counts_replica-exceedances+1)),
+                    1. if exceedances == counts_replica else float(beta.ppf(.975, exceedances+1, counts_replica-exceedances))]
+        diagnostic = dict(predictive_tail=tail, predictive_tail_MC_95=interval, observed_distance=qobserved,
+            replica_distance_16_50_84=np.quantile(qreplica, [.16, .5, .84]).tolist(), replicas=counts_replica,
+            moment_draws=counts_moment, exact_between_parameter_covariance=True,
+            moment_half_full_distance_relative_change=float(abs(half_observed-qobserved)/max(1, qobserved)), observables={})
+        assert diagnostic['moment_half_full_distance_relative_change'] < .02, diagnostic
+        for lo, hi, name in bank['exp']['observable_ranges']:
+            local = np.flatnonzero((heldout >= lo) & (heldout < hi))
+            if len(local):
+                qa, qr = predictive_distance(observed[local], mean[local], covariance[np.ix_(local, local)], replicas[:, local])
+                diagnostic['observables'][name] = dict(predictive_tail=float(np.mean(qr >= qa)), observed_distance=qa, bins=len(local))
+        summary['directions'][direction]['mixture_calibrated'] = diagnostic
+        np.savez_compressed(ROOT/(direction+'_replicas.npz'), predictive_mean=mean, predictive_covariance=covariance,
+            replicas=replicas, observed_distance=qobserved, replica_distance=qreplica, heldout_indices=heldout)
+        print('CALIBRATED', direction, json.dumps(diagnostic), flush=True)
+    summary['predictive_tail_definition'] = ('Use a fixed Mahalanobis discrepancy centered on the conditional posterior-predictive mean, '
+        'with covariance including both conditional measurement uncertainty and between-parameter spread. '
+        'Tail is calibrated using 32768 draws from the actual conditional Gaussian mixture, not a chi-square approximation. '
+        'The mean/between-parameter covariance are exact grid integrals; average within-parameter covariance uses 4096 draws with a half/full stability check. '
+        'This is a directional Bayesian predictive check under the frozen model, not a frequentist tension significance.')
+    save(ROOT/'summary.json', summary)
+    ref.verify()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--stage', choices=('grid', 'summary', 'calibrate', 'all'), default='all')
+    args = parser.parse_args()
+    if args.stage in ('grid', 'all'):
+        fit_grid()
+    if args.stage in ('summary', 'all'):
+        summarize()
+    if args.stage in ('calibrate', 'all'):
+        calibrate_predictive()

@@ -1,0 +1,292 @@
+"""Publication QA from frozen arrays; optional one-point inference, never fitting."""
+from pathlib import Path
+import argparse
+import hashlib
+import json
+import sys
+
+import numpy as np
+from scipy.linalg import solve_triangular
+from scipy.special import ndtr
+
+WORK = Path('/home/jean/jetscape')
+ROOT = Path(__file__).resolve().parent / 'appendix_qa'
+QUEUE = WORK / 'paper_local_checks_20261019/queue'
+RAW = WORK / 'atlas_rg_inference_20261015/recovery_20261016/precision_continuation/timeout_completion/export/full_simulation_covariance_rg.npz'
+sys.path.insert(0, str(WORK))
+sys.path.insert(0, str(WORK / 'paper_local_checks_20261019'))
+sys.path.insert(0, str(WORK / 'publication_closure_20261021'))
+
+GROUPS = [
+    ('alice_hadron_group', 'ALICE hadrons', '__pt_ch_alice__'),
+    ('atlas_hadron_group', 'ATLAS hadrons', '__pt_ch_atlas__'),
+    ('cms_hadron_group', 'CMS hadrons', '__pt_ch_cms__'),
+    ('alice_jet_group', 'ALICE jets', '__pt_alice__'),
+    ('atlas_jet_group', 'ATLAS jets', '__pt_atlas__'),
+    ('cms_jet_group', 'CMS jets', '__pt_cms__'),
+    ('alice_theta_g_group', r'ALICE $\theta_g$', '__tg_alice__'),
+    ('atlas_dr12_group', r'ATLAS $dR_{12}$', '__dr12_atlas__'),
+    ('atlas_rg_group', r'ATLAS $r_g$', '__rg_atlas__'),
+]
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def sha(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def arrays(path):
+    with np.load(path, allow_pickle=False) as z:
+        return {k: z[k].copy() for k in z.files}
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, indent=2, allow_nan=False) + '\n')
+
+
+def inputs():
+    paths = [QUEUE / 'MANIFEST.json', QUEUE / 'covariances.npz', RAW]
+    paths += [QUEUE / 'results/all/QA' / name for name in
+              ('fivefold_predictions.npz', 'independent_validation.npz',
+               'optimizer_and_PC_audit.json', 'validation_summary.json')]
+    pins = {str(p): sha(p) for p in paths}
+    rows = read(paths[0])['models']['all']['features']
+    exp = arrays(paths[1])
+    own = [(n, float(a), float(b)) for n, a, b in rows]
+    full = [(n, float(a), float(b)) for n, a, b in exp['features']]
+    selected = [full.index(row) for row in own]
+    raw = arrays(RAW)
+    raw_rows = list(zip(raw['observable_names'], raw['xmin'], raw['xmax']))
+    ri = [raw_rows.index(row) for row in own]
+    cv, hold = arrays(paths[3]), arrays(paths[4])
+    assert cv['truth'].shape == (39, 138) and hold['design_ids'].tolist() == [38]
+    # Frozen prediction text tables were serialized at finite decimal precision.
+    np.testing.assert_allclose(cv['truth'], raw['central_values'][cv['design_ids']][:, ri], rtol=2e-6, atol=1e-12)
+    np.testing.assert_allclose(hold['truth'], raw['central_values'][[38]][:, ri], rtol=2e-6, atol=1e-12)
+    assert len(set(own)) == len(own) == 138
+    indices = [np.array([i for i, r in enumerate(own) if tag in r[0]]) for _, _, tag in GROUPS]
+    assert sorted(np.concatenate(indices).tolist()) == list(range(138))
+    cexp = exp['covariance_ell_0p2'][np.ix_(selected, selected)]
+    return pins, own, raw, ri, cv, hold, indices, cexp
+
+
+def render():
+    import matplotlib.pyplot as plt
+    import hybrid_plotting as hp
+    ROOT.mkdir(exist_ok=True)
+    pins, rows, raw, ri, cv, hold, groups, cexp = inputs()
+    audit = read(QUEUE / 'results/all/QA/optimizer_and_PC_audit.json')['main']['groups']
+    with hp.paper_style():
+        fig, axes = plt.subplots(1, 2, figsize=(7.15, 3.4), layout='constrained')
+        u, v = cv['design_unit'].T
+        axes[0].scatter(u, v, s=15, color=hp.DEFAULT_COLOR, label='39 training points')
+        axes[0].scatter(*hold['design_unit'].T, s=75, marker='*', color=hp.comparison_style('vermillion')['color'], label='Held-out point')
+        umax = 2/np.pi*np.arctan(20**(1/3))
+        axes[0].axvspan(umax, 1, color='.9', zorder=-1)
+        axes[0].axvline(umax, color='.3', ls=':', lw=1)
+        axes[0].set(xlim=(0, 1), ylim=(0, 1), xlabel=r'$u$ (resolution input)', ylabel=r'$v$ (coupling input)')
+        axes[0].legend(loc='lower left', bbox_to_anchor=(0,1.01), fontsize=8, frameon=False)
+        for key, label, _ in GROUPS:
+            value = audit[key]
+            count = np.arange(1, len(value['explained_variance_ratio'])+1)
+            axes[1].plot(count, np.cumsum(value['explained_variance_ratio']), lw=1, color='.7')
+            axes[1].scatter(value['retained'], value['retained_variance_fraction'], s=25, color=hp.DEFAULT_COLOR)
+        axes[1].set(xscale='log', xlim=(.9, 38), ylim=(.6, 1.007), xlabel='PCA coefficient count', ylabel='Cumulative variance', xticks=[1,2,4,8,16,36], xticklabels=['1','2','4','8','16','36'])
+        axes[1].text(.98, .05, 'Dots: retained counts\nAll nine observable groups', transform=axes[1].transAxes, ha='right', fontsize=9)
+        for ax in axes:
+            hp.frame_axes(ax, minor=False)
+        hp.save_figure(fig, ROOT / 'qa_design_pca')
+        plt.close(fig)
+
+        fig, axes = plt.subplots(3, 3, figsize=(7.15, 7.5), layout='constrained')
+        for ax, (_, label, _), ix in zip(axes.ravel(), GROUPS, groups):
+            truth, mean = cv['truth'][:, ix].ravel(), cv['observed_mean'][:, ix].ravel()
+            sigma = np.sqrt(np.diagonal(cv['observed_covariance'], axis1=1, axis2=2)[:, ix]).ravel()
+            ax.errorbar(truth, mean, yerr=sigma, fmt='.', ms=2, lw=.4, alpha=.35, color=hp.DEFAULT_COLOR)
+            ax.scatter(hold['truth'][:, ix], hold['observed_mean'][:, ix], s=12, marker='x', color=hp.comparison_style('vermillion')['color'])
+            lo, hi = min(truth.min(), (mean-sigma).min()), max(truth.max(), (mean+sigma).max())
+            pad = .08*(hi-lo)
+            ax.plot([lo-pad, hi+pad], [lo-pad, hi+pad], color='.4', ls='--', lw=1)
+            ax.set(xlim=(lo-pad, hi+pad), ylim=(lo-pad, hi+pad), title=label)
+            ax.tick_params(labelsize=9)
+            hp.frame_axes(ax, minor=False)
+        fig.supxlabel('Held-out simulation', fontsize=12)
+        fig.supylabel('Prediction for the noisy held-out target', fontsize=12)
+        hp.save_figure(fig, ROOT / 'qa_validation_scatter')
+        plt.close(fig)
+
+        fig, axes = plt.subplots(3, 3, figsize=(7.15, 7.5), layout='constrained')
+        metrics = {}
+        for ax, (key, label, _), ix in zip(axes.ravel(), GROUPS, groups):
+            pull = ((cv['truth']-cv['observed_mean']) / np.sqrt(np.diagonal(cv['observed_covariance'], axis1=1, axis2=2)))[:, ix].ravel()
+            x = np.linspace(-5, 5, 301)
+            ax.hist(pull, bins=np.linspace(-5, 5, 21), density=True, color=hp.DEFAULT_COLOR, alpha=.55)
+            ax.plot(x, np.exp(-x*x/2)/np.sqrt(2*np.pi), color='.25', lw=1)
+            coverage = [(abs(pull) <= k).mean() for k in (1, 2)]
+            metrics[key] = dict(coverage_1sigma=coverage[0], coverage_2sigma=coverage[1], max_pull=float(abs(pull).max()))
+            ax.text(.96, .95, f'Within 1 / 2 sigma\n{100*coverage[0]:.1f}% / {100*coverage[1]:.1f}%', transform=ax.transAxes, ha='right', va='top', fontsize=8)
+            ax.set(xlim=(-5, 5), ylim=(0, .9), title=label, xticks=[-4, -2, 0, 2, 4])
+            ax.tick_params(labelsize=9)
+            hp.frame_axes(ax, minor=False)
+        fig.supxlabel(r'$(y_{\rm sim}-\mu_{\rm target})/\sigma_{\rm target}$', fontsize=12)
+        fig.supylabel('Normalized bin-count density', fontsize=12)
+        hp.save_figure(fig, ROOT / 'qa_validation_pulls')
+        plt.close(fig)
+
+        fig, axes = plt.subplots(1, 2, figsize=(7.15, 4.7), layout='constrained')
+        labels = [label for _, label, _ in GROUPS]
+        mc = np.sqrt(np.stack([raw['covariance'][int(d), ri, int(d)][:, ri].diagonal() for d in cv['design_ids']]))
+        latent = np.sqrt(np.diagonal(cv['latent_covariance'], axis1=1, axis2=2))
+        exp_sigma = np.sqrt(cexp.diagonal())
+        for offset, values, role, name in [(-.11, latent/exp_sigma, 'default', 'Latent emulator uncertainty'), (.11, mc/exp_sigma, 'vermillion', 'Simulation statistical error')]:
+            quantiles = np.array([np.quantile(values[:, ix], [.16, .5, .84]) for ix in groups])
+            axes[0].errorbar(quantiles[:, 1], np.arange(9)+offset, xerr=np.vstack((quantiles[:, 1]-quantiles[:, 0], quantiles[:, 2]-quantiles[:, 1])), fmt='o', ms=3, lw=1.2, label=name, color=hp.comparison_style(role)['color'])
+        axes[0].axvline(1, color='.4', ls='--', lw=1)
+        axes[0].set(xscale='log', xlabel=r'Uncertainty / $\sigma_{\rm exp}$', yticks=np.arange(9), yticklabels=labels, ylim=(8.5, -.7))
+        axes[0].legend(loc='lower left', bbox_to_anchor=(0, 1.01), frameon=False, fontsize=8)
+        t = np.linspace(0, 3, 121)
+        axes[1].plot(t, 2*ndtr(t)-1, color='.25', lw=1, label='Gaussian reference')
+        for ix in (groups[3], groups[4], groups[5], np.concatenate(groups[6:])):
+            pull = abs(((cv['truth']-cv['observed_mean']) / np.sqrt(np.diagonal(cv['observed_covariance'], axis1=1, axis2=2)))[:, ix]).ravel()
+            name, role = ('Substructure', 'default') if len(ix)==59 else {12:('ALICE jets','vermillion'),15:('ATLAS jets','purple'),8:('CMS jets','blue')}[len(ix)]
+            style = hp.comparison_style(role) | dict(marker=None, linewidth=1.5)
+            axes[1].plot(t, [(pull <= k).mean() for k in t], label=name, **style)
+        axes[1].set(xlim=(0,3), ylim=(0,1.02), xlabel=r'Half-width / $\sigma_{\rm target}$', ylabel='Fraction of bins inside')
+        axes[1].legend(loc='lower right', frameon=False, fontsize=8)
+        for ax in axes:
+            ax.tick_params(labelsize=9)
+            hp.frame_axes(ax, minor=False)
+        hp.save_figure(fig, ROOT / 'qa_precision_coverage')
+        plt.close(fig)
+    save(ROOT / 'RENDERED.json', dict(source_pins=pins, script_sha256=sha(Path(__file__)), metrics=metrics,
+         caveat='Descriptive correlated-bin counts, not independent calibration trials. Frozen original CV fits; no refits or promotions.'))
+    print('CACHED_QA_RENDERED', flush=True)
+
+
+def closure(refine=False):
+    from functools import partial
+    from types import FunctionType, SimpleNamespace
+    import queue_models as api
+    import remaining_inference as infer
+    from checks import partial_prediction
+    ROOT.mkdir(exist_ok=True)
+    output_tag = 'closure_grid_181x121' if refine else 'closure_grid'
+    assert not (ROOT / (output_tag+'.npz')).exists(), 'Do not repeat a completed grid'
+    pins, own, raw, ri, cv, hold, groups, cexp = inputs()
+    bank = api.load_bank('all', experimental=False)
+    identity = api.model_identity('all')
+    assert own == [(n, float(a), float(b)) for n,a,b in bank['features']]
+    model = bank['mean_model']
+    train = bank['raw']['Design_indices'].astype(int)
+    np.testing.assert_array_equal(model.noise, raw['covariance'][train][:, ri][:, :, train][:, :, :, ri])
+    cross = raw['covariance'][38, ri][:, train][:, :, ri]
+    target = raw['covariance'][38, ri, 38][:, ri]
+    exact = partial_prediction(model, hold['design_unit'], np.arange(138), cross[None], target[None])
+    np.testing.assert_allclose(exact[0], hold['observed_mean'], atol=2e-10, rtol=1e-9)
+    np.testing.assert_allclose(exact[1], hold['observed_covariance'], atol=2e-10, rtol=1e-8)
+    # Reuse the exact tested helper bytecode with matrix-chain contraction
+    # ordering enabled. The original helper/module and all models stay intact.
+    fast_numpy = SimpleNamespace(**(vars(np) | {'einsum': partial(np.einsum, optimize=True)}))
+    fast_prediction = FunctionType(partial_prediction.__code__,
+        partial_prediction.__globals__ | {'np': fast_numpy})
+    check_points = np.vstack((hold['design_unit'], [[.4,.4],[.7,.5]]))
+    check_cross = np.broadcast_to(cross, (3,)+cross.shape)
+    check_target = np.broadcast_to(target, (3,)+target.shape)
+    slow = partial_prediction(model,check_points,np.arange(138),check_cross,check_target)
+    fast = fast_prediction(model,check_points,np.arange(138),check_cross,check_target)
+    for a,b in zip(fast,slow):
+        np.testing.assert_allclose(a,b,atol=2e-10,rtol=1e-8)
+    template = arrays(QUEUE / 'results/all/inference/grid.npz')
+    # One untouched validation target with experimental covariance, no replica draw.
+    stride = 2 if refine else 4
+    q, kappa = template['q'][::stride], template['kappa'][::stride]
+    def evaluate(q, kappa):
+        points = infer.physical_points(q, kappa)
+        ll = np.full((len(q),len(kappa)),np.nan)
+        if refine:
+            previous = arrays(ROOT/'closure_grid.npz')
+            old_report = read(ROOT/'CLOSURE.json')
+            assert old_report['fit_identity'] == identity and old_report['source_pins'] == pins
+            np.testing.assert_array_equal(previous['q'],q[::2])
+            np.testing.assert_array_equal(previous['kappa'],kappa[::2])
+            ll[::2,::2] = previous['loglike']
+        missing = np.flatnonzero(np.isnan(ll.ravel()))
+        for start in range(0, len(missing), 64):
+            ids = missing[start:start+64]
+            batch = points[ids]
+            mean, cov = fast_prediction(model, batch, np.arange(138),
+                np.broadcast_to(cross, (len(batch),)+cross.shape), np.broadcast_to(target, (len(batch),)+target.shape))
+            factor = np.linalg.cholesky(cov + cexp)
+            residual = hold['truth'][0] - mean
+            white = np.linalg.solve(factor, residual[..., None])[..., 0]
+            ll.ravel()[ids] = -.5*np.sum(white**2,axis=1)-np.log(np.diagonal(factor,axis1=1,axis2=2)).sum(axis=1)
+            if start % 2048 == 0:
+                print('CLOSURE new cells', start+len(batch), '/', len(missing), flush=True)
+        assert np.isfinite(ll).all()
+        return ll
+    ll = evaluate(q, kappa)
+    prior = infer._helper(infer.PRIOR_PATH)
+    mass, tv = infer.convergence(ll,q,kappa)
+    density = mass/(prior.weights(q)[:,None]*prior.weights(kappa)[None,:])
+    # A real convergence failure is reported, not bypassed or silently refined.
+    np.savez_compressed(ROOT / (output_tag+'.npz'), q=q,kappa=kappa,loglike=ll,mass=mass,density=density)
+    true_u, true_v = hold['design_unit'][0]
+    true_q, true_k = np.tan(np.pi*true_u/2)**3, .3+.3*true_v
+    report = dict(fit_identity=identity, source_pins=pins, true_physical=[true_q,true_k],
+        shape=list(ll.shape), coarse_fine_TV=float(tv), convergence_pass=bool(tv<.02),
+        kind='One-point parameter recovery using heldout38 and full experimental covariance; no experimental replica draw. Includes measured target/train and target/target MC covariance.',
+        caveat='One point is not repeated-sample coverage calibration or a posterior-local simulation test.')
+    save(ROOT / ('CLOSURE_181x121.json' if refine else 'CLOSURE.json'), report)
+    assert api.model_identity('all') == identity
+    print('CLOSURE_COMPLETE', {k:report[k] for k in ('true_physical','shape','coarse_fine_TV','convergence_pass')}, flush=True)
+
+
+def render_closure():
+    import matplotlib.pyplot as plt
+    import hybrid_plotting as hp
+    import remaining_inference as infer
+    from scipy.interpolate import RegularGridInterpolator
+    suffix = '_181x121' if (ROOT/'CLOSURE_181x121.json').exists() else ''
+    z, report = arrays(ROOT / ('closure_grid'+suffix+'.npz')), read(ROOT / ('CLOSURE'+suffix+'.json'))
+    if not report['convergence_pass']:
+        raise ValueError('Closure quadrature has not passed the stated convergence gate')
+    prior = infer._helper(infer.PRIOR_PATH)
+    q, k, mass, density = (z[key] for key in ('q','kappa','mass','density'))
+    true_q, true_k = report['true_physical']
+    ordered = np.argsort(density.ravel())[::-1]
+    threshold = [density.ravel()[ordered][np.searchsorted(np.cumsum(mass.ravel()[ordered]),p)] for p in (.68,.95)]
+    true_density = float(RegularGridInterpolator((q,k),density)([[true_q,true_k]])[0])
+    report['physical_pi_T_Lres_16_50_84'] = prior.quantiles(mass,q,0)
+    report['kappa_16_50_84'] = prior.quantiles(mass,k,1)
+    report['truth_inside_68pct_joint_HPD'] = bool(true_density >= threshold[0])
+    report['truth_inside_95pct_joint_HPD'] = bool(true_density >= threshold[1])
+    with hp.paper_style():
+        fig, axes = plt.subplots(1,2,figsize=(7.15,3.6),layout='constrained')
+        for ax, x, marginal, truth, xlabel in (
+            (axes[0],q,mass.sum(axis=1)/prior.weights(q),true_q,hp.LRES_LABEL),
+            (axes[1],k,mass.sum(axis=0)/prior.weights(k),true_k,hp.KAPPA_LABEL)):
+            ax.plot(x,marginal,color=hp.DEFAULT_COLOR,lw=2,label='Recovered posterior')
+            ax.fill_between(x,0,marginal,color=hp.DEFAULT_COLOR,alpha=.15)
+            ax.axvline(truth,color=hp.comparison_style('vermillion')['color'],ls='--',lw=1.5,label='Generating parameter')
+            ax.set(xlim=(x[0],x[-1]),ylim=(0,None),xlabel=xlabel,ylabel='Posterior density')
+            hp.frame_axes(ax,minor=False)
+        axes[1].legend(loc='upper left',frameon=False,fontsize=8)
+        hp.save_figure(fig, ROOT / 'qa_parameter_recovery')
+        plt.close(fig)
+    save(ROOT / 'CLOSURE_REVIEW.json',report)
+    print('CLOSURE_RENDERED',{k:report[k] for k in ('true_physical','physical_pi_T_Lres_16_50_84','kappa_16_50_84','truth_inside_95pct_joint_HPD')},flush=True)
+
+
+if __name__ == '__main__':
+    p=argparse.ArgumentParser()
+    p.add_argument('stage', choices=['render','closure','render-closure'])
+    p.add_argument('--refine',action='store_true')
+    args=p.parse_args()
+    if args.stage == 'closure':
+        closure(args.refine)
+    else:
+        {'render':render,'render-closure':render_closure}[args.stage]()

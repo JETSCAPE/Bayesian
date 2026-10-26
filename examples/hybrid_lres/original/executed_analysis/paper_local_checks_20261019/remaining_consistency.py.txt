@@ -1,0 +1,473 @@
+"""Queued, auxiliary common-all138 consistency and own-source galleries.
+
+No GP fitting is permitted. Common-model source posteriors are recomputed with
+the same all138 GP used in the conditional law, never borrowed from own-subset
+inference. The original conditional/cache mathematics and RNG policy are reused.
+"""
+from __future__ import annotations
+
+import argparse
+from contextlib import ExitStack, contextmanager
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import re
+import sys
+from unittest.mock import patch
+
+import numpy as np
+
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+SOURCE_CASES = ("inclusive", "substructure")
+BATCH = 64
+QUALIFICATIONS = [
+    "Auxiliary common-all138 control, not the primary own-subset inference",
+    "Model-conditional predictive tails, not formal compatibility p-values or probabilities",
+    "Conditional RG reconstructed edges, assumed first edge and legacy particle inputs remain",
+    "Original normalization/centrality conventions and reduced RG statistics remain qualified",
+    "Plug-in kernels, empirical PCA/omitted covariance and finite measured-MC precision remain",
+    "Shared-simulation validation is not independent-generator validation",
+]
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def array_digest(*arrays):
+    h = hashlib.sha256()
+    for array in arrays:
+        array = np.ascontiguousarray(array)
+        h.update(str((array.shape, array.dtype.str)).encode())
+        h.update(array.tobytes())
+    return h.hexdigest()
+
+
+def save_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_name(path.name + ".pending")
+    pending.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+    pending.replace(path)
+
+
+def module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    result = importlib.util.module_from_spec(spec)
+    sys.modules[name] = result
+    spec.loader.exec_module(result)
+    return result
+
+
+@contextmanager
+def no_fits(study):
+    """Guard the native optimizer entry points without changing saved models."""
+    s = study.p.ref.s
+    classes = [study.RestrictedMeanGP, s.sn.JointPCGP,
+               study.sk_learn.sklearn_gaussian_process.GaussianProcessRegressor]
+
+    def forbidden(*args, **kwargs):
+        raise RuntimeError("GP fitting is forbidden in remaining_consistency")
+
+    with ExitStack() as stack:
+        for cls in dict.fromkeys(classes):
+            stack.enter_context(patch.object(cls, "fit", forbidden))
+        yield
+
+
+def verified_inference(folder, required, expected_identity=None):
+    """Verify the queue's actual output bindings before reading cached results."""
+    folder = Path(folder).resolve()
+    marker = folder / "COMPLETE.json"
+    record = json.loads(marker.read_text())
+    bindings = next((record[key] for key in ("output_sha256", "outputs_sha256", "outputs")
+                     if isinstance(record.get(key), dict)), None)
+    if not bindings:
+        raise ValueError(f"Inference COMPLETE has no output hashes: {folder}")
+    checked = {str(marker): digest(marker)}
+    for name, checksum in bindings.items():
+        path = Path(name)
+        path = (path if path.is_absolute() else folder / path).resolve()
+        if not path.is_relative_to(folder):
+            raise ValueError("Inference output binding escapes its result directory")
+        if isinstance(checksum, dict):
+            checksum = checksum["sha256"]
+        if digest(path) != checksum:
+            raise ValueError(f"Changed inference artifact: {path}")
+        checked[str(path)] = checksum
+    if any(str((folder / name).resolve()) not in checked for name in required):
+        raise ValueError(f"Inference COMPLETE does not bind required artifacts: {required}")
+    if expected_identity is not None:
+        if record.get("fit_source_identity") != expected_identity:
+            raise ValueError("Inference posterior belongs to a different source GP")
+        path = folder / "INPUTS.json"
+        if str(path) not in checked:
+            raise ValueError("Inference COMPLETE must bind its INPUTS.json")
+        identity = json.loads(path.read_text())
+        token = hashlib.sha256(json.dumps(identity, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        if (identity["model_identity"] != expected_identity
+                or record.get("input_identity") != token):
+            raise ValueError("Inference input/model identity mismatch")
+    return checked
+
+
+def fit_id(bank):
+    identities = {row["joint_group_fit_id"] for row in bank["models"].values()}
+    if len(identities) != 1:
+        raise ValueError("Common bank contains mixed fit identities")
+    return identities.pop()
+
+
+def partition(bank, *, nominal=True):
+    features = np.asarray(bank["features"], dtype=str)
+    names, low = features[:, 0], features[:, 1].astype(float)
+    inclusive = np.flatnonzero(np.array([
+        ("__hadron__" in name and edge >= 30) or "__inclusive_jet__pt_" in name
+        for name, edge in zip(names, low, strict=True)]))
+    sub = np.flatnonzero(np.array([
+        any(tag in name for tag in ("__tg_", "__dr12_", "__rg_")) for name in names]))
+    if (len(set(np.r_[inclusive, sub])) != len(names)
+            or not len(inclusive) or not len(sub)):
+        raise ValueError("Common bank must contain only the two disjoint selected sectors")
+    if nominal and (len(names), len(inclusive), len(sub)) != (138, 79, 59):
+        raise ValueError("Expected the new selected-only all138 GP with inclusive79/substructure59")
+    return inclusive, sub
+
+
+def native_sources(prediction, bank, sectors, likelihood):
+    """Three source likelihoods, all from this one prediction and one GP."""
+    mean, covariance = prediction["central_value"], prediction["cov"]
+    if (mean.shape[1:] != (len(bank["features"]),)
+            or covariance.shape != (len(mean), len(bank["features"]), len(bank["features"]))
+            or not np.isfinite(mean).all() or not np.isfinite(covariance).all()):
+        raise ValueError("Misaligned or nonfinite common-model prediction")
+    np.testing.assert_allclose(covariance, covariance.swapaxes(1, 2), atol=1e-12, rtol=1e-10)
+    if np.linalg.eigvalsh(covariance).min() < -1e-9:
+        raise ValueError("Common latent prediction failed PSD")
+    return np.column_stack([likelihood(prediction, bank, bank["cov"], indices)
+                            for indices in sectors])
+
+
+def common_sources(folder, bank, reference, identity, helper, cache_module, likelihood, unit):
+    """Resumable likelihood pass; no own-subset posterior is accepted here."""
+    folder = Path(folder)
+    q, k = [np.asarray(reference[key], dtype=float) for key in ("q", "kappa")]
+    for axis, bounds in ((q, (0., 20.)), (k, (.3, .6))):
+        if (axis.ndim != 1 or len(axis) < 5 or len(axis) % 4 != 1
+                or not np.isfinite(axis).all() or not np.all(np.diff(axis) > 0)):
+            raise ValueError("Common source axes must be increasing and have length 4m+1")
+        np.testing.assert_allclose(axis[[0, -1]], bounds, atol=1e-14, rtol=0,
+                                   err_msg="Common source physical prior support")
+    shape = (len(q), len(k))
+    joint = np.asarray(reference["loglike"], dtype=float)
+    if joint.shape != shape or not np.isfinite(joint).all():
+        raise ValueError("Invalid completed all138 joint grid")
+    common_id = fit_id(bank)
+    if "fit_id" in reference and str(np.asarray(reference["fit_id"]).item()) != common_id:
+        raise ValueError("Completed grid and common conditional GP fit IDs differ")
+    if "features" in reference:
+        np.testing.assert_array_equal(reference["features"], np.asarray(bank["features"], dtype=str))
+    inclusive, sub = partition(bank, nominal=False)
+    sectors = (inclusive, sub, np.arange(len(bank["features"])))
+    binding = dict(model_identity=identity, fit_id=common_id,
+                   arrays_sha256=array_digest(q, k, joint, np.asarray(bank["features"], dtype=str),
+                                              bank["exp"]["y"], bank["cov"]),
+                   source_sha256={str(Path(__file__)): digest(__file__),
+                                  str(ROOT / "conditional_cache.py"): digest(ROOT / "conditional_cache.py"),
+                                  str(cache_module.MATH_PATH): digest(cache_module.MATH_PATH)},
+                   sectors=[indices.tolist() for indices in sectors],
+                   source_weights="Recomputed native likelihoods of the SAME common GP")
+    folder.mkdir(parents=True, exist_ok=True)
+    manifest = folder / "source_identity.json"
+    if manifest.exists():
+        if json.loads(manifest.read_text()) != binding:
+            raise ValueError("Common source cache belongs to different inputs or GP")
+    else:
+        if (folder / "source_loglike.npy").exists():
+            raise ValueError("Unbound common source likelihood cache")
+        save_json(manifest, binding)
+    path = folder / "source_loglike.npy"
+    progress = folder / "source_progress.json"
+    existed = path.exists()
+    if not existed and progress.exists():
+        raise ValueError("Initialized common source cache is missing its likelihood array")
+    values = np.load(path, mmap_mode="r+") if existed else np.lib.format.open_memmap(
+        path, mode="w+", dtype=float, shape=(np.prod(shape), 3))
+    if values.shape != (np.prod(shape), 3) or values.dtype != np.dtype(float):
+        raise ValueError("Wrong common source likelihood cache shape/dtype")
+    if not path.exists():
+        raise RuntimeError("Failed to create common source cache")
+    # New open_memmap arrays are zero-filled; initialize only with a new manifest-bound file.
+    if not progress.exists():
+        values[:] = np.nan
+        values.flush()
+        save_json(progress, dict(initialized=True))
+    qq, kk = np.meshgrid(q, k, indexing="ij")
+    points = unit(qq.ravel(), kk.ravel())
+    for start in range(0, len(values), BATCH):
+        indices = np.arange(start, min(start + BATCH, len(values)))
+        indices = indices[~np.isfinite(values[indices]).all(axis=1)]
+        if not len(indices):
+            continue
+        prediction = bank["mean_model"].predict(points[indices])
+        result = native_sources(prediction, bank, sectors, likelihood)
+        np.testing.assert_allclose(result[:, 2], joint.ravel()[indices], atol=1e-7, rtol=1e-10,
+                                   err_msg="Common GP differs from completed all138 inference")
+        for field, actual in (("prediction_mean", prediction["central_value"]),
+                              ("prediction_variance", np.diagonal(prediction["cov"], axis1=1, axis2=2))):
+            if field in reference:
+                np.testing.assert_allclose(actual, np.asarray(reference[field])[indices],
+                                           atol=1e-11, rtol=1e-9, err_msg=field)
+        values[indices] = result
+        values.flush()
+    np.testing.assert_allclose(values[:, 2], joint.ravel(), atol=1e-7, rtol=1e-10)
+    source = dict(q=q, kappa=k, fit_id=np.asarray(common_id))
+    for column, sector in enumerate(("inclusive", "substructure", "joint")):
+        key = cache_module.CASES[sector]
+        source["loglike_" + key] = np.asarray(values[:, column]).reshape(shape).copy()
+        source["mass_" + key] = helper.posterior_mass(source["loglike_" + key], q, k)[0]
+    return source
+
+
+def conditional_control(folder, bank, source, helper, cache_module, unit):
+    """Use unmodified Cache math directly on 138 coordinates, without padding."""
+    cache = cache_module.Cache(folder, bank, source["q"], source["kappa"], source, helper)
+    qq, kk = np.meshgrid(source["q"], source["kappa"], indexing="ij")
+    points = unit(qq.ravel(), kk.ravel())
+    for start in range(0, len(cache.full_indices), BATCH):
+        indices = cache.full_indices[start:start + BATCH]
+        indices = indices[cache.need(indices)]
+        if len(indices):
+            cache.evaluate(indices, bank["mean_model"].predict(points[indices]), bank)
+            cache.flush()
+    summary = cache.summarize(bank)
+    summary.update(model_scope="auxiliary_common_selected_all138_not_own_subset_posteriors",
+                   source_weights="Same common GP as conditional law, recomputed for each source sector",
+                   qualifications=QUALIFICATIONS, no_GP_fitting=True,
+                   seed=cache_module.SEED, moment_draws=cache_module.MOMENT_DRAWS,
+                   replicas=cache_module.REPLICAS)
+    save_json(Path(folder) / "conditional_summary.json", summary)
+    return summary
+
+
+def predictive_mapping(payload, features, selected_features):
+    """Require an explicit frozen-target route for the ordinary own-source gallery."""
+    np.testing.assert_array_equal(np.asarray(payload["features170"], dtype=str), features)
+    quantiles = np.asarray(payload["quantiles"], dtype=float)
+    routes = np.asarray(payload["emulator_route_per_feature"], dtype=str)
+    if (quantiles.shape != (5, len(features)) or routes.shape != (len(features),)
+            or not np.isfinite(quantiles).all() or np.any(np.diff(quantiles, axis=0) < 0)
+            or np.any(np.char.str_len(routes) == 0)):
+        raise ValueError("Invalid predictive quantiles or missing per-feature emulator routes")
+    selected = {tuple(map(str, row)) for row in np.asarray(selected_features, dtype=str)}
+    fitted = np.array([tuple(row) in selected for row in features])
+    if int(fitted.sum()) != len(selected):
+        raise ValueError("Own-source selected features are missing from the frozen target map")
+    if (np.any(routes[fitted] != "own_subset_model")
+            or np.any(routes[~fitted] != "auxiliary_frozen_N170_excluded_target")):
+        raise ValueError("Predictive emulator routes disagree with the own/frozen target partition")
+    if "probabilities" in payload:
+        np.testing.assert_array_equal(payload["probabilities"], [.025, .16, .5, .84, .975])
+    if "own_feature_indices_in_full" in payload:
+        indices = np.array([list(map(tuple, features)).index(tuple(row))
+                            for row in np.asarray(selected_features, dtype=str)])
+        np.testing.assert_array_equal(payload["own_feature_indices_in_full"], indices)
+    return quantiles, fitted, routes
+
+
+def _title(name):
+    experiment = next((key.upper() for key in ("alice", "atlas", "cms") if key in name), "Synthetic")
+    if "__rg_" in name:
+        observable, xlabel = r"$r_g$", r"$r_g$"
+        matched = re.search(r"rg_atlas__R0\.4_pt([012])__", name)
+        if matched:
+            low, high = ((158, 200), (200, 315), (315, 501))[int(matched[1])]
+            observable += rf", ${low}<p_T<{high}$ GeV"
+    elif "__dr12_" in name:
+        observable, xlabel = r"$dR_{12}$", r"$dR_{12}$"
+    elif "__tg_" in name:
+        observable, xlabel = r"$\theta_g$", r"$\theta_g$"
+    else:
+        observable = "Hadron ratio" if "__hadron__" in name else "Jet ratio"
+        xlabel = r"$p_T$ [GeV]"
+    radius = re.search(r"__R([0-9.]+)__", name)
+    if radius:
+        observable += ", R=" + radius[1]
+    centrality = name.rsplit("__", 1)[-1]
+    if re.fullmatch(r"\d+-\d+", centrality):
+        observable += ", " + centrality + "%"
+    return experiment + " " + observable, xlabel
+
+
+def gallery(folder, features, observed, experimental, quantiles, *, title, scope, fitted=None):
+    """One legible observable per page; no posterior or covariance calculations."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    if str(WORK) not in sys.path:
+        sys.path.insert(0, str(WORK))
+    import hybrid_plotting as hp
+    features = np.asarray(features, dtype=str)
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    records = []
+    with hp.paper_style():
+        for index, name in enumerate(dict.fromkeys(features[:, 0])):
+            ix = np.flatnonzero(features[:, 0] == name)
+            low, high = features[ix, 1:].astype(float).T
+            x = .5 * (low + high)
+            label, xlabel = _title(name)
+            fig, ax = plt.subplots(figsize=(hp.FIGURE_WIDTH, 5.6))
+            fig.subplots_adjust(left=.15, right=.97, bottom=.21, top=.77)
+            color = hp.comparison_style("default")["color"]
+            ax.fill_between(x, quantiles[0, ix], quantiles[4, ix], color=color, alpha=.12, label="95% predictive")
+            ax.fill_between(x, quantiles[1, ix], quantiles[3, ix], color=color, alpha=.25, label="68% predictive")
+            ax.plot(x, quantiles[2, ix], color=color, lw=2.5)
+            ax.errorbar(x, np.asarray(observed)[ix], yerr=np.sqrt(np.diag(experimental)[ix]),
+                        fmt="o", color="black", ms=4, capsize=2, label="Data (marginal errors)")
+            if np.all(x > 0) and x.max() / x.min() > 8:
+                ax.set_xscale("log")
+            ax.set(xlabel=xlabel, ylabel="Measured ratio")
+            hp.frame_axes(ax, minor=False)
+            ax.legend(loc="best", fontsize=10)
+            fig.suptitle(title + "\n" + label, fontsize=13, y=.95)
+            note = scope
+            if fitted is not None:
+                note += f"\nSource-trained bins: {int(fitted[ix].sum())}/{len(ix)}; other targets use declared frozen mapping."
+            fig.text(.5, .035, note, ha="center", va="bottom", fontsize=9)
+            stem = folder / f"observable_{index:02d}"
+            try:
+                paths = hp.save_figure(fig, stem)
+            finally:
+                plt.close(fig)
+            records.append(dict(observable=name, feature_indices=ix.tolist(), scope=scope,
+                                files=[str(path) for path in paths]))
+    return records
+
+
+def execute(queue):
+    """Queue entry. Reads only completed fits/inference; writes only consistency/."""
+    output = Path(queue.QUEUE).resolve() / "consistency"
+    if output.exists() and (output.resolve() != output or any(path.is_symlink() for path in output.rglob("*"))):
+        raise ValueError("Symlinked consistency output is forbidden")
+    identities = {case: queue.model_identity(case) for case in ("all", *SOURCE_CASES)}
+    inputs = verified_inference(queue.results("all"), ("grid.npz",), identities["all"])
+    for case in SOURCE_CASES:
+        inputs.update(verified_inference(queue.results(case), ("grid.npz", "predictive.npz"), identities[case]))
+    study = queue.configure("all")
+    with no_fits(study):
+        bank = queue.load_bank("all")
+        partition(bank)
+        identity = identities["all"]
+        if fit_id(bank) != identity["fit_id"]:
+            raise ValueError("Loaded conditional GP and queue model identity differ")
+        with np.load(queue.results("all") / "grid.npz", allow_pickle=False) as archive:
+            reference = {key: archive[key].copy() for key in archive.files}
+        covariance = queue.selected_covariances("all", bank)["ell_0p2"]
+        np.testing.assert_array_equal(bank["cov"], covariance)
+        cache_module = module("_remaining_original_conditional_cache", ROOT / "conditional_cache.py")
+        helper_path = WORK / "slide_plots_20260924/make_slide_plots.py"
+        helper = module("_remaining_original_quadrature", helper_path)
+        inputs.update({str(Path(__file__)): digest(__file__),
+                       str(ROOT / "conditional_cache.py"): digest(ROOT / "conditional_cache.py"),
+                       str(cache_module.MATH_PATH): digest(cache_module.MATH_PATH),
+                       str(helper_path): digest(helper_path),
+                       str(ROOT / "queue_models.py"): digest(ROOT / "queue_models.py")})
+        binding = dict(common_model=identity, own_models={case: identities[case] for case in SOURCE_CASES},
+                       input_sha256=inputs, qualifications=QUALIFICATIONS)
+        manifest = output / "manifest.json"
+        if manifest.exists() and json.loads(manifest.read_text()) != binding:
+            raise ValueError("Consistency outputs belong to different queue inputs/models")
+        save_json(manifest, binding)
+        complete = output / "COMPLETE.json"
+        if complete.exists():
+            record = json.loads(complete.read_text())
+            for path, checksum in record["output_sha256"].items():
+                if digest(path) != checksum:
+                    raise ValueError("Changed completed consistency artifact: " + path)
+            return record
+        common = output / "common_all138"
+        core = study.p.ref.s.core
+        source = common_sources(common, bank, reference, identity, helper, cache_module,
+                                core.likelihood, core.unit)
+        summary = conditional_control(common, bank, source, helper, cache_module, core.unit)
+        pages = []
+        with np.load(common / "conditional_results.npz", allow_pickle=False) as archive:
+            for direction in cache_module.DIRECTIONS:
+                held = archive[direction + "_heldout_indices"]
+                pages.extend(gallery(output / "plots" / direction,
+                    np.asarray(bank["features"], dtype=str)[held], bank["exp"]["y"][held],
+                    bank["cov"][np.ix_(held, held)], archive[direction + "_measurement_quantiles"],
+                    title="Auxiliary common all138: " + direction.replace("_", " "),
+                    scope="Conditional measurement prediction; not a formal compatibility p-value."))
+        _, frozen = queue.full_bank()
+        frozen_features = np.asarray(frozen["features"], dtype=str)
+        if frozen_features.shape != (170, 3):
+            raise ValueError("Ordinary target mapping requires the frozen 170-feature layout")
+        mapping, precision = {}, {}
+        for case in SOURCE_CASES:
+            with np.load(queue.results(case) / "predictive.npz", allow_pickle=False) as archive:
+                payload = {key: archive[key].copy() for key in archive.files}
+            quantiles, fitted, routes = predictive_mapping(payload, frozen_features, queue.spec(case)["features"])
+            precision[case] = json.loads(str(np.asarray(payload["precision_json"]).item()))
+            mapping[case] = dict(source_model_identity=identities[case],
+                                 source_posterior=str(queue.results(case) / "grid.npz"),
+                                 features170=frozen_features.tolist(),
+                                 emulator_route_per_feature=routes.tolist(), fitted_feature_mask=fitted.tolist(),
+                                 no_cross_model_residual_conditioning=True, auxiliary_excluded_targets=True,
+                                 predictive_precision=precision[case])
+            pages.extend(gallery(output / "plots" / ("own_source_" + case), frozen_features,
+                frozen["exp"]["y"], frozen["cov"], quantiles,
+                title="Own-subset source posterior: " + case,
+                scope="Ordinary latent prediction; auxiliary frozen targets, no cross-model residual conditioning.",
+                fitted=fitted))
+        save_json(output / "target_mapping.json", mapping)
+        save_json(output / "catalog_index.json", pages)
+        save_json(output / "summary.json", dict(
+            common_model_identity=identity, common_conditional=summary,
+            own_source_models={case: identities[case] for case in SOURCE_CASES},
+            ordinary_predictive_precision=precision,
+            qualifications=QUALIFICATIONS, pending_visual_review=True,
+            ordinary_galleries="Jason own-source posterior/cache with explicit frozen excluded-target mapping"))
+        for path, checksum in inputs.items():
+            if digest(path) != checksum:
+                raise ValueError("Input changed during consistency calculation: " + path)
+        if any(queue.model_identity(case) != value for case, value in identities.items()):
+            raise ValueError("Source GP identity changed during consistency calculation")
+        if not summary["all_numerical_checks_passed"]:
+            save_json(output / "STATUS.json", dict(status="NUMERICAL_REVIEW_REQUIRED", complete=False,
+                      reason="Original conditional-cache convergence checks failed; summaries/figures retained"))
+            raise RuntimeError("Conditional numerical checks need review; no COMPLETE was issued")
+        paths = [path for path in output.rglob("*") if path.is_file()
+                 and path.name not in ("COMPLETE.json", "STATUS.json") and not path.name.endswith(".pending")]
+        band_passed = all(row["predictive_band_converged"] for row in precision.values())
+        record = dict(status="COMPLETE_PENDING_VISUAL_REVIEW", common_conditional_is_auxiliary=True,
+                      ordinary_galleries_use_own_source_posteriors=True,
+                      no_GP_fitting=True, no_frozen_edits=True, numerical_checks_passed=bool(band_passed),
+                      conditional_numerical_checks_passed=True, ordinary_band_checks_passed=bool(band_passed),
+                      ordinary_predictive_precision=precision,
+                      pending_visual_review=True, qualifications=QUALIFICATIONS,
+                      model_identity=identity, input_sha256=inputs,
+                      output_sha256={str(path.resolve()): digest(path) for path in sorted(paths)})
+        save_json(complete, record)
+        return record
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.parse_args(argv)
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    import queue_models
+    execute(queue_models)
+
+
+if __name__ == "__main__":
+    main()

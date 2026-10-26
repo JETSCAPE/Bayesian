@@ -1,0 +1,399 @@
+"""Matched low-pT extension; frozen high-pT reference, REML training and native QA."""
+import argparse
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import copy
+import gc
+import importlib.util
+import json
+from pathlib import Path
+import shutil
+import sys
+import time
+import uuid
+import warnings
+
+import numpy as np
+from scipy.linalg import block_diag
+from scipy.interpolate import RegularGridInterpolator
+import yaml
+
+HERE = Path(__file__).resolve().parent
+PRESENTATION = HERE.parent
+WORK = PRESENTATION.parent
+sys.path.insert(0, str(PRESENTATION))
+sys.path.insert(0, str(WORK/'emulator_mean_refit_20261013'))
+import prepare_presentation as p
+from refit_model import RestrictedMeanGP, FastMeanAware
+from mean_model import omitted_maps, MeanAware
+from bayesian.emulation import sk_learn
+from bayesian.systematic_correlation import SystematicCorrelationManager
+
+ROOT = PRESENTATION/'low_pt_comparison'
+NOISE = HERE/'download/full_simulation_covariance_hpt10.npz'
+BASE_CONFIG = WORK/'emulator_mean_refit_20261013/configs/mean_refit/main.yaml'
+KEYS = p.FOUR
+
+
+def save(path, value):
+    p.save(path, value)
+
+
+def check_inputs():
+    p.verify()
+    metadata = json.loads(NOISE.with_suffix('.json').read_text())
+    assert metadata['status'] == 'LOW_PT_FULL_BANK_COMPLETE'
+    assert p.digest(NOISE) == metadata['output_sha256']
+    approved = dict(line.split()[::-1] for line in (HERE/'BANK_SHA256SUMS').read_text().splitlines())
+    helper = approved['collect_low_pt_gate.py']
+    collector = approved['collect_low_pt_bank.py']
+    for records in metadata['provenance'].values():
+        for record in records:
+            assert record['collector_sha256'] == (helper if record['task'] in (0, 200) else collector)
+    with np.load(NOISE) as new, np.load(p.ref.r.matched.COVARIANCE) as old:
+        names = list(zip(new['observable_names'].astype(str), new['xmin'], new['xmax']))
+        ix = [names.index(row) for row in zip(old['observable_names'].astype(str), old['xmin'], old['xmax'])]
+        np.testing.assert_array_equal(new['design_ids'], old['design_ids'])
+        np.testing.assert_array_equal(new['central_values'][:, ix], old['central_values'])
+        projected = new['covariance'][:, ix, :, :][:, :, :, ix]
+        np.testing.assert_allclose(projected, old['covariance'], rtol=1e-8, atol=1e-12)
+        assert len(names) == 134 and len(ix) == 102
+    inputs = [NOISE, NOISE.with_suffix('.json'), BASE_CONFIG, Path(__file__),
+              WORK/'emulator_mean_refit_20261013/refit_model.py',
+              WORK/'emulator_mean_check_20261013/mean_model.py',
+              *sorted(Path(yaml.safe_load(BASE_CONFIG.read_text())['observable_table_dir']).rglob('*.dat'))]
+    manifest = dict(hashes={str(path): p.digest(path) for path in inputs},
+        change='Hadron bin lower-edge cut 30 -> 10; expanded measured simulation covariance and matched retraining',
+        fixed='Original groups, PC counts, PCA settings, kernels, eight restarts/seeds, mean-aware REML, omitted-average treatment; full experimental ell=.2/power2; physical-uniform prior',
+        new_features=134, old_features=102, data_mean_old_block_max_error=metadata['old_mean_max_error'],
+        noise_old_block_max_error=metadata['old_covariance_max_error'],
+        prior={'pi_T_Lres': [0,20], 'kappa_sc': [.3,.6]}, GP_coordinates='unit square',
+        validation='same design 38 holdout and same fivefold split seed; no validation assimilation',
+        source_modified=False, original_outputs_modified=False)
+    path = ROOT/'manifest.json'
+    if path.exists():
+        assert json.loads(path.read_text()) == manifest, 'Input/source changed; inspect before reusing outputs'
+    else:
+        save(path, manifest)
+
+
+def config(fold=None):
+    original = yaml.safe_load(BASE_CONFIG.read_text())
+    cfg = copy.deepcopy(original)
+    cfg['output_dir'] = str(ROOT/'results/hpt10' if fold is None else ROOT/f'results/hpt10/cv/fold_{fold}')
+    cfg['analysis_base']['cuts']['hadron__pt_'][0] = 10
+    cfg['analyses']['analysis_raa_unit']['cuts']['hadron__pt_'][0] = 10
+    for group in cfg['analyses']['analysis_raa_unit']['parameters']['emulators'].values():
+        group['simulation_noise']['covariance_file'] = str(NOISE)
+    normalized = copy.deepcopy(cfg)
+    normalized['output_dir'] = original['output_dir']
+    normalized['analysis_base']['cuts'] = original['analysis_base']['cuts']
+    normalized['analyses']['analysis_raa_unit']['cuts'] = original['analyses']['analysis_raa_unit']['cuts']
+    for name, group in normalized['analyses']['analysis_raa_unit']['parameters']['emulators'].items():
+        group['simulation_noise'] = original['analyses']['analysis_raa_unit']['parameters']['emulators'][name]['simulation_noise']
+    assert normalized == original
+    path = ROOT/'configs'/('main.yaml' if fold is None else f'fold_{fold}.yaml')
+    p.ref.s.fixed_config(path, cfg)
+    return path
+
+
+def stage():
+    check_inputs()
+    s = p.ref.s
+    path = config()
+    cfg = yaml.safe_load(path.read_text())
+    settings = s.analysis.AnalysisSettings.from_config_file('analysis_raa_unit', path, 'Lres-E-loss')
+    target = settings.output_dir/'observables.h5'
+    if not target.exists():
+        raw = s.data_IO.initialize_observables_dict_from_tables(cfg['observable_table_dir'],
+            cfg['analyses']['analysis_raa_unit'], 'Lres-E-loss',
+            correlation_groups=cfg['analyses']['correlation_groups'])
+        s.data_IO.write_dict_to_h5(raw, settings.output_dir, 'observables.h5', verbose=False)
+    raw = s.data_IO.read_dict_from_h5(settings.output_dir, 'observables.h5', verbose=False)
+    origin = s.data_IO.read_dict_from_h5(p.ref.s.FROZEN, 'observables.h5', verbose=False)
+    for field in ('Design', 'Design_validation', 'Design_indices', 'Design_indices_validation'):
+        np.testing.assert_array_equal(raw[field], origin[field])
+    assert raw['Design_indices_validation'].tolist() == [38]
+    for fold, (train, test) in enumerate(s.KFold(5, shuffle=True, random_state=20261007).split(raw['Design'])):
+        es = s.analysis.AnalysisSettings.from_config_file('analysis_raa_unit', config(fold), 'Lres-E-loss')
+        if not (es.output_dir/'observables.h5').exists():
+            s.data_IO.write_dict_to_h5(s.cv_subset(raw, train, test), es.output_dir, 'observables.h5', verbose=False)
+    save(ROOT/'QA/staged.json', dict(features=134, training_ids=raw['Design_indices'].tolist(),
+        holdout_ids=raw['Design_indices_validation'].tolist(), original_coordinates_and_split_unchanged=True))
+
+
+def attach(bank):
+    s = p.ref.s
+    projection, transfer, center, residual, groups = s.jg.linear_maps(bank['ec'], bank['models'])
+    u, v = omitted_maps(bank['ec'], bank['models'], groups)
+    truth = s.data_IO.predictions_matrix_from_h5(bank['settings'].output_dir,
+        'observables.h5', observable_filter=bank['ec'].observable_filter)
+    noise = s.sn.load_aligned_covariance(NOISE, bank['raw']['Design_indices'], bank['features'])
+    gp = next(iter(bank['models'].values()))['joint_pc_gp'].joint
+    bank['mean_model'] = FastMeanAware(gp, truth, projection, transfer, center, residual, u, v, noise)
+    points = bank['raw']['Design_validation'][:1]
+    fast = bank['mean_model'].predict(points)
+    slow = MeanAware.predict(bank['mean_model'], points)
+    for field in slow:
+        np.testing.assert_allclose(fast[field], slow[field], atol=2e-11, rtol=1e-9)
+    return bank
+
+
+def ell_bank(bank):
+    s = p.ref.s
+    _, exp = s.core.old.covariance(bank, True, 'split')
+    spec = yaml.safe_load((s.ELLROOT/'configs/ell_0p2.yaml').read_text())
+    old = json.loads((s.ELLROOT/'manifest.json').read_text())
+    rename = {(row['observable'], row['source']+':'+row['original_tag']):
+              row['source']+':'+row['tag'] for row in spec['source_map']}
+    arrays, parsed, coordinates = {}, [], {}
+    table_dir = Path(yaml.safe_load(BASE_CONFIG.read_text())['observable_table_dir'])/'Data'
+    for start, stop, name in exp['observable_ranges']:
+        requested = []
+        for source in exp['correlation_manager'].get_systematic_names_for_observable(name):
+            target = rename.get((name, source), source)
+            requested.append(target)
+            arrays.setdefault(target, np.zeros(len(exp['y'])))[start:stop] = exp['y_err_syst'][start:stop, exp['systematic_names'].index(source)]
+        parsed.append((name, requested, [], None))
+        table = np.atleast_2d(np.loadtxt(table_dir/('Data__'+name+'.dat')))
+        centers = table[:, :2].mean(1)
+        full = (centers-centers.min())/np.ptp(centers) if np.ptp(centers) else np.zeros_like(centers)
+        indices = []
+        for feature in bank['features'][start:stop]:
+            matched = np.flatnonzero(np.all(np.isclose(table[:, :2], feature[1:], atol=1e-10, rtol=0), axis=1))
+            assert len(matched) == 1
+            indices.append(int(matched[0]))
+        coordinates[name] = full[indices]
+    manager = SystematicCorrelationManager(correlation_groups=defaultdict(list))
+    manager.parse_configuration(parsed)
+    manager.set_correlation_parameters(spec['correlation_groups'])
+    manager.resolve_bin_counts(exp['observable_ranges'])
+    manager.register_observable_ranges(exp['observable_ranges'])
+    manager.set_observable_pt(coordinates)
+    names = manager.get_all_systematic_names()
+    updated = dict(exp, correlation_manager=manager, systematic_names=names,
+        y_err_syst=np.column_stack([arrays[name] for name in names]))
+    covariance = s.core.old.log_posterior._build_statistical_covariance(updated)+sum(s.core.previous.group_matrices(updated).values())
+    np.linalg.cholesky(covariance)
+    frozen = p.ref.s.ell_bank(p.ref.load_bank())
+    ix = [bank['features'].index(feature) for feature in frozen['features']]
+    np.testing.assert_allclose(covariance[np.ix_(ix, ix)], frozen['cov'], atol=1e-14, rtol=1e-12)
+    np.testing.assert_array_equal(updated['y'][ix], frozen['exp']['y'])
+    return dict(bank, exp=updated, cov=covariance)
+
+
+def load(fold=None, experimental=True):
+    bank = p.ref.BASE_LOAD(config(fold))
+    p.ref.s.jg.validate_results(bank['ec'], bank['models'], check_file=True)
+    bank = attach(bank)
+    return ell_bank(bank) if experimental else bank
+
+
+def validate(bank):
+    s = p.ref.s
+    raw = bank['raw']
+    ids = np.r_[raw['Design_indices'], raw['Design_indices_validation']]
+    noise = s.sn.load_aligned_covariance(NOISE, ids, bank['features'])
+    latent = bank['mean_model'].predict(raw['Design_validation'])
+    observed = bank['mean_model'].predict(raw['Design_validation'], noise)
+    truth = s.data_IO.predictions_matrix_from_h5(bank['settings'].output_dir, 'observables.h5',
+        validation_set=True, observable_filter=bank['ec'].observable_filter)
+    model = bank['mean_model']
+    reconstructed = (truth-model.center) @ model.projection.T @ model.transfer+model.center
+    return dict(design_ids=raw['Design_indices_validation'], design_unit=raw['Design_validation'], truth=truth,
+        latent_mean=latent['central_value'], latent_covariance=latent['cov'],
+        observed_mean=observed['central_value'], observed_covariance=observed['cov'],
+        pca_reconstruction=reconstructed, truncation_error=reconstructed-truth,
+        interpolation_error=latent['central_value']-reconstructed)
+
+
+def fit(fold=None):
+    s = p.ref.s
+    label = 'main' if fold is None else f'fold_{fold}'
+    settings = s.analysis.AnalysisSettings.from_config_file('analysis_raa_unit', config(fold), 'Lres-E-loss')
+    ec = s.emulation.EmulationConfig.from_config_file(settings)
+    paths = [s.base.IO.output_filename(es, settings) for es in ec.emulation_settings.values()]
+    if all(path.exists() for path in paths) and (settings.output_dir/'joint_fit.json').exists():
+        bank = load(fold, experimental=False)
+    else:
+        assert not any(path.exists() for path in paths), 'Partial fit; inspect instead of overwriting'
+        prepared = {name: sk_learn.fit_emulator(es, settings, prepare_only=True)
+                    for name, es in ec.emulation_settings.items()}
+        raw = s.data_IO.read_dict_from_h5(settings.output_dir, 'observables.h5', verbose=False)
+        features, maps, kernels, targets, restart_blocks = [], [], [], [], []
+        first = next(iter(ec.emulation_settings.values()))
+        x = next(iter(prepared.values()))['_training_design']
+        for name, es in ec.emulation_settings.items():
+            result = prepared[name]
+            np.testing.assert_array_equal(result['_training_design'], x)
+            names = s.data_IO.sorted_observable_list_from_dict(raw, observable_filter=es.base_settings.observable_filter)
+            features.extend((key, float(lo), float(hi)) for key in names
+                for lo, hi in zip(raw['Data'][key]['xmin'], raw['Data'][key]['xmax']))
+            pc, scaler = result['PCA']['pca'], result['PCA']['scaler']
+            projection = pc.components_[:es.n_pc]/scaler.scale_
+            if pc.whiten:
+                projection /= np.sqrt(pc.explained_variance_[:es.n_pc, None])
+            maps.append(projection)
+            group_kernels = result['_initial_kernels']
+            assert all(s.sn.white_variance(kernel) == 0 for kernel in group_kernels)
+            kernels.extend(group_kernels)
+            targets.append(result['PCA']['Y_pca_truncated'])
+            bounds = np.vstack([kernel.bounds for kernel in group_kernels])
+            rng = np.random.RandomState(es.settings['random_state'])
+            restart_blocks.append([rng.uniform(bounds[:, 0], bounds[:, 1]) for _ in range(es.n_restarts)])
+        noise = s.sn.load_aligned_covariance(NOISE, raw['Design_indices'], features)
+        projection = block_diag(*maps)
+        noise_pc = np.einsum('ab,ibjc,dc->aidj', projection, noise, projection, optimize=True).reshape(len(kernels)*len(x), -1)
+        starts = [np.concatenate([rows[i] for rows in restart_blocks]) for i in range(first.n_restarts)]
+        gp = RestrictedMeanGP(kernels, jitter=first.alpha, n_restarts=first.n_restarts,
+                              random_state=0)
+        started = time.monotonic()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            gp.fit(x, np.concatenate(targets, axis=1), noise_pc, restart_thetas=starts)
+        best = min(gp.optimization_, key=lambda row: row['objective'])
+        assert best['success'], 'Best REML optimizer did not converge'
+        identity, offset = uuid.uuid4().hex, 0
+        for name, es in ec.emulation_settings.items():
+            result = prepared[name]
+            indices = np.arange(offset, offset+es.n_pc)
+            result.update(joint_pc_gp=s.jg.GroupView(gp, indices),
+                emulators=[s.sn.PCView(gp, int(i)) for i in indices],
+                simulation_noise=s.sn.fingerprint(s.jg.options(ec)),
+                joint_group_fit_id=identity, joint_group_names=tuple(ec.emulation_settings),
+                mean_aware_training='REML-constant-means-v1')
+            del result['_training_design'], result['_initial_kernels']
+            s.base.IO.write_emulator(result, es, settings)
+            offset += es.n_pc
+        theta = np.concatenate([kernel.theta for kernel in gp.kernels_])
+        bounds = np.vstack([kernel.bounds for kernel in gp.kernels_])
+        _, gradient = gp.objective(theta)
+        projected = gradient.copy()
+        projected[(theta <= bounds[:, 0]+1e-5) & (projected > 0)] = 0
+        projected[(theta >= bounds[:, 1]-1e-5) & (projected < 0)] = 0
+        save(settings.output_dir/'joint_fit.json', dict(label=label, seconds=time.monotonic()-started,
+            optimization=gp.optimization_, best_success=best['success'], warnings=[str(w.message) for w in caught],
+            projected_gradient_max=float(abs(projected).max()), fitted_theta=theta.tolist(), bounds=bounds.tolist(),
+            joint_fit_id=identity, covariance_sha256=p.digest(NOISE),
+            n_pc={name: es.n_pc for name, es in ec.emulation_settings.items()},
+            method='Same mean-aware restricted-likelihood fit and eight restart draws as frozen reference'))
+        bank = load(fold, experimental=False)
+        print('LOW_PT_FIT_COMPLETE', label, round(time.monotonic()-started, 1), flush=True)
+    result = validate(bank)
+    folder = ROOT/'QA'
+    folder.mkdir(exist_ok=True)
+    np.savez_compressed(folder/('independent_validation.npz' if fold is None else f'fold_{fold}_predictions.npz'), **result)
+    save(settings.output_dir/'pc_audit.json', s.pc_audit(bank))
+    return label
+
+
+def fit_all(workers):
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fit, fold) for fold in (None, 0, 1, 2, 3, 4)]
+        for future in as_completed(futures):
+            print('LOW_PT_VALIDATION_COMPLETE', future.result(), flush=True)
+    bank = load()
+    folds = []
+    for fold in range(5):
+        with np.load(ROOT/'QA'/f'fold_{fold}_predictions.npz') as z:
+            folds.append({key: z[key].copy() for key in z.files})
+    combined = {key: np.concatenate([row[key] for row in folds]) for key in folds[0]}
+    assert sorted(combined['design_ids']) == sorted(bank['raw']['Design_indices'])
+    np.savez_compressed(ROOT/'QA/fivefold_predictions.npz', **combined)
+    with np.load(ROOT/'QA/independent_validation.npz') as z:
+        independent = {key: z[key].copy() for key in z.files}
+    save(ROOT/'QA/validation_summary.json', dict(fivefold=p.ref.s.metrics(bank, combined),
+        independent=p.ref.s.metrics(bank, independent)))
+    save(ROOT/'QA/regional_validation.json', p.ref.r.regional_metrics(bank, combined))
+
+
+def cases(bank):
+    names = bank['names']
+    raa = (np.char.find(names, '__hadron__') >= 0) | (np.char.find(names, '__inclusive_jet__pt_') >= 0)
+    tg, dr = np.char.find(names, '__tg_alice__') >= 0, np.char.find(names, '__dr12_atlas__') >= 0
+    assert (raa | tg | dr).all()
+    return {key: np.flatnonzero(mask) for key, mask in zip(KEYS, (raa, raa|tg, raa|dr, raa|tg|dr))}
+
+
+def inference():
+    bank = load()
+    folder = ROOT/'inference'
+    folder.mkdir(exist_ok=True)
+    with np.load(p.SOURCE/'grid_refine0.npz') as z:
+        q, k = z['q'].copy(), z['kappa'].copy()
+    shape = (len(q), len(k))
+    points = p.ref.s.core.unit(*[v.ravel() for v in np.meshgrid(q, k, indexing='ij')])
+    identity = next(iter(bank['models'].values()))['joint_group_fit_id']
+    path = folder/'grid.npz'
+    if path.exists():
+        return
+    checkpoint = folder/'checkpoint.npz'
+    ll = {key: np.full(len(points), np.nan) for key in KEYS}
+    means, variances = np.full((len(points), len(bank['features'])), np.nan), np.full((len(points), len(bank['features'])), np.nan)
+    if checkpoint.exists():
+        with np.load(checkpoint) as z:
+            assert z['fit_id'].item() == identity
+            ll = {key: z['loglike_'+key].copy() for key in KEYS}
+            means, variances = z['prediction_mean'].copy(), z['prediction_variance'].copy()
+    indices = cases(bank)
+    for start in range(0, len(points), 128):
+        stop = min(start+128, len(points))
+        if all(np.isfinite(values[start:stop]).all() for values in ll.values()):
+            continue
+        pred = bank['mean_model'].predict(points[start:stop])
+        means[start:stop] = pred['central_value']
+        variances[start:stop] = np.diagonal(pred['cov'], axis1=1, axis2=2)
+        for key, ix in indices.items():
+            ll[key][start:stop] = p.ref.s.core.likelihood(pred, bank, bank['cov'], ix)
+        if start % 10240 == 0 or stop == len(points):
+            np.savez_compressed(checkpoint, fit_id=identity, q=q, kappa=k,
+                prediction_mean=means, prediction_variance=variances,
+                **{'loglike_'+key: values for key, values in ll.items()})
+            print('LOW_PT_GRID', stop, len(points), flush=True)
+    helper = p.helpers()
+    arrays = dict(q=q, kappa=k, prediction_mean=means, prediction_variance=variances, fit_id=identity)
+    summaries = {}
+    weights = helper.trapezoid_weights(q)[:, None]*helper.trapezoid_weights(k)[None, :]
+    mesh = np.column_stack([v.ravel() for v in np.meshgrid(q, k, indexing='ij')])
+    for key, values in ll.items():
+        values = values.reshape(shape)
+        mass, density = helper.posterior_mass(values, q, k)
+        _, coarse = helper.posterior_mass(values[::2, ::2], q[::2], k[::2])
+        interp = RegularGridInterpolator((q[::2], k[::2]), coarse)(mesh).reshape(shape)
+        interp /= (interp*weights).sum()
+        tv = float(.5*np.sum(abs(density-interp)*weights))
+        assert tv < .02, (key, 'Grid requires refinement', tv)
+        peak = np.unravel_index(values.argmax(), shape)
+        ix = indices[key]
+        pred = bank['mean_model'].predict(p.ref.s.core.unit([q[peak[0]]], [k[peak[1]]]))
+        native = p.ref.s.log_posterior._loglikelihood(pred['central_value'][0, ix]-bank['exp']['y'][ix],
+            pred['cov'][0][np.ix_(ix, ix)]+bank['cov'][np.ix_(ix, ix)])
+        np.testing.assert_allclose(native, values[peak], atol=1e-8)
+        arrays.update({'loglike_'+key: values, 'mass_'+key: mass})
+        summaries[key] = dict(n_bins=len(ix), q_16_50_84=helper.weighted_quantile(mass,q,0),
+            kappa_16_50_84=helper.weighted_quantile(mass,k,1), coarse_fine_TV=tv,
+            native_error=float(abs(native-values[peak])))
+    np.savez_compressed(path, **arrays)
+    save(folder/'summary.json', summaries)
+    np.savez_compressed(ROOT/'QA/experimental_covariance.npz', covariance=bank['cov'], features=np.asarray(bank['features'],dtype=str))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--stage', choices=['stage', 'fit', 'inference', 'all'], default='all')
+    parser.add_argument('--workers', type=int, default=3)
+    args = parser.parse_args()
+    p.ref.configure()
+    if args.stage in ('stage', 'all'):
+        stage()
+    else:
+        check_inputs()
+    if args.stage in ('fit', 'all'):
+        fit_all(args.workers)
+    if args.stage in ('inference', 'all'):
+        inference()
+    p.verify()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,414 @@
+{
+  "geometry.py": {
+    "source": "headline_results_20261019/render_headlines.py",
+    "source_sha256": "59fbfc400fc9eb9641ab291c67ecffe877adf6c96fc2d92aba17f44f92250b80",
+    "symbols": {
+      "weights": {
+        "line": 64,
+        "end": 65,
+        "sha256": "7618c18d268f9404742b12c95e0e762224603416fac7af352c27c0126ab9d3ff"
+      },
+      "density_and_levels": {
+        "line": 68,
+        "end": 75,
+        "sha256": "7687f769eb188fdd7502e6014ea43ac0e522a5d8288653a794c8252d0c7aaeac"
+      },
+      "contour": {
+        "line": 78,
+        "end": 81,
+        "sha256": "79e2c21bb7a4339c6bbee98ded30ffbc9d4790feaa2adf0cc9ef3ede722071dc"
+      }
+    },
+    "substitutions": [],
+    "sha256": "f550f6e06835d3a7000d7d51689a179fc7775a02d00d35a720c39ee9fdbdc5a4"
+  },
+  "plots.py": {
+    "source": "paper_local_checks_20261019/remaining_render.py",
+    "source_sha256": "70ef7057741f07e4154708f161c614c19c36ce8be2ec74b4357ddb079c2af56f",
+    "symbols": {
+      "ELL": {
+        "line": 32,
+        "end": 32,
+        "sha256": "16cf10e4eeb05b03b2cf63c4d45ff8752b5c55908f935821e8813ceb572a1b07"
+      },
+      "LABELS": {
+        "line": 33,
+        "end": 45,
+        "sha256": "0f109a8ea3c4dba8bbee264ad4402c0890d87876d12aa12490214e23653252cf"
+      },
+      "ROLE": {
+        "line": 46,
+        "end": 54,
+        "sha256": "476ae541c2e152160d32fede6d05df14e9039f766897d6c0c4e77463be74eae1"
+      },
+      "CORE": {
+        "line": 55,
+        "end": 55,
+        "sha256": "e6e883b7e092b1e18ca98b1b9edd14e6abf4f4f71be158c5a1a6578e78b02729"
+      },
+      "label": {
+        "line": 63,
+        "end": 84,
+        "sha256": "f00aee546dd0fc2723597074d9d6f5179712b20da7557968f7df4a49b1dfd153"
+      },
+      "style": {
+        "line": 87,
+        "end": 99,
+        "sha256": "3cbdda2169041f0965b2f85b39ef3c7daa9bff0a483ac9d653166efd75a8f607"
+      },
+      "features": {
+        "line": 180,
+        "end": 184,
+        "sha256": "c6e95332f7c8467a1b97519eb19dfce0cd2ad8a74718da1f54d101126dcc43bb"
+      },
+      "validate_grid": {
+        "line": 187,
+        "end": 197,
+        "sha256": "24742c17e70428420b572ea15e7209849e3483fd09a22a3938ef7ff633dfeb41"
+      },
+      "resolution_axis": {
+        "line": 332,
+        "end": 338,
+        "sha256": "055f903c408c5fcabfcbcdceb401a58966078d90d0db40424bcb63d020876c05"
+      },
+      "handle": {
+        "line": 341,
+        "end": 342,
+        "sha256": "f92d0d3c91d03f9993430e81c1c6b5ec496bf9cffce29a1c8a64d6e84e4a4500"
+      },
+      "posterior_overlay": {
+        "line": 377,
+        "end": 407,
+        "sha256": "a013e3bd2a5b28779b11d976a93e4946da73667082a902a8e03f639cf06c6b8d"
+      },
+      "summary_cases": {
+        "line": 410,
+        "end": 411,
+        "sha256": "6c8f68e480b21b42b626eac74a24d171dae9d427c205dabe165bad565cc1f972"
+      },
+      "intervals": {
+        "line": 414,
+        "end": 439,
+        "sha256": "eaab30f51f9e8bedc9ff60955e6d508ddffa5a056c76d5804b015fa4d9f87a2e"
+      },
+      "interval_row": {
+        "line": 442,
+        "end": 445,
+        "sha256": "9b37af192c002dae2c33305fb59056bfdc80c377a572294ea6ff09d4191ded54"
+      },
+      "ell_figures": {
+        "line": 473,
+        "end": 518,
+        "sha256": "779d6db9006605cdd4cda38c739aff171eb4266170536654c15810bc0e821dc7"
+      },
+      "observable_title": {
+        "line": 521,
+        "end": 538,
+        "sha256": "2d69c23e444014a1919bc95841f1bb87c76b06b8cef0897bcfef0df40bb75445"
+      },
+      "draw_observable": {
+        "line": 541,
+        "end": 580,
+        "sha256": "747bdbe6e82f1a364ec93362c7122c43799d254e455ed0ddbd9cd6dd4216144e"
+      },
+      "galleries": {
+        "line": 583,
+        "end": 606,
+        "sha256": "28215ffb9ec2bbb1ffb01f90b1dc7633d91a2c835d8c765a24a4e34afd682bf2"
+      },
+      "prior_figures": {
+        "line": 609,
+        "end": 656,
+        "sha256": "8240913acb65308acf2e4baaf5ed7a87aa6ff733835b8282d2187098eff759f4"
+      },
+      "density_levels": {
+        "line": 659,
+        "end": 662,
+        "sha256": "cacd514908b029b382abda5fb6905ca3d277e86c672b8297a7f4255ad5f122cd"
+      }
+    },
+    "substitutions": [],
+    "sha256": "4a938479eb27d2d46a6842559c8b6fc32584c2cc2a72a9f08bfceefb40bd8227"
+  },
+  "composition.py": {
+    "source": "BayesianLres-draft-qa/jhep_design/render.py",
+    "source_sha256": "f99157fc7280b8c5405072bc14408cb74a31fba60cf0e8dc5ff2f9da7c80d833",
+    "symbols": {
+      "clear": {
+        "line": 25,
+        "end": 31,
+        "sha256": "78de353fb80910b3af764ec22a1742d465da02b1f8ff9f5ec2b2c9b98488495c"
+      },
+      "key": {
+        "line": 34,
+        "end": 42,
+        "sha256": "9f7cc3a6ca47642ab8e7ab85f96e9eb6013e7d3d72db864c5c16b0d9c2bc6267"
+      },
+      "linekey": {
+        "line": 45,
+        "end": 47,
+        "sha256": "000e408112bdbe6ff369a51e468d867aa34268204898700fda2ccf0c1e645b36"
+      },
+      "corekey": {
+        "line": 50,
+        "end": 59,
+        "sha256": "c3b0274e7c27245be7fe5578fe567c4996468373826b1ecc626885bcba32c319"
+      },
+      "style": {
+        "line": 62,
+        "end": 80,
+        "sha256": "e0078ad4d0cb4dac0013a91e212c80c202edac0c98d9bc880f31a8a18c9f9ff4"
+      },
+      "panels": {
+        "line": 95,
+        "end": 99,
+        "sha256": "c4fdeb5315e8a60a342e8a0d7ce5f0f10776048576e11bf06fc92f357f6e39d2"
+      },
+      "gallery_key": {
+        "line": 102,
+        "end": 112,
+        "sha256": "4b523b0b07f50ad8f847cfa2e8ceefea44902321b6f16a201872c4bd625889f2"
+      },
+      "gallery_hadrons": {
+        "line": 115,
+        "end": 130,
+        "sha256": "3de5f7e9d88d3dea9267ffe534d57932bc900432c98c5a14c807ea9b09ec342e"
+      },
+      "gallery_regroup": {
+        "line": 133,
+        "end": 182,
+        "sha256": "9166576255ae179bc318800455eb559affb8174d79e46c34f140e9fe960a6e37"
+      },
+      "finish": {
+        "line": 185,
+        "end": 323,
+        "sha256": "6a81390e6b4d62ac58b64eb39ae37171a1759a22681a2111555c41449085d6de"
+      },
+      "wake_bars": {
+        "line": 326,
+        "end": 352,
+        "sha256": "c3d4ec3e796604571541c8b9cf54ed2f5aefb84f6f8860a43f38fdf49f2ab807"
+      }
+    },
+    "substitutions": [],
+    "sha256": "0f041ac453b968ffd0730454e24d692f950dc563267793709d59dc92a44ba373"
+  },
+  "typography.py": {
+    "source": "BayesianLres-draft-qa/typography/render.py",
+    "source_sha256": "7316d45efc355c0b11d5fb8048c291d05b6bad42f1f9e7da51c65b2aae1e896f",
+    "symbols": {
+      "signature": {
+        "line": 53,
+        "end": 75,
+        "sha256": "47c90b7eaab8ea7568c5d40b4de251891f9bc2a8af63969f58b1fee4fffcb88d"
+      },
+      "typography": {
+        "line": 78,
+        "end": 89,
+        "sha256": "642925e8d6ea7d6d4e0a9faac537a6412c2202b2c0b02dad6f236ea174737b67"
+      },
+      "clear_figure_text": {
+        "line": 92,
+        "end": 98,
+        "sha256": "71e8f2e354f10a21fb35eca7cac03dbffa9a40291d3a8e23618e7277e655646a"
+      },
+      "legend": {
+        "line": 101,
+        "end": 105,
+        "sha256": "6452474f91b28e9bf826226a1e47335ca84b73a0edbf0c39bb48b4e8bbdd66d2"
+      },
+      "capture": {
+        "line": 125,
+        "end": 136,
+        "sha256": "ae924cf03f60c9ef79bf91e87d2df9854a1ebe1213cbd49ba99a0122a24f2713"
+      },
+      "core_plot": {
+        "line": 139,
+        "end": 154,
+        "sha256": "5cd481731882c65901d51f8b1e10b1eba321c6df088689b46c33842df9671112"
+      },
+      "family_plots": {
+        "line": 157,
+        "end": 174,
+        "sha256": "bac06567d2f2e72683cc3927f58329c67613bf39d63aa9578fa47406ed24f962"
+      },
+      "experiment_plot": {
+        "line": 177,
+        "end": 190,
+        "sha256": "3e84e10f62970b4a1bda090a11ab2f34d1b732bdadcc3c96905f4601d208c978"
+      },
+      "wake_plots": {
+        "line": 304,
+        "end": 364,
+        "sha256": "98cf878da46ec5c256dfd71afdffc9b86ae06978dd6195700f8bb1796f346198"
+      },
+      "qa_plots": {
+        "line": 367,
+        "end": 420,
+        "sha256": "4631003043958aa61b54312545302ba4ee0b1dc58fc7d8656f422c3ea0083ac1"
+      }
+    },
+    "substitutions": [
+      [
+        "old.endpoint(WORK/f'wake_subset_training_20261018/{family}_a{a}/inference')",
+        "old.endpoint(f'{family}_a{a}')"
+      ]
+    ],
+    "sha256": "863bfaa007a9a7e7b7cba71ab92ca7822e388fc8c2c448451c29bb69a2f694d1"
+  },
+  "core.py": {
+    "source": "paper_local_checks_20261019/render_core_review.py",
+    "source_sha256": "cfb5fbfc5c8f5ab1ab851972113bf8ca819c433270044cfd3351fc88c75a7e3e",
+    "symbols": {
+      "draw": {
+        "line": 20,
+        "end": 50,
+        "sha256": "d0840395792b88e2d3c6f0b5672310eddb25e4c95e0d426ef1589723146f69ac"
+      }
+    },
+    "substitutions": [],
+    "sha256": "8a169ccd1b8546b8ca80a0eda725b276e283fef602f2ae81d25d7f3a2f607aed"
+  },
+  "layout.py": {
+    "source": "paper_figures_20261019/v2/build_v2.py",
+    "source_sha256": "2e5df80dbb6de1af2fc55ec22503703a9597a602940bf94e3ca9d4196b6c0fa0",
+    "symbols": {
+      "log_resolution": {
+        "line": 42,
+        "end": 49,
+        "sha256": "e1392f4f4c86d636520e9cbfb7c34985087ddea4ea6d656c6e60883f9df5102f"
+      },
+      "physical_square_contours": {
+        "line": 355,
+        "end": 370,
+        "sha256": "255cf0fb4ccdfb25541e29d7dd7fb65de19ae8ce7ba5c6b4ace30bec0c71705c"
+      }
+    },
+    "substitutions": [],
+    "sha256": "8fcb962a8116d87a3d88abc751be93b2fb28b97f607871b628627a7ab12e7121"
+  },
+  "prior_sensitivity.py": {
+    "source": "paper_figures_20261019/v2/prior_sensitivity.py",
+    "source_sha256": "4895539a22104142e231241eaacbf9b80240f5431f95a02ef406aea53a9b5fdc",
+    "symbols": {
+      "physical": {
+        "line": 35,
+        "end": 38,
+        "sha256": "0dec81795adc24225cbd5fe2f2ddaff0bc1cc0598509f26f20935c0e5cf91bf4"
+      }
+    },
+    "substitutions": [],
+    "sha256": "32b8db154dc886b717f5f2b91d110926dac74e83286e1d455737fa7fea4dbde8"
+  },
+  "qa.py": {
+    "source": "BayesianLres-draft-qa/appendix_qa.py",
+    "source_sha256": "78598a8e7e3b54519b4dd5c5c7954b2f27374f34b0c84eb66ab8289839dcafff",
+    "symbols": {
+      "GROUPS": {
+        "line": 20,
+        "end": 30,
+        "sha256": "7f43ea355d30b34d3c9d42d03cf32912c9c28ff31486c33d959ff82a3079e47e"
+      },
+      "render": {
+        "line": 77,
+        "end": 167,
+        "sha256": "24f9347b652989528ae75620f61da188eee6ce53521690cb9980e0243c221816"
+      }
+    },
+    "substitutions": [
+      [
+        "read(QUEUE / 'results/all/QA/optimizer_and_PC_audit.json')",
+        "AUDIT"
+      ],
+      [
+        "np.sqrt(np.stack([raw['covariance'][int(d), ri, int(d)][:, ri].diagonal() for d in cv['design_ids']]))",
+        "np.sqrt(raw['mc_variance'])"
+      ]
+    ],
+    "sha256": "119e30945835ffba4f9908ba3180db0c0f302145c2514e01ff2a56ab5ebff518"
+  },
+  "slides.py": {
+    "source": "collaborator_update_20261021/build_update.py",
+    "source_sha256": "9b3e8c8b9fc91e3d3e8a57182ac77920f2d53d66e3e24f5e3e4ccdc734562a9b",
+    "symbols": {
+      "style": {
+        "line": 34,
+        "end": 35,
+        "sha256": "93c466a913c9ddf5c51157dc7c87056f3d5ccd04d39ee0deb3b1ffe2cd8979c5"
+      },
+      "head": {
+        "line": 38,
+        "end": 45,
+        "sha256": "65bbf6594bebed374f3dfe8c00548a918420e00aee768238ddfb67415f1f2d83"
+      },
+      "note": {
+        "line": 48,
+        "end": 49,
+        "sha256": "7d698fbf67fa918c28ea214e4b09ff819051e57acf0577b9a91450d82aefc764"
+      },
+      "logq": {
+        "line": 62,
+        "end": 67,
+        "sha256": "33ed5d770e20f24e0cf089af40d79dd11636b0cf412915f747d43ac658936b8d"
+      },
+      "legend": {
+        "line": 70,
+        "end": 73,
+        "sha256": "b7964b049f5af0bdd296f6784af271385e4a29578e5f60c98367960af38ffe8e"
+      },
+      "posterior": {
+        "line": 76,
+        "end": 93,
+        "sha256": "434fbd1dd2ebfd2d72ae4ea34d2d44ff513ff75a93742975eaa9fe08da1c969e"
+      },
+      "our_wake": {
+        "line": 265,
+        "end": 296,
+        "sha256": "8c6af8499f2f70cf93627967f79e41beb3d45c6d000efbe2cf9f32ec8371d69f"
+      },
+      "fixed_wake": {
+        "line": 299,
+        "end": 328,
+        "sha256": "7c07a0e01e52e99d4dfaba35c0077de92496105259e799cf227bbb6c6293f665"
+      },
+      "wake_posteriors": {
+        "line": 331,
+        "end": 371,
+        "sha256": "9e685255087737126a9c997860e61440fde7662a7be9968a937ac53db6ac6700"
+      }
+    },
+    "substitutions": [
+      [
+        "INPUT.json(WORK/'wake_bounded_transport_20261017/validated_local/REPORT.json')",
+        "INPUT.json('wake_profile_report')"
+      ],
+      [
+        "INPUT.npz(WORK/'wake_bounded_transport_20261017/validated_local/comparison.npz')",
+        "INPUT.npz('wake_profile')"
+      ],
+      [
+        "INPUT.pin(WORK/'wake_bounded_transport_20261017/METHOD.txt')",
+        "None"
+      ],
+      [
+        "INPUT.npz(WORK/'wake_individual_substructure_20261019/fixed_design_31/comparison.npz')",
+        "INPUT.npz('wake_fixed')"
+      ],
+      [
+        "INPUT.json(WORK/'wake_individual_substructure_20261019/fixed_design_31/NUMERICAL.json')",
+        "INPUT.json('wake_fixed_point')"
+      ],
+      [
+        "old.endpoint(WORK/f'wake_subset_training_20261018/{family}_a{endpoint}/inference')",
+        "old.endpoint(f'{family}_a{endpoint}')"
+      ]
+    ],
+    "sha256": "142f8e1224be52416f61c6d9f004345876f7953e44ca2ec40027295e5c2d24ff"
+  },
+  "hybrid_plotting.py": {
+    "source": "hybrid_plotting/__init__.py",
+    "source_sha256": "eac8308551a646e1302002a287a22933400b9f5f4affb2aee862c00cf1264997",
+    "sha256": "eac8308551a646e1302002a287a22933400b9f5f4affb2aee862c00cf1264997",
+    "bytewise": true
+  }
+}

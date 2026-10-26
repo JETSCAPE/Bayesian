@@ -1,0 +1,313 @@
+"""Fresh jet-only native PCA/REML fits for three existing simulation banks."""
+from copy import deepcopy
+import argparse
+import gc
+import json
+from pathlib import Path
+import sys
+
+import numpy as np
+import yaml
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+sys.path[:0] = [str(WORK / 'wake_baseline_control_20261018'),
+               str(WORK / 'simulation_uncertainty_audit_20261018'), str(WORK),
+               str(WORK / 'Bayesian-substructure-physical-prior-20260925/src')]
+import run_control as control
+import audit
+
+CASES = dict(old_39=control.REFERENCE, old_30=control.ROOT, new_a0_30=control.REDUCED)
+GROUPS = ('alice_jet_group', 'atlas_jet_group', 'cms_jet_group')
+SUFFIX = 'results/main/analysis_raa_unit_Lres-E-loss'
+
+
+def source_paths(case):
+    folder = CASES[case]
+    paths = [folder / 'configs/main.yaml', folder / SUFFIX / 'observables.h5',
+             folder / 'inference/grid.npz', control.REFERENCE / 'QA/experimental_covariance.npz']
+    if case == 'new_a0_30':
+        paths += [folder / SUFFIX / f'projected_noise.{ext}' for ext in ('npz', 'json')]
+    else:
+        paths += [control.NOISE, control.NOISE.with_suffix('.json')]
+    paths += [Path(__file__), control.LEGACY / 'train_local.py', control.LEGACY / 'projected_mean.py',
+              WORK / 'emulator_mean_refit_20261013/refit_model.py',
+              WORK / 'emulator_discarded_checks_20261014/omitted_completion.py']
+    native = WORK / 'Bayesian-substructure-physical-prior-20260925/src/bayesian'
+    paths += [native / name for name in ('emulation/sk_learn.py', 'emulation/joint_groups.py',
+                                        'emulation/simulation_noise.py')]
+    return paths
+
+
+def selected_config(original, output, backend):
+    cfg = deepcopy(original)
+    cfg['output_dir'] = str(output)
+    groups = cfg['analyses']['analysis_raa_unit']['parameters']['emulators']
+    selected = {name: groups[name] for name in GROUPS}
+    for group in selected.values():
+        if group['n_pc'] != 2 or group['simulation_noise']['residual_white_noise']:
+            raise ValueError('Unexpected reference jet PCA/noise settings')
+        group['simulation_noise']['covariance_file'] = str(backend)
+    cfg['analyses']['analysis_raa_unit']['parameters']['emulators'] = selected
+    return cfg
+
+
+def stage_inputs(case, stage):
+    folder = ROOT / case
+    pins = {str(p): control.sha(p) for p in source_paths(case)}
+    original = yaml.safe_load((CASES[case] / 'configs/main.yaml').read_text())
+    cfg = selected_config(original, folder / 'results/main', folder / 'noise_backend.json')
+    cfg_path = folder / 'configs/main.yaml'
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    text = yaml.safe_dump(cfg, sort_keys=False)
+    if cfg_path.exists():
+        if cfg_path.read_text() != text:
+            raise ValueError('Changed previously staged jet-only config')
+    else:
+        with cfg_path.open('x') as stream:
+            stream.write(text)
+    raw = stage.data_IO.read_dict_from_h5(CASES[case] / SUFFIX, 'observables.h5', verbose=False)
+    names = {row['observable'] for group in cfg['analyses']['analysis_raa_unit']['parameters']['emulators'].values()
+             for row in group['observable_list']}
+    for section in ('Data', 'Prediction', 'Prediction_validation'):
+        raw[section] = {name: value for name, value in raw[section].items() if name in names}
+        if set(raw[section]) != names:
+            raise ValueError('Jet source coverage changed')
+    expected = [i for i in (range(40) if case == 'old_39' else control.IDS) if i != 38]
+    np.testing.assert_array_equal(raw['Design_indices'], expected)
+    np.testing.assert_array_equal(raw['Design_indices_validation'], [38])
+    control.save(folder / 'noise_backend.json', dict(
+        policy='Marginal measured jet-only simulation covariance; no nonjet conditioning',
+        source=str(control.NOISE if case != 'new_a0_30' else CASES[case] / SUFFIX / 'projected_noise.npz'),
+        selected_groups=list(GROUPS), preserve_cross_jet_design_bin_and_shared_pp=True))
+    output = stage.settings('main').output_dir
+    if not (output / 'observables.h5').exists():
+        stage.data_IO.write_dict_to_h5(raw, output, 'observables.h5', verbose=False)
+    stage.assert_same_tree(stage.data_IO.read_dict_from_h5(output, 'observables.h5', verbose=False), raw)
+    control.save(folder / 'STAGED.json', dict(inputs=pins, case=case,
+        backend_sha256=control.sha(folder / 'noise_backend.json'),
+        fits=dict(main=dict(training_samples=expected, target_samples=[38],
+            config_sha256=control.sha(cfg_path), observables_sha256=control.sha(output / 'observables.h5'))),
+        retained_PC_counts={name:2 for name in GROUPS}, features=35,
+        fresh_native_PCA_and_REML_optimization=True, nonjet_training_data_excluded=True,
+        independent_holdout_only='Focused attribution: no new fivefold sweep or production-certification claim'))
+
+
+def extract_projected_noise(source_noise, source_target, identity, features, projection, omitted, n):
+    """Marginalize training inputs by selecting covariance rows, not conditioning."""
+    source_features = [tuple(v) for v in identity['features']]
+    columns = np.array([source_features.index(f) for f in features])
+    outside = np.setdiff1d(np.arange(len(source_features)), columns)
+    retained = np.array(identity['projection'])
+    discarded = np.array(identity['omitted_projection'])
+    rp = np.flatnonzero((abs(retained[:, columns]).sum(1) > 0) & (abs(retained[:, outside]).sum(1) == 0))
+    op = np.flatnonzero((abs(discarded[:, columns]).sum(1) > 0) & (abs(discarded[:, outside]).sum(1) == 0))
+    np.testing.assert_array_equal(projection, retained[np.ix_(rp, columns)])
+    np.testing.assert_array_equal(omitted, discarded[np.ix_(op, columns)])
+    if len(rp) + len(op) != len(features):
+        raise ValueError('Incomplete marginal jet coordinate basis')
+    rows = np.r_[(rp[:, None] * n + np.arange(n)).ravel(), len(retained) * n + op]
+    noise = source_noise[np.ix_(rows, rows)].copy()
+    target = dict(cross=source_target['cross'][:, columns][:, :, rows].copy(),
+                  variance=source_target['variance'][:, columns][:, :, columns].copy())
+    return noise, target
+
+
+def configure(case):
+    folder = ROOT / case
+    stage = control.module('_jet_only_stage_' + case, control.LEGACY / 'stage_local.py')
+    previous = sys.modules.get('stage_local')
+    sys.modules['stage_local'] = stage
+    try:
+        trainer = control.module('_jet_only_native_' + case, control.LEGACY / 'train_local.py')
+    finally:
+        if previous is None:
+            sys.modules.pop('stage_local', None)
+        else:
+            sys.modules['stage_local'] = previous
+    stage.ROOT, stage.REFERENCE = folder, control.REFERENCE
+    completion = control.module('_jet_only_complete_basis', WORK / 'emulator_discarded_checks_20261014/omitted_completion.py')
+    trainer.omitted_maps = completion.omitted_maps
+    trainer.LABELS = ('main',)
+
+    def validate(label):
+        if label != 'main':
+            raise ValueError('Only one focused main fit per case')
+        record = json.loads((folder / 'STAGED.json').read_text())
+        for path, digest in record['inputs'].items():
+            if control.sha(path) != digest:
+                raise ValueError('Changed source: ' + path)
+        item = record['fits']['main']
+        if (control.sha(folder / 'configs/main.yaml') != item['config_sha256']
+                or control.sha(stage.settings(label).output_dir / 'observables.h5') != item['observables_sha256']
+                or control.sha(folder / 'noise_backend.json') != record['backend_sha256']):
+            raise ValueError('Changed staged jet-only inputs')
+        return record
+
+    stage.validate_staged = validate
+
+    def layout(label, models=None):
+        validate(label)
+        settings = stage.settings(label)
+        ec = trainer.emulation.EmulationConfig.from_config_file(settings)
+        raw = trainer.data_IO.read_dict_from_h5(settings.output_dir, 'observables.h5', verbose=False)
+        exp = trainer.data_IO.data_array_from_h5(settings.output_dir, 'observables.h5', observable_filter=ec.observable_filter)
+        features = [(name, float(lo), float(hi)) for _, _, name in exp['observable_ranges']
+                    for lo, hi in zip(raw['Data'][name]['xmin'], raw['Data'][name]['xmax'])]
+        if len(features) != 35 or any('__inclusive_jet__pt_' not in row[0] for row in features):
+            raise ValueError('Training must contain only 35 jet RAA bins')
+        if tuple(ec.emulation_settings) != GROUPS:
+            raise ValueError('Nonjet emulator group present')
+        if models is None:
+            models = {name: trainer.base.IO.read_emulator(es, settings) for name, es in ec.emulation_settings.items()}
+            trainer.jg.validate_results(ec, models, check_file=True)
+        return dict(settings=settings, ec=ec, raw=raw, exp=exp, features=features,
+                    names=np.array([f[0] for f in features]), models=models)
+
+    trainer.layout = layout
+
+    def projected_noise(bank, maps):
+        output = bank['settings'].output_dir
+        path, marker = output / 'projected_noise.npz', output / 'projected_noise.json'
+        identity = json.loads(json.dumps(trainer.noise_identity(bank, maps)))
+        if marker.exists():
+            record = json.loads(marker.read_text())
+            if record['identity'] != identity or record['sha256'] != control.sha(path):
+                raise ValueError('Changed jet-only projected covariance')
+            with np.load(path) as z:
+                noise = z['training'].copy()
+                target = dict(cross=z['cross'].copy(), variance=z['variance'].copy())
+        else:
+            if path.exists():
+                raise ValueError('Uncommitted covariance cache')
+            n = len(bank['raw']['Design_indices'])
+            if case == 'new_a0_30':
+                source = CASES[case] / SUFFIX / 'projected_noise.npz'
+                receipt = json.loads(source.with_suffix('.json').read_text())
+                if receipt['sha256'] != control.sha(source):
+                    raise ValueError('Changed original measured projected noise')
+                np.testing.assert_array_equal(receipt['identity']['staged_fit']['training_samples'], bank['raw']['Design_indices'])
+                np.testing.assert_array_equal(receipt['identity']['staged_fit']['target_samples'], bank['raw']['Design_indices_validation'])
+                with np.load(source) as z:
+                    noise, target = extract_projected_noise(z['training'],
+                        dict(cross=z['cross'], variance=z['variance']), receipt['identity'],
+                        bank['features'], maps[0], maps[4], n)
+            else:
+                with np.load(control.NOISE) as z:
+                    ids = np.r_[bank['raw']['Design_indices'], bank['raw']['Design_indices_validation']]
+                    di = [z['design_ids'].tolist().index(int(i)) for i in ids]
+                    source_features = list(zip(z['observable_names'].astype(str), z['xmin'], z['xmax']))
+                    fi = [source_features.index(f) for f in bank['features']]
+                    cov = z['covariance'][np.ix_(di, fi, di, fi)]
+                noise, target = control.project_dense(cov, maps[0], maps[4], n)
+            joint = np.block([[noise, target['cross'][0].T], [target['cross'][0], target['variance'][0]]])
+            minimum = float(np.linalg.eigvalsh((joint + joint.T) / 2).min())
+            if minimum < -1e-10 * max(abs(joint).max(), 1):
+                raise ValueError('Non-PSD jet train/target covariance')
+            trainer.publish_npz(path, training=noise, **target)
+            control.save(marker, dict(identity=identity, sha256=control.sha(path),
+                jet_only_marginal_not_Schur_conditioned_covariance=True,
+                retained_omitted_and_target_cross_blocks=True, joint_min_eigenvalue=minimum))
+        trainer.check_noise(noise, target, maps, len(bank['raw']['Design_indices']), 1)
+        return noise, target
+
+    trainer.projected_noise = projected_noise
+
+    def validation(bank, label):
+        points = bank['raw']['Design_validation']
+        model = bank['mean_model']
+        latent, observed = model.predict(points), model.predict(points, bank['target_noise'])
+        truth = trainer.data_IO.predictions_matrix_from_h5(bank['settings'].output_dir, 'observables.h5',
+            validation_set=True, observable_filter=bank['ec'].observable_filter)
+        reconstruction = (truth - model.center) @ model.projection.T @ model.transfer + model.center
+        result = dict(physical_design_ids=np.array([38]), sample_ids=np.array([38]), design_unit=points,
+            truth=truth, latent_mean=latent['central_value'], latent_covariance=latent['cov'],
+            observed_mean=observed['central_value'], observed_covariance=observed['cov'],
+            pca_reconstruction=reconstruction, truncation_error=reconstruction-truth,
+            interpolation_error=latent['central_value']-reconstruction)
+        trainer.publish_npz(folder / 'QA/main_predictions.npz', **result)
+        control.save(folder / 'QA/main_validation.json', dict(groups=trainer.metrics(bank, result),
+            physical_design_ids=[38], paired_holdout_and_shared_pp_covariance=True,
+            independent_generator_validation=False, new_fivefold_not_performed=True))
+        control.save(folder / 'QA/PC_audit.json', {name:dict(retained=es.n_pc,
+            available=len(bank['models'][name]['PCA']['pca'].components_),
+            explained_variance_ratio=bank['models'][name]['PCA']['pca'].explained_variance_ratio_.tolist(),
+            whiten=bool(bank['models'][name]['PCA']['pca'].whiten)) for name, es in bank['ec'].emulation_settings.items()})
+
+    trainer.validate = validation
+    return stage, trainer
+
+
+def inference(case, trainer):
+    from scipy.interpolate import RegularGridInterpolator
+    folder = ROOT / case / 'inference'
+    folder.mkdir(exist_ok=True)
+    bank = trainer.load()
+    fit_path = bank['settings'].output_dir / 'joint_fit.json'
+    marker = folder / 'COMPLETE.json'
+    if marker.exists():
+        receipt = json.loads(marker.read_text())
+        if receipt['fit_sha256'] != control.sha(fit_path):
+            raise ValueError('Changed inference fit')
+        for name, digest in receipt['outputs'].items():
+            if control.sha(folder / name) != digest:
+                raise ValueError('Changed saved posterior')
+        return bank
+    p, helper = control.context_helpers()
+    with np.load(CASES[case] / 'inference/grid.npz') as z:
+        q, k = z['q'].copy(), z['kappa'].copy()
+    points = p.ref.s.core.unit(*[a.ravel() for a in np.meshgrid(q, k, indexing='ij')])
+    ll = np.empty(len(points))
+    for first in range(0, len(points), 256):
+        last = min(first+256, len(points))
+        prediction = audit.selected_predict(bank['mean_model'], points[first:last], np.arange(35))
+        ll[first:last] = audit.likelihood_parts(prediction['central_value'], prediction['cov'], bank['exp']['y'], bank['cov'])[0]
+        if first % 20480 == 0 or last == len(points):
+            print('JET_ONLY_PHYSICAL_GRID', case, last, len(points), flush=True)
+    ll = ll.reshape(len(q), len(k))
+    mass, density = helper.posterior_mass(ll, q, k)
+    _, coarse = helper.posterior_mass(ll[::2, ::2], q[::2], k[::2])
+    mesh = np.column_stack([a.ravel() for a in np.meshgrid(q, k, indexing='ij')])
+    interpolated = RegularGridInterpolator((q[::2], k[::2]), coarse)(mesh).reshape(mass.shape)
+    weights = helper.trapezoid_weights(q)[:, None] * helper.trapezoid_weights(k)[None, :]
+    interpolated /= (interpolated * weights).sum()
+    tv = float(.5 * np.sum(abs(density-interpolated) * weights))
+    if tv >= .02:
+        raise ValueError('Physical grid requires refinement; preserve completed fit')
+    peak = np.unravel_index(ll.argmax(), ll.shape)
+    prediction = bank['mean_model'].predict(p.ref.s.core.unit([q[peak[0]]], [k[peak[1]]]))
+    native = p.ref.s.log_posterior._loglikelihood(prediction['central_value'][0]-bank['exp']['y'],
+                                                prediction['cov'][0]+bank['cov'])
+    np.testing.assert_allclose(native, ll[peak], atol=1e-8, rtol=0)
+    trainer.publish_npz(folder / 'grid.npz', q=q, kappa=k, mass_jet_RAA=mass, loglike_jet_RAA=ll)
+    summary = dict(pi_T_Lres_16_50_84=helper.weighted_quantile(mass, q, 0),
+        kappa_sc_16_50_84=helper.weighted_quantile(mass, k, 1), coarse_fine_TV=tv,
+        maximum_likelihood=dict(pi_T_Lres=float(q[peak[0]]), kappa_sc=float(k[peak[1]])),
+        native_likelihood_error=float(abs(native-ll[peak])), nonjet_training_information=False,
+        mass_above16p172=float(mass[q > 16.172].sum()) if case != 'old_39' else None)
+    control.save(folder / 'SUMMARY.json', summary)
+    control.save(marker, dict(fit_sha256=control.sha(fit_path),
+        outputs={name:control.sha(folder / name) for name in ('grid.npz', 'SUMMARY.json')}))
+    return bank
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--case', choices=tuple(CASES), required=True)
+    parser.add_argument('--stage', choices=('prepare', 'fit', 'infer', 'all'), default='all')
+    args = parser.parse_args()
+    ROOT.mkdir(exist_ok=True)
+    stage, trainer = configure(args.case)
+    if args.stage in ('prepare', 'all'):
+        stage_inputs(args.case, stage)
+    if args.stage in ('fit', 'all'):
+        print('FRESH_JET_ONLY_TRAINING_START', args.case, flush=True)
+        trainer.fit('main')
+    if args.stage in ('infer', 'all'):
+        inference(args.case, trainer)
+    print('JET_ONLY_STAGE_COMPLETE', args.case, args.stage, flush=True)
+    gc.collect()
+
+
+if __name__ == '__main__':
+    main()

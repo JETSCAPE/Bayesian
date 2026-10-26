@@ -1,0 +1,152 @@
+{
+  "paper_local_checks_20261019/subset_models.py": {
+    "snapshot": "paper_local_checks_20261019/subset_models.py.txt",
+    "sha256": "d9872c2fc0de430366536dc6c65ef7cff688c9bc871fd72cf77d6c84d9f1e9d1",
+    "bytes": 23579,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "paper_local_checks_20261019/queue_models.py": {
+    "snapshot": "paper_local_checks_20261019/queue_models.py.txt",
+    "sha256": "beade9998fe0ca855bf4cf8b34dcbdc70b46a1eae75af6d425500edbcaf6d314",
+    "bytes": 18373,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "paper_local_checks_20261019/remaining_inference.py": {
+    "snapshot": "paper_local_checks_20261019/remaining_inference.py.txt",
+    "sha256": "21ce634422b52ca9ee3e366426c6e9e983bc3bc78f0b19525c6cc9d9ea176797",
+    "bytes": 33880,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "paper_local_checks_20261019/remaining_consistency.py": {
+    "snapshot": "paper_local_checks_20261019/remaining_consistency.py.txt",
+    "sha256": "6b0e99a1d31ab6fdb5d3af3cf5371e664912f38451bf1b6d8af0ff578933bce5",
+    "bytes": 25670,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "paper_local_checks_20261019/covariances.py": {
+    "snapshot": "paper_local_checks_20261019/covariances.py.txt",
+    "sha256": "c3f9988d0d44d08c2aabac431519128fb9c1676ef15d90d4b4fde1cafbed89ff",
+    "bytes": 12779,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "paper_local_checks_20261019/selected_experiment.py": {
+    "snapshot": "paper_local_checks_20261019/selected_experiment.py.txt",
+    "sha256": "ad6f3ab7fa08b54a93902377bd26b21e3eea8c8ed520627b965bd3e4004c5c22",
+    "bytes": 12200,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "paper_local_checks_20261019/audit_model_usage.py": {
+    "snapshot": "paper_local_checks_20261019/audit_model_usage.py.txt",
+    "sha256": "d0ab96a53a972ffd3c029c97f84e044c41ae8c2a402b0299d7d60e8204cf663c",
+    "bytes": 9230,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "paper_local_checks_20261019/conditional_cache.py": {
+    "snapshot": "paper_local_checks_20261019/conditional_cache.py.txt",
+    "sha256": "509ddf9421e8736f50d007fc834edb87753633ecbeb962aec8d0f57142f427bd",
+    "bytes": 28786,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "publication_closure_20261021/checks.py": {
+    "snapshot": "publication_closure_20261021/checks.py.txt",
+    "sha256": "735c940e7006c087246f75ef4e1559c1561c184aa91242018374c59f80559dc5",
+    "bytes": 14747,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "publication_closure_20261021/test_checks.py": {
+    "snapshot": "publication_closure_20261021/test_checks.py.txt",
+    "sha256": "8cf0f2852d1e87571a2863a2bce072cb9b6fd01336c086975d87f7d68355390d",
+    "bytes": 2547,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "paper_figures_20261019/v2/prior_sensitivity.py": {
+    "snapshot": "paper_figures_20261019/v2/prior_sensitivity.py.txt",
+    "sha256": "4895539a22104142e231241eaacbf9b80240f5431f95a02ef406aea53a9b5fdc",
+    "bytes": 12234,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "resolution_universality_20261011/consistency_mean_refit_20261013/run_consistency.py": {
+    "snapshot": "resolution_universality_20261011/consistency_mean_refit_20261013/run_consistency.py.txt",
+    "sha256": "aed4b7c873571bce0077f79d91bd58c0335b40fc636da5c2b6f1581035f06644",
+    "bytes": 19239,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "BayesianLres-draft-qa/appendix_qa.py": {
+    "snapshot": "BayesianLres-draft-qa/appendix_qa.py.txt",
+    "sha256": "78598a8e7e3b54519b4dd5c5c7954b2f27374f34b0c84eb66ab8289839dcafff",
+    "bytes": 17473,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "jet_only_retraining_20261018/run_jet_only.py": {
+    "snapshot": "jet_only_retraining_20261018/run_jet_only.py.txt",
+    "sha256": "90cc0fc42cb83101a2ed94c64425d61f595daae83fa4eb9ca898fac0c23b8577",
+    "bytes": 17791,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "presentation_plots_20261014/prepare_presentation.py": {
+    "snapshot": "presentation_plots_20261014/prepare_presentation.py.txt",
+    "sha256": "3ea3040352c8eb5a8a887d9d5cc8af5315df4417d8b96e0c333ddcd96cc946ba",
+    "bytes": 12139,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "presentation_plots_20261014/low_pt_preparation/run_low_pt_comparison.py": {
+    "snapshot": "presentation_plots_20261014/low_pt_preparation/run_low_pt_comparison.py.txt",
+    "sha256": "8e6bf0df6d8e3e89cb1892abcb26fcc7f8c6130516afcb5b07559c95df2b1cdc",
+    "bytes": 22092,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "presentation_plots_20261014/low_pt_preparation/resume_low_pt_qa.py": {
+    "snapshot": "presentation_plots_20261014/low_pt_preparation/resume_low_pt_qa.py.txt",
+    "sha256": "27e1add20211f9b38fe36bc23674f88841e3d5303da1393842e2b89bebe0dfa3",
+    "bytes": 3943,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "emulator_mean_refit_20261013/run_refit.py": {
+    "snapshot": "emulator_mean_refit_20261013/run_refit.py.txt",
+    "sha256": "df690a8cbf52ed61d3043340bd4e5e043a441fc457e13e4f51dfbe3391ac2736",
+    "bytes": 13627,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "emulator_mean_refit_20261013/refit_model.py": {
+    "snapshot": "emulator_mean_refit_20261013/refit_model.py.txt",
+    "sha256": "d4e32bfe446f1938438945263e55a7c403d2ddc01e2125e8df9d2a39e1bc4ce1",
+    "bytes": 6409,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "emulator_mean_check_20261013/mean_model.py": {
+    "snapshot": "emulator_mean_check_20261013/mean_model.py.txt",
+    "sha256": "789d43863f9db7b2e8f739fe8618b40ea6ed33dcb3da46edf9fcf1a57fab0d62",
+    "bytes": 6485,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "emulator_mean_check_20261013/run_check.py": {
+    "snapshot": "emulator_mean_check_20261013/run_check.py.txt",
+    "sha256": "7fe7253a808b5fad6ef4bf4d46c1cec762cad50093635c5832bfbcb6a286c96b",
+    "bytes": 12363,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "emulator_qa_corrected_cov_20261012/run_checks.py": {
+    "snapshot": "emulator_qa_corrected_cov_20261012/run_checks.py.txt",
+    "sha256": "7f87854ef3c7c343500943e817000bf3aaf483ea0dbb559dc613b4917000cada",
+    "bytes": 19683,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "emulator_discarded_checks_20261014/omitted_completion.py": {
+    "snapshot": "emulator_discarded_checks_20261014/omitted_completion.py.txt",
+    "sha256": "5a611b5dc855c71553230df77a33eb981011d3b100b33ce4c397ebd8050bbe18",
+    "bytes": 2009,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "wake_baseline_control_20261018/run_control.py": {
+    "snapshot": "wake_baseline_control_20261018/run_control.py.txt",
+    "sha256": "87d42b8c6e59cc9a7ea8f5450bc08918d86192093873c9b7515faf17cc480f15",
+    "bytes": 20642,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  },
+  "simulation_uncertainty_audit_20261018/audit.py": {
+    "snapshot": "simulation_uncertainty_audit_20261018/audit.py.txt",
+    "sha256": "2783ca8a54e03533a4492dea33c01c0a3b20345307e9264af072a11ba9d0d4aa",
+    "bytes": 14670,
+    "status": "Exact historical author source; inert review snapshot, NOT a portable replay command"
+  }
+}

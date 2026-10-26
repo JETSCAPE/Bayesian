@@ -1,0 +1,241 @@
+"""Pure covariance-only checks on an already loaded, full nominal N bank.
+
+No loading, setup, fitting, plotting, or file writes occur here. Registered
+coordinates must already use the full-measurement, pre-cut convention.
+"""
+
+from copy import deepcopy
+import hashlib
+
+import numpy as np
+
+
+VALUES = (0., .05, .2, .5, np.inf)
+DISPLAY = ("ell_0", "ell_0p05", "ell_0p2", "ell_0p5", "ell_inf")
+ATOL = 1e-14
+RTOL = 1e-12
+PSD_TOL = 1e-12
+
+
+def _kind(value):
+    return str(value).partition(":")[0].strip().lower()
+
+
+def _identity(matrix):
+    return hashlib.sha256(np.asarray(matrix, dtype="<f8").tobytes(order="C")).hexdigest()
+
+
+def _check_matrix(matrix, label):
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.shape != (170, 170) or not np.isfinite(matrix).all():
+        raise ValueError(f"{label}: require a finite full 170-by-170 matrix")
+    np.testing.assert_allclose(matrix, matrix.T, atol=ATOL, rtol=RTOL, err_msg=label)
+    minimum = float(np.linalg.eigvalsh(matrix).min())
+    if minimum < -PSD_TOL:
+        raise ValueError(f"{label}: component is not PSD (minimum eigenvalue {minimum})")
+    return dict(sha256=_identity(matrix), minimum_eigenvalue=minimum, psd=True)
+
+
+def _layout(bank, exp):
+    features = bank["features"]
+    if len(exp["y"]) != 170 or len(features) != 170:
+        raise ValueError("Require the full 170-feature nominal N bank, before selection cuts")
+    ranges, coordinates = exp["observable_ranges"], {}
+    stored = exp["correlation_manager"].to_dict()["_observable_pt"]
+    cursor = 0
+    seen = set()
+    for start, stop, name in ranges:
+        if start != cursor or not start < stop <= 170 or name in seen:
+            raise ValueError("Observable ranges must uniquely partition all 170 features")
+        if any(str(row[0]) != name for row in features[start:stop]):
+            raise ValueError(f"Feature order does not match observable range: {name}")
+        x = np.asarray(stored.get(name, []), dtype=float)
+        if (x.shape != (stop - start,) or not np.isfinite(x).all()
+                or np.any(x < -ATOL) or np.any(x > 1 + ATOL)):
+            raise ValueError(f"Missing or invalid registered pre-cut coordinates: {name}")
+        coordinates[name] = x.copy()
+        seen.add(name)
+        cursor = stop
+    if cursor != 170:
+        raise ValueError("Observable ranges do not cover all 170 features")
+    names = exp["systematic_names"]
+    errors = np.asarray(exp["y_err_syst"])
+    if (len(set(names)) != len(names) or errors.shape != (170, len(names))
+            or not np.isfinite(errors).all()):
+        raise ValueError("Invalid systematic names or uncertainty columns")
+    return coordinates
+
+
+def _analytic_sources(exp, unknown, coordinates):
+    manager = exp["correlation_manager"]
+    ranges = {name: (start, stop) for start, stop, name in exp["observable_ranges"]}
+    result = {}
+    for tag in unknown:
+        members = manager.correlation_groups[tag]
+        observables = {row[0] for row in members}
+        if len(observables) != 1:
+            raise ValueError(f"Unknown length tag must belong to one observable: {tag}")
+        name = next(iter(observables))
+        start, stop = ranges[name]
+        x = coordinates[name]
+        if len(np.unique(x)) != len(x):
+            raise ValueError(f"Duplicate coordinates make the zero-length limit ambiguous: {name}")
+        sigma_squared = np.zeros(stop - start)
+        for _, low, high, source in members:
+            if (low, high) != (start, stop) or source not in exp["systematic_names"]:
+                raise ValueError(f"Invalid source membership for tag: {tag}")
+            column = exp["systematic_names"].index(source)
+            sigma_squared += np.square(exp["y_err_syst"][start:stop, column])
+        sigma = np.sqrt(sigma_squared)
+        result[tag] = (start, stop, x, np.outer(sigma, sigma))
+    return result
+
+
+def prepare(bank, run):
+    """Return the five frozen ell models and JSON-safe numerical QA.
+
+    Only actually used tags explicitly configured as jetscape:/ptgauss: are
+    varied. All generated kernels are jetscape: (power 2). A legacy power-1.9
+    input is not silently accepted: ell=.2 must reproduce bank['cov'].
+    """
+    s = run.study.p.ref.s
+    group_matrices = s.core.previous.group_matrices
+    build_stat = s.core.old.log_posterior._build_statistical_covariance
+    original = deepcopy(bank["exp"])
+    coordinates = _layout(bank, original)
+    manager = original["correlation_manager"]
+    metadata = deepcopy(manager.to_dict())
+    parameters = dict(metadata["_pending_correlation_params"])
+    groups = deepcopy(manager.correlation_groups)
+    unknown = [tag for tag in groups
+               if tag in parameters and _kind(parameters[tag]) in ("jetscape", "ptgauss")]
+    fixed = [tag for tag in groups if tag not in unknown]
+    if not unknown:
+        raise ValueError("No actually used experimental length tags found")
+    analytic = _analytic_sources(original, unknown, coordinates)
+    stat = build_stat(deepcopy(original))
+    stat_check = _check_matrix(stat, "statistical covariance")
+    native_sources = group_matrices(deepcopy(original))
+    if list(native_sources) != list(groups):
+        raise ValueError("Native source matrices must retain the manager's tag order")
+    native_checks = {tag: _check_matrix(matrix, tag) for tag, matrix in native_sources.items()}
+    nominal = np.asarray(bank["cov"], dtype=float)
+    _check_matrix(nominal, "nominal experimental covariance")
+    np.testing.assert_allclose(stat + sum(native_sources.values()), nominal,
+                               atol=ATOL, rtol=RTOL, err_msg="Native nominal reconstruction")
+
+    qa = dict(
+        kind="covariance_only_unknown_experimental_length_scan",
+        n_features=170, kernel="exp(-square(delta_x / ell))", kernel_power=2,
+        lengths={key: ("infinity" if np.isinf(ell) else ell)
+                 for key, ell in zip(DISPLAY, VALUES, strict=True)},
+        fixed_tags=fixed, unknown_tags=unknown,
+        unused_parameter_tags=[tag for tag in parameters if tag not in groups],
+        coordinates={name: x.tolist() for name, x in coordinates.items()},
+        coordinate_convention="Existing full-measurement normalized centers; no renormalization",
+        coordinate_provenance="Inherited from the supplied nominal manager, not reloaded or reverified",
+        observable_ranges=[dict(start=int(a), stop=int(b), observable=name)
+                           for a, b, name in original["observable_ranges"]],
+        source_matrix_builder="run.study.p.ref.s.core.previous.group_matrices",
+        statistical_matrix_builder=(
+            "run.study.p.ref.s.core.old.log_posterior._build_statistical_covariance"),
+        statistical=stat_check,
+        source_groups={tag: dict(
+            parameter=parameters.get(tag), varied=tag in unknown,
+            members=[dict(observable=name, start=int(a), stop=int(b), source=source,
+                          input_kind=metadata["systematic_info"][source]["cor_kind"])
+                     for name, a, b, source in members],
+            nominal_matrix=native_checks[tag]) for tag, members in groups.items()},
+        tolerances=dict(atol=ATOL, rtol=RTOL, component_psd=PSD_TOL),
+        models={},
+        scientific_uncertainties=[
+            "Unknown systematic correlations remain model assumptions, not measured covariance",
+            "Angular-coordinate Gaussian kernels and independent RG residual slices are assumptions",
+            "Unreported experimental statistical correlations remain unavailable",
+            "Conditional RG edges/particle definition, finite MC and emulator qualifications remain",
+            "These numerical covariance checks do not establish inference robustness or calibration",
+        ],
+    )
+    models = {}
+    for key, ell in zip(DISPLAY, VALUES, strict=True):
+        exp = deepcopy(original)
+        current = exp["correlation_manager"]
+        updated = dict(parameters)
+        updated.update({tag: f"jetscape:{ell!r}" for tag in unknown})
+        current.set_correlation_parameters(updated)
+        # Native settings are pending until ranges are registered again.
+        current.register_observable_ranges(exp["observable_ranges"])
+        if current.correlation_groups != groups:
+            raise ValueError(f"Source grouping changed for {key}")
+        current_metadata = current.to_dict()
+        if current_metadata["_pending_correlation_params"] != updated:
+            raise ValueError(f"Unexpected parameter changes for {key}")
+        for name, x in metadata["_observable_pt"].items():
+            np.testing.assert_array_equal(current_metadata["_observable_pt"][name], x)
+        current_stat = build_stat(exp)
+        np.testing.assert_array_equal(current_stat, stat, err_msg=f"{key}: statistical covariance")
+        sources = group_matrices(exp)
+        if list(sources) != list(native_sources):
+            raise ValueError(f"Source matrix order changed for {key}")
+        checks = {}
+        for tag, matrix in sources.items():
+            check = _check_matrix(matrix, f"{key}/{tag}")
+            check["kernel_kinds"] = sorted({
+                current_metadata["systematic_info"][source]["cor_kind"]
+                for _, _, _, source in groups[tag]
+            })
+            if tag in fixed:
+                np.testing.assert_array_equal(matrix, native_sources[tag], err_msg=f"{key}/{tag}")
+                check["fixed_matrix_exact"] = True
+            else:
+                start, stop, x, outer = analytic[tag]
+                for _, _, _, source in groups[tag]:
+                    if current_metadata["systematic_info"][source]["cor_kind"] != "gaussian_jetscape":
+                        raise ValueError(f"Power-2 kernel not applied: {key}/{tag}")
+                distance = x[:, None] - x[None, :]
+                correlation = np.eye(len(x)) if ell == 0 else np.exp(-np.square(distance / ell))
+                expected = np.zeros((170, 170))
+                expected[start:stop, start:stop] = outer * correlation
+                np.testing.assert_allclose(matrix, expected, atol=ATOL, rtol=RTOL,
+                                           err_msg=f"{key}/{tag}: analytic power-2 source")
+                check.update(analytic_power2=True,
+                             analytic_max_abs_error=float(np.max(np.abs(matrix - expected))))
+            checks[tag] = check
+        # Preserve the native source insertion order for nominal matrix identity.
+        covariance = current_stat + sum(sources.values())
+        total_check = _check_matrix(covariance, key)
+        np.linalg.cholesky(covariance)
+        np.testing.assert_allclose(np.diag(covariance), np.diag(nominal), atol=ATOL, rtol=RTOL,
+                                   err_msg=f"{key}: marginal variances")
+        total_check.update(cholesky=True, sources=checks,
+                           statistical_exact=True, source_grouping_exact=True,
+                           coordinates_exact=True,
+                           marginal_diagonal_exact=bool(np.array_equal(
+                               np.diag(covariance), np.diag(nominal))),
+                           marginal_diagonal_max_abs_error=float(np.max(np.abs(
+                               np.diag(covariance) - np.diag(nominal)))))
+        qa["models"][key] = total_check
+        models[key] = covariance
+
+    rebuilt = models["ell_0p2"]
+    np.testing.assert_allclose(rebuilt, nominal, atol=ATOL, rtol=RTOL,
+                               err_msg="ell=.2 must reproduce the supplied nominal bank")
+    qa["nominal_identity"] = dict(exact=bool(np.array_equal(rebuilt, nominal)),
+                                  allclose=True,
+                                  max_abs_error=float(np.max(np.abs(rebuilt - nominal))))
+    owner = np.empty(170, dtype=int)
+    for index, (start, stop, _) in enumerate(original["observable_ranges"]):
+        owner[start:stop] = index
+    cross = owner[:, None] != owner[None, :]
+    fixed_covariance = stat + sum((native_sources[tag] for tag in fixed), np.zeros((170, 170)))
+    np.testing.assert_allclose(models["ell_0"][cross], fixed_covariance[cross],
+                               atol=ATOL, rtol=RTOL, err_msg="ell=0: documented cross-correlations")
+    np.testing.assert_allclose(models["ell_0"][cross], nominal[cross], atol=ATOL, rtol=RTOL)
+    qa["zero_length"] = dict(
+        unknown_sources_diagonal=True, documented_cross_correlations_preserved=True,
+        nonzero_cross_observable_entries=int(np.count_nonzero(fixed_covariance[cross])),
+        total_is_diagonal=bool(np.array_equal(models["ell_0"], np.diag(np.diag(models["ell_0"])))),
+        cross_observable_max_abs_error=float(np.max(np.abs(
+            models["ell_0"][cross] - fixed_covariance[cross]), initial=0.)),
+    )
+    return models, qa

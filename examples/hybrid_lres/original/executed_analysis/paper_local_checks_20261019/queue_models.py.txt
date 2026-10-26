@@ -1,0 +1,419 @@
+"""Checked model registry for the remaining local paper work; no new GP method."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+QUEUE = ROOT / 'queue'
+FROZEN = WORK / 'atlas_rg_inference_20261015/recovery_20261016/precision_continuation/timeout_completion/local_inference'
+JET = WORK / 'jet_only_retraining_20261018/old_39'
+MANIFEST = QUEUE / 'MANIFEST.json'
+SUFFIX = 'results/main/analysis_raa_unit_Lres-E-loss'
+LENGTHS = ('ell_0', 'ell_0p05', 'ell_0p2', 'ell_0p5', 'ell_inf')
+CORE = ('inclusive', 'inclusive_plus_theta_g', 'inclusive_plus_dR12', 'inclusive_plus_rg', 'all')
+_MODULES, _STUDIES = {}, {}
+_FULL = None
+
+
+def sha(path):
+    path = Path(path)
+    before = path.stat()
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    after = path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise ValueError('File changed while hashing: ' + str(path))
+    return digest.hexdigest()
+
+
+def save(path, value):
+    path = Path(path)
+    if not path.resolve().is_relative_to(QUEUE.resolve()):
+        raise ValueError('Queue output escaped its new directory')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_suffix(path.suffix + '.pending')
+    pending.write_text(json.dumps(value, indent=2, allow_nan=False) + '\n')
+    pending.replace(path)
+
+
+def module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    result = importlib.util.module_from_spec(spec)
+    sys.modules[name] = result
+    spec.loader.exec_module(result)
+    return result
+
+
+def verify(pins):
+    for path, digest in pins.items():
+        if sha(path) != digest:
+            raise ValueError('Changed queue source: ' + path)
+
+
+def selections(features):
+    """All and only masks already requested for the paper/comparison figures."""
+    rows = [tuple(row) for row in features]
+    names = np.array([row[0] for row in rows])
+    lo = np.array([float(row[1]) for row in rows])
+    hadron = np.char.find(names, '__hadron__') >= 0
+    jets = np.char.find(names, '__inclusive_jet__pt_') >= 0
+    theta = np.char.find(names, '__tg_') >= 0
+    dr = np.char.find(names, '__dr12_') >= 0
+    rg = np.char.find(names, '__rg_') >= 0
+    high = hadron & (lo >= 30)
+    inclusive, sub = high | jets, theta | dr | rg
+    all_high = inclusive | sub
+    masks = dict(inclusive=inclusive, all=all_high,
+        inclusive_plus_theta_g=inclusive | theta, inclusive_plus_dR12=inclusive | dr,
+        inclusive_plus_rg=inclusive | rg, hadrons=high, jets=jets, substructure=sub,
+        theta_g=theta, dR12=dr, rg=rg,
+        inclusive_plus_theta_g_plus_dR12=inclusive | theta | dr,
+        inclusive_plus_theta_g_plus_rg=inclusive | theta | rg,
+        inclusive_plus_dR12_plus_rg=inclusive | dr | rg)
+    for family, mask in (('inclusive', inclusive), ('all', all_high)):
+        for experiment in ('alice', 'atlas', 'cms'):
+            masks[family + '_without_' + experiment] = mask & (np.char.find(names, '_' + experiment) < 0)
+    first_rg = np.zeros(len(rows), bool)
+    for name in sorted(set(names[rg])):
+        ix = np.flatnonzero(names == name)
+        first_rg[ix[np.argmin(lo[ix])]] = True
+    first_dr = np.zeros(len(rows), bool)
+    for name in sorted(set(names[dr])):
+        ix = np.flatnonzero(names == name)
+        first_dr[ix[np.argmin(lo[ix])]] = True
+    masks['all_without_first_rg'] = all_high & ~first_rg
+    masks['all_without_first_dR12'] = all_high & ~first_dr
+    masks['all_without_first_rg_and_dR12'] = all_high & ~(first_rg | first_dr)
+    masks['hpt10_inclusive'] = (hadron & (lo >= 10)) | jets
+    masks['hpt10_all'] = masks['hpt10_inclusive'] | sub
+    return {key: [rows[i] for i in np.flatnonzero(mask)] for key, mask in masks.items()}
+
+
+def build_manifest(features):
+    masks = selections(features)
+    expected = dict(inclusive=79, all=138, inclusive_plus_theta_g=87,
+        inclusive_plus_dR12=94, inclusive_plus_rg=115, hadrons=44, jets=35,
+        substructure=59, theta_g=8, dR12=15, rg=36,
+        inclusive_plus_theta_g_plus_dR12=102, inclusive_plus_theta_g_plus_rg=123,
+        inclusive_plus_dR12_plus_rg=130, all_without_first_rg=135,
+        all_without_first_dR12=137, all_without_first_rg_and_dR12=134,
+        hpt10_inclusive=111, hpt10_all=170)
+    seen, models = {}, {}
+    for case, rows in masks.items():
+        if case in expected and len(rows) != expected[case]:
+            raise ValueError('Changed frozen feature coverage: ' + case)
+        key = tuple(sorted(rows))
+        if not key or len(key) != len(set(key)):
+            raise ValueError('Empty or duplicated feature mask: ' + case)
+        if key in seen:
+            raise ValueError('Duplicate model mask requires explicit reuse: ' + case + '/' + seen[key])
+        seen[key] = case
+        kind = 'phase1' if case in ('inclusive', 'all') else 'new'
+        if case == 'jets':
+            kind = 'reused_jet_main'
+        if case == 'hpt10_all':
+            kind = 'frozen_full'
+        folder = ROOT / 'models' / case if kind == 'phase1' else QUEUE / 'models' / case
+        if kind == 'frozen_full':
+            folder = FROZEN
+        models[case] = dict(features=[list(row) for row in rows], n_features=len(rows),
+            model_kind=kind, model_root=str(folder),
+            inference_root=str(QUEUE / 'results' / case / 'inference'),
+            lengths=list(LENGTHS if case in CORE else ('ell_0p2',)),
+            prior_scan=case in ('inclusive', 'all'),
+            reused_main=str(JET) if case == 'jets' else None)
+    return dict(status='PREPARED_DEPENDENCY_QUEUE_NOT_SCIENTIFIC_CERTIFICATION', models=models,
+        n_distinct_masks=len(models), full_features=[list(row) for row in features],
+        source_grid=str(FROZEN / 'inference/grid.npz'),
+        fixed=dict(training_ids=[i for i in range(40) if i != 38], holdout=38,
+            fivefold_seed=20261007, physical_prior=[0, 20], kappa_prior=[.3, .6],
+            measured_paired_noise=True, fitted_white_kernel=False,
+            native_PCA_PC_kernel_bound_rules_restarts_seeds_unchanged=True),
+        caveats=['Existing rg conventions and finite simulation statistics remain qualified',
+                 'Learned kernels and selected-bin PCA are refitted, not numerically frozen',
+                 'Conditional common-model controls are auxiliary, not own-subset inference'])
+
+
+def prepare():
+    if MANIFEST.exists():
+        return manifest()
+    with np.load(FROZEN / 'QA/experimental_covariance.npz') as z:
+        features = [(str(n), float(a), float(b)) for n, a, b in z['features']]
+    record = build_manifest(features)
+    paths = [Path(__file__), ROOT / 'subset_models.py', ROOT / 'audit_model_usage.py',
+        ROOT / 'covariances.py', ROOT / 'selected_experiment.py',
+        FROZEN / 'QA/experimental_covariance.npz', FROZEN / 'inference/grid.npz',
+        FROZEN / 'inference/COMPLETE.json', FROZEN / 'manifest.json',
+        FROZEN / 'QA/staged.json', FROZEN / 'configs/main.yaml',
+        *sorted((FROZEN / SUFFIX).glob('emulator_*.pkl')), FROZEN / SUFFIX / 'joint_fit.json',
+        JET / 'STAGED.json', JET / 'configs/main.yaml',
+        JET / 'QA/main_predictions.npz', JET / 'QA/main_validation.json',
+        *sorted((JET / SUFFIX).glob('*'))]
+    record['source_sha256'] = {str(path): sha(path) for path in paths if path.is_file()}
+    save(MANIFEST, record)
+    return manifest()
+
+
+def manifest():
+    record = json.loads(MANIFEST.read_text())
+    verify(record['source_sha256'])
+    return record
+
+
+def spec(case):
+    return manifest()['models'][case]
+
+
+def results(case):
+    return Path(spec(case)['inference_root'])
+
+
+def _base():
+    if 'base' not in _MODULES:
+        _MODULES['base'] = module('_queue_original_subset', ROOT / 'subset_models.py')
+    return _MODULES['base']
+
+
+def full_bank():
+    global _FULL
+    manifest()
+    if _FULL is None:
+        helper = module('_queue_frozen_loader', WORK / 'paper_figures_20261019/v2/prior_sensitivity.py')
+        run, bank, _ = helper.load_frozen()
+        _FULL = run, bank
+    return _FULL
+
+
+def _jet_bank():
+    if 'jets' not in _MODULES:
+        sys.path.insert(0, str(WORK / 'jet_only_retraining_20261018'))
+        _MODULES['jets'] = module('_queue_verified_existing_jets', WORK / 'jet_only_retraining_20261018/run_jet_only.py')
+    _, trainer = _MODULES['jets'].configure('old_39')
+    bank = trainer.load()
+    expected = {tuple(row) for row in spec('jets')['features']}
+    if set(map(tuple, bank['features'])) != expected:
+        raise ValueError('Existing jet-only GP does not match requested bins')
+    return bank
+
+
+def configure(case):
+    if case in _STUDIES:
+        return _STUDIES[case]
+    record = spec(case)
+    if record['model_kind'] == 'frozen_full':
+        return full_bank()[0].study
+    if record['model_kind'] == 'phase1':
+        study = _base().configure(case)
+    else:
+        # A scoped instance of the already tested native adapter, not an edit
+        # to the source pinned by the active/completed first-stage fits.
+        adapter = module('_queue_selected_' + case, ROOT / 'subset_models.py')
+        wanted = {tuple(row) for row in record['features']}
+        adapter.CASES = {case: len(wanted)}
+        def expected(rows, selected):
+            if selected != case:
+                raise ValueError('Selected adapter used for a different case')
+            return [tuple(row) for row in rows if tuple(row) in wanted]
+
+        adapter.expected_features = expected
+        original_pins = adapter._source_pins
+
+        def pins(study):
+            value = original_pins(study)
+            value.update({str(Path(__file__)): sha(__file__), str(MANIFEST): sha(MANIFEST)})
+            return value
+
+        adapter._source_pins = pins
+        study = adapter.configure(case, root=QUEUE)
+        old_validate = study.validate_staged
+
+        def validate(fold=None):
+            value = old_validate(fold)
+            if not {str(Path(__file__)), str(MANIFEST)} <= set(value[0]['source_sha256']):
+                raise ValueError('Missing queue selection/source binding')
+            return value
+
+        study.validate_staged = validate
+        study._queue_adapter = adapter
+        if case == 'jets':
+            native_load = study.load
+
+            def load(fold=None, experimental=True):
+                if fold is not None:
+                    return native_load(fold, experimental=experimental)
+                study.validate_staged()
+                bank = _jet_bank()
+                # This existing fit is reused under its original identity.
+                return _base().frozen_ell_bank(bank) if experimental else bank
+
+            study.load = load
+    _STUDIES[case] = study
+    return study
+
+
+def stage(case):
+    record = spec(case)
+    if record['model_kind'] == 'frozen_full':
+        load_bank(case)
+        return
+    study = configure(case)
+    if record['model_kind'] == 'phase1':
+        study.validate_staged()
+    else:
+        study._queue_adapter.stage(case, root=QUEUE)
+
+
+def load_bank(case, experimental=True):
+    if spec(case)['model_kind'] == 'frozen_full':
+        bank = full_bank()[1]
+    else:
+        bank = configure(case).load(experimental=False)
+    expected = {tuple(row) for row in spec(case)['features']}
+    if set(map(tuple, bank['features'])) != expected or len(bank['features']) != len(expected):
+        raise ValueError('Loaded GP training features differ from this inference: ' + case)
+    if not experimental:
+        return bank
+    from selected_experiment import select_experiment
+    run, reference = full_bank()
+    s = run.study.p.ref.s
+    exp = select_experiment(reference['exp'], reference['features'], bank['features'], reference['cov'],
+        group_matrices=s.core.previous.group_matrices,
+        build_statistical_covariance=s.core.old.log_posterior._build_statistical_covariance)
+    covariance = selected_covariances(case, bank)['ell_0p2']
+    return dict(bank, exp=exp, cov=covariance, full_native_plots_deferred=False)
+
+
+def ensure_covariances():
+    path, receipt = QUEUE / 'covariances.npz', QUEUE / 'COVARIANCES.json'
+    identity = dict(manifest_sha256=sha(MANIFEST), registry_sha256=sha(__file__))
+    if receipt.exists():
+        saved = json.loads(receipt.read_text())
+        if saved['identity'] != identity or saved['output_sha256'] != sha(path):
+            raise ValueError('Changed frozen queue covariance cache')
+        return path
+    if path.exists():
+        raise ValueError('Uncommitted covariance cache; inspect before resuming')
+    import covariances
+    run, bank = full_bank()
+    values, qa = covariances.prepare(bank, run)
+    arrays = dict(features=np.asarray(bank['features'], dtype=str), y=bank['exp']['y'],
+        y_err_stat=bank['exp']['y_err_stat'],
+        **{'covariance_' + key: value for key, value in values.items()})
+    path.parent.mkdir(exist_ok=True)
+    pending = path.with_name(path.stem + '.pending.npz')
+    np.savez_compressed(pending, **arrays)
+    pending.replace(path)
+    save(receipt, dict(identity=identity, output_sha256=sha(path), qa=qa))
+    return path
+
+
+def selected_covariances(case, bank):
+    path = ensure_covariances()
+    with np.load(path) as z:
+        full = [(str(n), float(a), float(b)) for n, a, b in z['features']]
+        ix = [full.index(tuple(row)) for row in bank['features']]
+        if set(map(tuple, bank['features'])) != {tuple(row) for row in spec(case)['features']}:
+            raise ValueError('Wrong feature selection for covariance route')
+        return {key: z['covariance_' + key][np.ix_(ix, ix)].copy() for key in spec(case)['lengths']}
+
+
+def model_identity(case):
+    record = spec(case)
+    folder = Path(record['model_root'])
+    if record['model_kind'] == 'reused_jet_main':
+        folder = JET
+    paths = [folder / SUFFIX / 'joint_fit.json', folder / SUFFIX / 'observables.h5',
+             folder / 'configs/main.yaml', *sorted((folder / SUFFIX).glob('emulator_*.pkl'))]
+    marker = folder / SUFFIX / 'SELECTED_FIT.json'
+    if marker.exists():
+        paths.append(marker)
+    stage_marker = folder / 'STAGED.json'
+    if stage_marker.exists():
+        paths.append(stage_marker)
+    if record['model_kind'] == 'reused_jet_main':
+        paths += [folder / SUFFIX / 'projected_noise.json', folder / SUFFIX / 'projected_noise.npz']
+    fit = json.loads((folder / SUFFIX / 'joint_fit.json').read_text())
+    return dict(case=case, model_kind=record['model_kind'], model_root=str(folder),
+        fit_id=fit['joint_fit_id'], manifest_sha256=sha(MANIFEST),
+        source_sha256={str(path): sha(path) for path in paths},
+        feature_membership=[list(row) for row in record['features']])
+
+
+def reuse_jet_validation(study):
+    """Schema-map existing paired holdout predictions without refitting/relabeling."""
+    bank = study.load(experimental=False)
+    staged, settings, ec = study.validate_staged()
+    if [list(row) for row in bank['features']] != staged['fits']['main']['features']:
+        raise ValueError('Reused jet main order differs from new CV layout')
+    source = JET / 'QA/main_predictions.npz'
+    with np.load(source) as z:
+        result = {key: z[key].copy() for key in z.files if key not in ('physical_design_ids', 'sample_ids')}
+        result['design_ids'] = z['sample_ids'].copy()
+        np.testing.assert_array_equal(z['sample_ids'], z['physical_design_ids'])
+    np.testing.assert_array_equal(result['design_ids'], [38])
+    raw = study.p.ref.s.data_IO.read_dict_from_h5(settings.output_dir, 'observables.h5', verbose=False)
+    np.testing.assert_array_equal(result['design_unit'], raw['Design_validation'])
+    truth = study.p.ref.s.data_IO.predictions_matrix_from_h5(settings.output_dir, 'observables.h5',
+        validation_set=True, observable_filter=ec.observable_filter)
+    np.testing.assert_array_equal(result['truth'], truth)
+    target = study.ROOT / 'QA/independent_validation.npz'
+    target.parent.mkdir(exist_ok=True)
+    if target.exists():
+        with np.load(target) as z:
+            if set(z.files) != set(result):
+                raise ValueError('Changed reused main validation schema')
+            for key in z.files:
+                np.testing.assert_array_equal(z[key], result[key])
+    else:
+        np.savez_compressed(target, **result)
+    save(study.ROOT / 'QA/MAIN_REUSE.json', dict(source=str(source), source_sha256=sha(source),
+        output_sha256=sha(target), original_fit_id=model_identity('jets')['fit_id'],
+        policy='Existing paired holdout reused; only sample_ids renamed design_ids; no fit/prediction/physics change'))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--prepare', action='store_true')
+    parser.add_argument('--covariances', action='store_true')
+    parser.add_argument('--case')
+    parser.add_argument('--stage', choices=('stage', 'fit', 'numerical_qa'))
+    parser.add_argument('--fold', choices=('main', '0', '1', '2', '3', '4'), default='main')
+    args = parser.parse_args()
+    if args.prepare:
+        print(json.dumps(prepare(), indent=2), flush=True)
+        return
+    if args.covariances:
+        print(ensure_covariances(), flush=True)
+        return
+    if not args.case or not args.stage:
+        parser.error('--case and --stage required unless preparing')
+    if args.stage == 'stage':
+        stage(args.case)
+    else:
+        study = configure(args.case)
+        if args.stage == 'fit':
+            if spec(args.case)['model_kind'] == 'frozen_full' or (args.case == 'jets' and args.fold == 'main'):
+                load_bank(args.case, experimental=False)
+                if args.case == 'jets':
+                    reuse_jet_validation(study)
+            else:
+                study.fit(None if args.fold == 'main' else int(args.fold))
+        else:
+            if spec(args.case)['model_kind'] == 'frozen_full':
+                raise ValueError('Frozen full-bank QA must be verified read-only, not rewritten')
+            _base().qa(study)
+
+
+if __name__ == '__main__':
+    main()

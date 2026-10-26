@@ -1,0 +1,397 @@
+"""One local full-statistics, in-prior-design control using the existing trainer."""
+from copy import deepcopy
+from datetime import datetime, timezone
+import argparse
+import gc
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+import numpy as np
+import yaml
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+LEGACY = WORK / 'wake_nuisance_20261017/full_bank'
+REFERENCE = WORK / 'atlas_rg_inference_20261015/recovery_20261016/precision_continuation/timeout_completion/local_inference'
+REDUCED = WORK / 'wake_bounded_transport_20261017/endpoint_bank/physical_prior_restriction/seed_scaling_recovery/local_a0'
+NOISE = REFERENCE.parent / 'export/full_simulation_covariance_rg.npz'
+IDS = [0, 1, 2, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 18, 19, 20, 21, 22,
+       24, 25, 27, 28, 30, 31, 32, 34, 35, 36, 37, 38, 39]
+sys.path[:0] = [str(LEGACY), str(WORK), str(WORK / 'Bayesian-substructure-physical-prior-20260925/src')]
+
+
+def module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    obj = importlib.util.module_from_spec(spec)
+    sys.modules[name] = obj
+    spec.loader.exec_module(obj)
+    return obj
+
+
+def sha(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def save(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    value = json.loads(json.dumps(value, allow_nan=False))
+    if path.exists():
+        if json.loads(path.read_text()) != value:
+            raise ValueError('Refusing to replace completed record: ' + str(path))
+        return
+    with path.open('x') as stream:
+        json.dump(value, stream, indent=2, allow_nan=False)
+        stream.write('\n')
+
+
+def subset(raw, ids=IDS):
+    """Subset physical labels, not array offsets, retaining design 38 as a target."""
+    original = np.asarray(raw['Design_indices'])
+    train = np.flatnonzero(np.isin(original, [i for i in ids if i != 38]))
+    if original[train].tolist() != [i for i in ids if i != 38]:
+        raise ValueError('Unexpected original design order or missing selected designs')
+    if np.asarray(raw['Design_indices_validation']).tolist() != [38]:
+        raise ValueError('Independent target must remain design 38')
+    result = deepcopy(raw)
+    result['Design'] = raw['Design'][train]
+    result['Design_indices'] = original[train]
+    for name, values in result['Prediction'].items():
+        for field in ('y', 'y_err_stat'):
+            values[field] = raw['Prediction'][name][field][:, train]
+    return result
+
+
+def project_dense(cov, retained, omitted, n):
+    """Rotate the same MC covariance, retaining the omitted-average cross blocks."""
+    p, f = retained.shape
+    m = cov.shape[0] - n
+    if cov.shape != (n + m, f, n + m, f) or omitted.shape[1] != f or p + len(omitted) != f:
+        raise ValueError('Incomplete noise projection')
+    training = cov[:n, :, :n, :]
+    rr = np.einsum('pa,iajb,qb->piqj', retained, training, retained, optimize=True).reshape(p*n, p*n)
+    ro = np.einsum('pa,iajb,qb->piq', retained, training/n, omitted, optimize=True).reshape(p*n, -1)
+    oo = omitted @ training.mean(axis=(0, 2)) @ omitted.T
+    noise = np.block([[rr, ro], [ro.T, oo]])
+    cross = np.concatenate((
+        np.einsum('iajb,pb->iapj', cov[n:, :, :n, :], retained, optimize=True).reshape(m, f, p*n),
+        np.einsum('iab,pb->iap', cov[n:, :, :n, :].mean(axis=2), omitted, optimize=True)), axis=2)
+    variance = np.stack([cov[n+i, :, n+i, :] for i in range(m)])
+    return noise, dict(cross=cross, variance=variance)
+
+
+def pin_inputs():
+    paths = [Path(__file__), NOISE, NOISE.with_suffix('.json'), REFERENCE/'configs/main.yaml',
+             REFERENCE/'results/main/analysis_raa_unit_Lres-E-loss/observables.h5',
+             REFERENCE/'QA/experimental_covariance.npz',
+             REFERENCE/'inference/grid.npz', REDUCED/'inference/grid.npz',
+             WORK/'emulator_discarded_checks_20261014/omitted_completion.py',
+             WORK/'emulator_mean_refit_20261013/refit_model.py',
+             WORK/'emulator_mean_check_20261013/mean_model.py']
+    paths += [LEGACY/name for name in ('train_local.py', 'stage_local.py', 'projected_mean.py')]
+    return {str(p): sha(p) for p in paths}
+
+
+def setup():
+    stage = module('_baseline_control_stage', LEGACY/'stage_local.py')
+    previous = sys.modules.get('stage_local')
+    sys.modules['stage_local'] = stage
+    try:
+        train = module('_baseline_control_trainer', LEGACY/'train_local.py')
+    finally:
+        if previous is None:
+            sys.modules.pop('stage_local', None)
+        else:
+            sys.modules['stage_local'] = previous
+    completion = module('_baseline_complete_omitted', WORK/'emulator_discarded_checks_20261014/omitted_completion.py')
+    stage.ROOT, stage.REFERENCE = ROOT, REFERENCE
+    train.LABELS = ('main',)
+    train.omitted_maps = completion.omitted_maps
+
+    def validate(label):
+        if label != 'main':
+            raise ValueError('Only one main control fit is authorized')
+        record = json.loads((ROOT/'STAGED.json').read_text())
+        for name, digest in record['inputs'].items():
+            if sha(name) != digest:
+                raise ValueError('Changed source/input: ' + name)
+        item = record['fits']['main']
+        if sha(stage.settings(label).output_dir/'observables.h5') != item['observables_sha256']:
+            raise ValueError('Changed staged HDF5')
+        if sha(ROOT/'configs/main.yaml') != item['config_sha256']:
+            raise ValueError('Changed staged config')
+        if sha(ROOT/'noise_backend.json') != record['backend_sha256']:
+            raise ValueError('Changed noise-backend identity')
+        if item['training_samples'] != [i for i in IDS if i != 38] or item['target_samples'] != [38]:
+            raise ValueError('Changed physical design selection')
+        return record
+
+    stage.validate_staged = validate
+
+    def projected_noise(bank, maps):
+        directory = bank['settings'].output_dir
+        path, marker = directory/'projected_noise.npz', directory/'projected_noise.json'
+        identity = json.loads(json.dumps(train.noise_identity(bank, maps)))
+        if marker.exists():
+            saved = json.loads(marker.read_text())
+            if saved['identity'] != identity or saved['sha256'] != sha(path):
+                raise ValueError('Changed projected noise cache')
+            with np.load(path) as z:
+                noise = z['training'].copy()
+                target = dict(cross=z['cross'].copy(), variance=z['variance'].copy())
+        else:
+            if path.exists():
+                raise ValueError('Uncommitted projected noise cache')
+            ids = np.r_[bank['raw']['Design_indices'], bank['raw']['Design_indices_validation']]
+            with np.load(NOISE) as source:
+                names = list(zip(source['observable_names'].astype(str), source['xmin'], source['xmax']))
+                di = [source['design_ids'].tolist().index(int(i)) for i in ids]
+                fi = [names.index(row) for row in bank['features']]
+                cov = source['covariance'][np.ix_(di, fi, di, fi)]
+            n = len(bank['raw']['Design_indices'])
+            noise, target = project_dense(cov, maps[0], maps[4], n)
+            joint = np.block([[noise, target['cross'].reshape(170, -1).T],
+                              [target['cross'].reshape(170, -1), target['variance'][0]]])
+            eigen = np.linalg.eigvalsh((joint+joint.T)/2)
+            if eigen.min() < -1e-10 * max(abs(joint).max(), 1):
+                raise ValueError('Projected joint training/target MC covariance is not PSD')
+            train.publish_npz(path, training=noise, **target)
+            save(marker, dict(identity=identity, sha256=sha(path), measured_noise_unchanged=True,
+                full_cross_design_group_shared_pp_and_omitted_blocks_retained=True,
+                joint_min_eigenvalue=float(eigen.min()), covariance_sha256=sha(NOISE)))
+            del cov, joint
+            gc.collect()
+        train.check_noise(noise, target, maps, 30, 1)
+        return noise, target
+
+    train.projected_noise = projected_noise
+
+    def validate_target(bank, label):
+        points = bank['raw']['Design_validation']
+        latent = bank['mean_model'].predict(points)
+        observed = bank['mean_model'].predict(points, bank['target_noise'])
+        truth = train.data_IO.predictions_matrix_from_h5(bank['settings'].output_dir, 'observables.h5',
+            validation_set=True, observable_filter=bank['ec'].observable_filter)
+        model = bank['mean_model']
+        reconstruction = (truth-model.center) @ model.projection.T @ model.transfer + model.center
+        result = dict(sample_ids=np.array([38]), physical_design_ids=np.array([38]), design_unit=points,
+            truth=truth, latent_mean=latent['central_value'], latent_covariance=latent['cov'],
+            observed_mean=observed['central_value'], observed_covariance=observed['cov'],
+            pca_reconstruction=reconstruction, truncation_error=reconstruction-truth,
+            interpolation_error=latent['central_value']-reconstruction)
+        train.publish_npz(ROOT/'QA/main_predictions.npz', **result)
+        save(ROOT/'QA/main_validation.json', dict(groups=train.metrics(bank, result), physical_design_ids=[38],
+            paired_train_target_and_shared_pp_noise=True, independent_generator_validation=False,
+            fivefold_not_repeated='Focused single-main-fit attribution control, not new emulator certification'))
+        save(ROOT/'QA/PC_audit.json', {name:dict(retained=bank['ec'].emulation_settings[name].n_pc,
+            available=len(item['PCA']['pca'].components_),
+            explained_variance_ratio=item['PCA']['pca'].explained_variance_ratio_.tolist(),
+            whiten=bool(item['PCA']['pca'].whiten)) for name, item in bank['models'].items()})
+
+    train.validate = validate_target
+    return stage, train
+
+
+def stage_inputs(stage):
+    pins = pin_inputs()
+    old = stage.data_IO.read_dict_from_h5(
+        REFERENCE/'results/main/analysis_raa_unit_Lres-E-loss', 'observables.h5', verbose=False)
+    raw = subset(old)
+    cfg = yaml.safe_load((REFERENCE/'configs/main.yaml').read_text())
+    cfg['output_dir'] = str(ROOT/'results/main')
+    cfg_path = ROOT/'configs/main.yaml'
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    text = yaml.safe_dump(cfg, sort_keys=False)
+    if cfg_path.exists():
+        if cfg_path.read_text() != text:
+            raise ValueError('Changed staged control config')
+    else:
+        with cfg_path.open('x') as stream:
+            stream.write(text)
+    output = stage.settings('main').output_dir
+    if not (output/'observables.h5').exists():
+        stage.data_IO.write_dict_to_h5(raw, output, 'observables.h5', verbose=False)
+    stage.assert_same_tree(stage.data_IO.read_dict_from_h5(output, 'observables.h5', verbose=False), raw)
+    save(ROOT/'noise_backend.json', dict(method='Exact projection of frozen full paired simulation covariance',
+        covariance_file=str(NOISE), covariance_sha256=sha(NOISE), no_new_simulation=True))
+    save(ROOT/'STAGED.json', dict(inputs=pins, backend_sha256=sha(ROOT/'noise_backend.json'),
+        fits=dict(main=dict(training_samples=raw['Design_indices'].tolist(), target_samples=[38],
+            config_sha256=sha(cfg_path), observables_sha256=sha(output/'observables.h5'))),
+        change='Only physical design restriction and resultant native PCA/REML refit',
+        fixed='Frozen tables, full MC covariance, experimental ell=.2 power2 covariance, physical priors, PC counts, kernels, bounds and restart seeds',
+        all_170_features_retained=True, full_statistics_old_features=True,
+        rg_statistics='Unchanged reduced rg reference; not a full-statistics rg upgrade',
+        no_white_kernel=True, no_cluster_work=True, omitted_mapper='existing complete coordinate mapper'))
+
+
+def context_helpers():
+    sys.path.insert(0, str(WORK/'presentation_plots_20261014'))
+    import prepare_presentation as p
+    return p, p.helpers()
+
+
+def inference(train):
+    from scipy.interpolate import RegularGridInterpolator
+    p, helper = context_helpers()
+    bank = train.load()
+    core = p.ref.s.core
+    folder = ROOT/'inference'
+    folder.mkdir(exist_ok=True)
+    identity = next(iter(bank['models'].values()))['joint_group_fit_id']
+    with np.load(REFERENCE/'inference/grid.npz') as z:
+        q, k = z['q'].copy(), z['kappa'].copy()
+    points = core.unit(*[v.ravel() for v in np.meshgrid(q, k, indexing='ij')])
+    indices = np.flatnonzero(np.char.find(bank['names'], '__inclusive_jet__pt_') >= 0)
+    if len(indices) != 35:
+        raise ValueError('Require the exact original 35 jet bins')
+    checkpoint = folder/'checkpoint.npz'
+    ll = np.full(len(points), np.nan)
+    if checkpoint.exists():
+        with np.load(checkpoint) as z:
+            if z['fit_id'].item() != identity:
+                raise ValueError('Stale inference checkpoint')
+            ll = z['loglike_jet_RAA'].copy()
+    if (folder/'COMPLETE.json').exists():
+        record = json.loads((folder/'COMPLETE.json').read_text())
+        if record['fit_id'] != identity:
+            raise ValueError('Changed completed fit')
+        for name, digest in record['outputs'].items():
+            if sha(name) != digest:
+                raise ValueError('Changed completed inference output')
+        return bank
+    for start in range(0, len(points), 128):
+        stop = min(start+128, len(points))
+        if np.isfinite(ll[start:stop]).all():
+            continue
+        pred = bank['mean_model'].predict(points[start:stop])
+        ll[start:stop] = core.likelihood(pred, bank, bank['cov'], indices)
+        if start % 10240 == 0 or stop == len(points):
+            pending = folder/'checkpoint.pending.npz'
+            np.savez_compressed(pending, fit_id=identity, loglike_jet_RAA=ll)
+            pending.replace(checkpoint)
+            print('CONTROL_JET_GRID', stop, len(points), flush=True)
+    ll = ll.reshape(len(q), len(k))
+    mass, density = helper.posterior_mass(ll, q, k)
+    _, coarse = helper.posterior_mass(ll[::2, ::2], q[::2], k[::2])
+    mesh = np.column_stack([v.ravel() for v in np.meshgrid(q, k, indexing='ij')])
+    interpolated = RegularGridInterpolator((q[::2], k[::2]), coarse)(mesh).reshape(mass.shape)
+    weights = helper.trapezoid_weights(q)[:, None]*helper.trapezoid_weights(k)[None, :]
+    interpolated /= (interpolated*weights).sum()
+    tv = float(.5*np.sum(abs(density-interpolated)*weights))
+    if tv >= .02:
+        raise ValueError('Physical grid requires numerical refinement')
+    peak = np.unravel_index(ll.argmax(), ll.shape)
+    pred = bank['mean_model'].predict(core.unit([q[peak[0]]], [k[peak[1]]]))
+    native = p.ref.s.log_posterior._loglikelihood(pred['central_value'][0, indices]-bank['exp']['y'][indices],
+        pred['cov'][0][np.ix_(indices, indices)]+bank['cov'][np.ix_(indices, indices)])
+    np.testing.assert_allclose(native, ll[peak], atol=1e-8, rtol=0)
+    train.publish_npz(folder/'grid.npz', q=q, kappa=k, fit_id=identity,
+        mass_jet_RAA=mass, loglike_jet_RAA=ll)
+    save(folder/'summary.json', dict(jet_RAA=dict(pi_T_Lres_16_50_84=helper.weighted_quantile(mass,q,0),
+        kappa_sc_16_50_84=helper.weighted_quantile(mass,k,1), n_bins=35, coarse_fine_TV=tv,
+        maximum_likelihood=dict(pi_T_Lres=float(q[peak[0]]), kappa_sc=float(k[peak[1]])),
+        native_error=float(abs(native-ll[peak])), mass_above_training_max=float(mass[q>16.172].sum()))))
+    save(folder/'COMPLETE.json', dict(fit_id=identity, outputs={str(path):sha(path) for path in
+        (folder/'grid.npz', folder/'summary.json')}))
+    return bank
+
+
+def render(bank):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    import hybrid_plotting as hp
+    p, helper = context_helpers()
+    import render_presentation as render
+    cases = dict(previous=(REFERENCE, 'Full statistics, 39 training', 'default'),
+                 restricted=(ROOT, 'Full statistics, 30 training', 'blue'),
+                 reduced=(REDUCED, r'Reduced statistics, 30 training ($a=0$)', 'vermillion'))
+    posteriors, summaries = {}, {}
+    for key, (path, label, role) in cases.items():
+        with np.load(path/'inference/grid.npz') as z:
+            posteriors[key] = render.make_posterior(z['mass_jet_RAA'], z['q'], z['kappa'])
+        item = posteriors[key]
+        summaries[key] = dict(pi_T_Lres_16_50_84=helper.weighted_quantile(item['mass'],item['q'],0),
+            kappa_sc_16_50_84=helper.weighted_quantile(item['mass'],item['k'],1))
+    pairs = {}
+    for left, right in (('previous','restricted'),('restricted','reduced'),('previous','reduced')):
+        a, b = posteriors[left], posteriors[right]
+        np.testing.assert_array_equal(a['q'], b['q'])
+        np.testing.assert_array_equal(a['k'], b['k'])
+        pairs[left+'__'+right] = dict(joint_shared_probability=float(np.minimum(a['mass'],b['mass']).sum()),
+            not_a_calibrated_consistency_pvalue=True)
+    plots = ROOT/'plots'
+    plots.mkdir(exist_ok=True)
+    old_plot_dir = render.p.PLOTS
+    render.p.PLOTS = plots
+    styles = {key:hp.comparison_style(role) for key,(_,_,role) in cases.items()}
+    render.LABELS.update({key:label for key,(_,label,_) in cases.items()})
+    with hp.paper_style():
+        render.parameter_pair(posteriors, list(cases), 'jets_baseline_control', 'Jet baseline control', styles=styles)
+        fig, ax = plt.subplots(figsize=(9, 5.7), layout='constrained')
+        for key, (_, label, role) in cases.items():
+            item = posteriors[key]
+            ax.plot(item['k'], item['mass'].sum(0)/helper.trapezoid_weights(item['k']),
+                    label=label, **{k:v for k,v in hp.comparison_style(role).items() if k != 'marker'})
+        ax.set(xlim=(.34,.49), ylim=(0,None), xlabel=hp.KAPPA_LABEL, ylabel='Posterior density')
+        ax.set_ylim(0,ax.get_ylim()[1]*1.4)
+        ax.legend(fontsize=12, loc='upper left')
+        hp.frame_axes(ax)
+        hp.save_figure(fig, plots/'jets_kappa_marginal')
+        plt.close(fig)
+        with np.load(ROOT/'QA/main_predictions.npz') as z:
+            observed, truth = z['observed_mean'][0], z['truth'][0]
+            sigma = np.sqrt(np.diagonal(z['observed_covariance'][0]))
+        fig, axes = plt.subplots(1, 2, figsize=(13.5,5.8), layout='constrained')
+        for name, idx in bank['group_indices'].items():
+            if 'jet_group' not in name:
+                continue
+            role = dict(alice_jet_group='vermillion', atlas_jet_group='blue', cms_jet_group='purple')[name]
+            label = name.split('_')[0].upper()
+            color = hp.comparison_style(role)['color']
+            axes[0].errorbar(truth[idx], observed[idx], yerr=sigma[idx], fmt='o', color=color, label=label)
+            axes[1].plot(np.arange(len(idx)), (observed[idx]-truth[idx])/sigma[idx], 'o',color=color,label=label)
+        axes[0].plot([0,1],[0,1],color='.4',lw=1.2)
+        axes[0].set(xlabel='Simulation target', ylabel='Emulator prediction', title='Held-out design 38')
+        axes[0].legend()
+        axes[1].axhspan(-2,2,color=hp.DEFAULT_COLOR,alpha=.08)
+        axes[1].axhline(0,color='.4',lw=1.2)
+        axes[1].set(xlabel='Bin within emulator group',ylabel='Residual / correlated-target uncertainty')
+        for ax in axes:
+            hp.frame_axes(ax)
+        hp.save_figure(fig, ROOT/'QA/heldout_jets')
+        plt.close(fig)
+    render.p.PLOTS = old_plot_dir
+    save(ROOT/'COMPARISON.json', dict(summaries=summaries, distribution_overlap=pairs,
+        scope='One main refit and heldout 38; no new fivefold calibration claim',
+        prior=dict(pi_T_Lres=[0,20], kappa_sc=[.3,.6]),
+        existing_sources_unchanged=True, covariance_unchanged=True))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--stage-only', action='store_true')
+    args = parser.parse_args()
+    stage, train = setup()
+    stage_inputs(stage)
+    if args.stage_only:
+        print('CONTROL_STAGE_VERIFIED', flush=True)
+        return
+    save(ROOT/'STARTED.json', dict(pid=os.getpid(), started_utc=datetime.now(timezone.utc).isoformat(),
+        source_sha256=sha(__file__), one_main_fit_only=True, no_cluster_work=True))
+    train.fit('main')
+    bank = inference(train)
+    render(bank)
+    save(ROOT/'COMPLETE.json', dict(status='REVIEW_REQUIRED', source_sha256=sha(__file__),
+        comparison_sha256=sha(ROOT/'COMPARISON.json')))
+    print('CONTROL_COMPLETE', flush=True)
+
+
+if __name__ == '__main__':
+    main()

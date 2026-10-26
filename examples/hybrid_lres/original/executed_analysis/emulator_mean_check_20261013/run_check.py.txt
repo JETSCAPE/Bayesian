@@ -1,0 +1,252 @@
+"""Frozen-kernel mean-uncertainty control, exact paired noise and four grids."""
+import argparse
+import copy
+import gc
+import importlib.util
+import json
+from pathlib import Path
+import sys
+import time
+
+import numpy as np
+from sklearn.model_selection import KFold
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+sys.path.insert(0, str(WORK/'emulator_qa_corrected_cov_20261012'))
+import run_checks as r
+from mean_model import MeanAware, omitted_maps
+
+KEY = 'joint_mean_fixed_kernels'
+ORIGINAL_LOAD = r.load
+
+
+def configure():
+    r.configure()
+    r.s.ROOT = ROOT
+    r.s.predict = predict
+    r.s.ref.predict = predict
+
+
+def mean_bank(fold=None):
+    bank = ORIGINAL_LOAD(r.baseline_config(fold))
+    p, b, center, residual, groups = r.s.jg.linear_maps(bank['ec'], bank['models'])
+    u, v = omitted_maps(bank['ec'], bank['models'], groups)
+    truth = r.s.data_IO.predictions_matrix_from_h5(bank['settings'].output_dir,
+        bank['settings'].io.observables_filename, observable_filter=bank['ec'].observable_filter)
+    noise = r.s.sn.load_aligned_covariance(r.matched.COVARIANCE,
+        bank['raw']['Design_indices'], bank['features'])
+    gp = next(iter(bank['models'].values()))['joint_pc_gp'].joint
+    bank['mean_model'] = MeanAware(gp, truth, p, b, center, residual, u, v, noise)
+    return bank
+
+
+def predict(bank, points):
+    if 'mean_model' in bank:
+        return bank['mean_model'].predict(points)
+    return r.ORIGINAL_PREDICT(bank, points)
+
+
+def validate(bank):
+    raw, model = bank['raw'], bank['mean_model']
+    train, test = raw['Design_indices'], raw['Design_indices_validation']
+    joint = r.s.sn.load_aligned_covariance(r.matched.COVARIANCE,
+                                          np.r_[train, test], bank['features'])
+    latent = model.predict(raw['Design_validation'])
+    observed = model.predict(raw['Design_validation'], joint)
+    truth = r.s.data_IO.predictions_matrix_from_h5(bank['settings'].output_dir,
+        bank['settings'].io.observables_filename, validation_set=True,
+        observable_filter=bank['ec'].observable_filter)
+    reconstructed = (truth-model.center) @ model.projection.T @ model.transfer+model.center
+    return dict(design_ids=test, design_unit=raw['Design_validation'], truth=truth,
+        latent_mean=latent['central_value'], latent_covariance=latent['cov'],
+        observed_mean=observed['central_value'], observed_covariance=observed['cov'],
+        pca_reconstruction=reconstructed, truncation_error=reconstructed-truth,
+        interpolation_error=latent['central_value']-reconstructed)
+
+
+def setup():
+    r.verify_lock()
+    manifest = dict(method='Universal kriging; flat constant means for all native PCA coordinates',
+        changed='Joint fitted mean uncertainty and retained/omitted noise coupling only',
+        fixed='Tables, full paired covariance, PC counts/bases/scalers, fitted kernels, empirical omitted covariance, ell=0.2, physical prior and selections',
+        compression='Retained scores at each design plus average of omitted scores; omitted contrasts not conditioned on',
+        omitted_model='Native empirical omitted covariance treated as exchangeable physical variation across designs; contributes R/N to training average and R to a new design',
+        limitations=['PCA basis and scaler uncertainty not propagated',
+            'Kernel hyperparameters frozen from plug-in-mean reference, not reoptimized under universal kriging',
+            'Empirical omitted covariance may still include MC variation',
+            'Held-out designs share MC samples; not independent-generator validation',
+            'Fixed generator cross sections and finite MC covariance precision'],
+        source_modified=False, defaults_changed=False,
+        covariance_sha256=r.matched.digest(r.matched.COVARIANCE),
+        protected_manifest=str(r.ROOT/'manifest.json'),
+        experiment_sources={str(path): r.matched.digest(path) for path in
+                            (ROOT/'mean_model.py', ROOT/'run_check.py')})
+    path = ROOT/'manifest.json'
+    if path.exists():
+        assert json.loads(path.read_text()) == manifest, 'Changed study code: do not reuse stale grids'
+    else:
+        r.s.save(path, manifest)
+    for key in ('reference', KEY):
+        (ROOT/'results'/key/'QA').mkdir(parents=True, exist_ok=True)
+    r.s.save(ROOT/'results/reference/inference/summary.json',
+             json.loads((r.BASE_RESULT/'inference/summary.json').read_text()))
+
+
+def qa():
+    folder = ROOT/'results'/KEY/'QA'
+    if (folder/'QA_COMPLETE.json').exists():
+        return
+    bank = mean_bank()
+    independent = validate(bank)
+    np.savez_compressed(folder/'independent_validation.npz', **independent)
+    folds = []
+    for fold in range(5):
+        path = folder/f'fold_{fold}_predictions.npz'
+        if path.exists():
+            with np.load(path) as z:
+                result = {key: z[key].copy() for key in z.files}
+        else:
+            current = mean_bank(fold)
+            result = validate(current)
+            np.savez_compressed(path, **result)
+            del current
+            gc.collect()
+        folds.append(result)
+        print(f'MEAN_QA fold {fold+1}/5 complete', flush=True)
+    combined = {key: np.concatenate([row[key] for row in folds]) for key in folds[0]}
+    assert sorted(combined['design_ids']) == sorted(bank['raw']['Design_indices'])
+    np.savez_compressed(folder/'fivefold_predictions.npz', **combined)
+    summary = dict(independent=r.s.metrics(bank, independent),
+                   fivefold=r.s.metrics(bank, combined),
+                   interpretation='Full noisy-target predictions with shared test/train covariance; not independent latent-accuracy validation')
+    r.s.save(folder/'validation_summary.json', summary)
+    r.s.save(folder/'regional_validation.json', r.regional_metrics(bank, combined))
+    model = bank['mean_model']
+    points = r.s.core.unit([2.172, 9.178], [.433071, .437709])
+    before, after = r.ORIGINAL_PREDICT(bank, points), predict(bank, points)
+    np.savez_compressed(folder/'model_diagnostic.npz', mean_offset=model.beta @ model.inverse,
+        mean_covariance=model.inverse.T @ model.mean_covariance @ model.inverse,
+        reference_mean=before['central_value'], trial_mean=after['central_value'],
+        reference_covariance=before['cov'], trial_covariance=after['cov'],
+        fitted_mean_covariance=after['fitted_mean_covariance'],
+        coordinates_piTLres_kappa=np.array([[2.172, .433071], [9.178, .437709]]))
+    r.s.save(folder/'QA_COMPLETE.json', dict(fivefold_designs=len(combined['design_ids']),
+        independent_designs=independent['design_ids'].tolist(), kernels_reused=True))
+
+
+def inference():
+    if (ROOT/'results'/KEY/'INFERENCE_COMPLETE.json').exists():
+        return
+    bank = mean_bank()
+    r.s.inference(KEY, bank)
+    r.verify_lock()
+    r.s.save(ROOT/'results'/KEY/'INFERENCE_COMPLETE.json', dict(
+        inference='Native Gaussian likelihood on physical-prior grid', defaults_changed=False))
+
+
+def render():
+    spec = importlib.util.spec_from_file_location('mean_control_plotter',
+        WORK/'emulator_sensitivity_ell02_20261010/render.py')
+    old = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(old)
+    old.OUT = ROOT/'plots'
+    old.OUT.mkdir(exist_ok=True)
+    # Existing gallery uses stored grid predictions, not historical emulator caches.
+    r.s.load = lambda config: mean_bank() if str(ROOT) in str(config) else ORIGINAL_LOAD(config)
+    bank = mean_bank()
+    entries = [('reference', 'Fixed empirical mean', 'default'),
+               (KEY, 'Joint mean uncertainty', 'vermillion')]
+    summaries, archives = {}, {}
+    for key, _, _ in entries:
+        summaries[key], archives[key] = old.archive(key)
+    comparisons = old.differences(archives, summaries)
+    r.s.save(ROOT/'summary.json', dict(posteriors=comparisons, defaults_changed=False,
+        publication_inference=False, kernels_reoptimized=False))
+    pages = []
+    for case in r.s.KEYS:
+        stem = old.OUT/f'{case}_parameters'
+        old.corner(entries, archives, case, stem)
+        pages.append((stem.with_suffix('.pdf'), old.CASE_LABELS[case]+' / parameters'))
+        pages.extend(old.observables(entries, case, 'mean', r.s.ell_bank(bank)))
+    qa_figures(bank, old, entries, pages)
+    # Native raw-target scatter/residual routine, with the actual new conditioning.
+    r.s.ref.OUT = ROOT/'results'/KEY
+    for label in ('fivefold', 'independent'):
+        name = 'fivefold_predictions.npz' if label == 'fivefold' else 'independent_validation.npz'
+        with np.load(ROOT/'results'/KEY/'QA'/name) as z:
+            result = {key: z[key].copy() for key in z.files}
+        r.s.ref.validation_figures(bank, result, label)
+    r.s.save(ROOT/'QA/native_index.json', dict(
+        new_native_scatter=[str(path) for path in (ROOT/'results'/KEY/'QA').rglob('*.pdf')],
+        unchanged_PCA_kernel_training_QA=str(r.ROOT/'results/reference/QA'),
+        caveat='Native PC-only training plots describe frozen GP fits, not the changed universal-mean prediction'))
+    sys.path.insert(0, str(r.s.REFROOT/'QA/.pdf_tools'))
+    import pymupdf
+    doc = pymupdf.open()
+    toc = []
+    for path, label in pages:
+        with pymupdf.open(path) as source:
+            for page in source:
+                page.get_pixmap(matrix=pymupdf.Matrix(.15, .15))
+            toc.append([1, label, len(doc)+1])
+            doc.insert_pdf(source)
+    doc.set_toc(toc)
+    doc.save(old.OUT/'comparison_catalog.pdf')
+    doc.close()
+    r.s.save(old.OUT/'catalog_index.json', [dict(path=str(path), label=label) for path, label in pages])
+
+
+def qa_figures(bank, plotter, entries, pages):
+    import matplotlib.pyplot as plt
+    import hybrid_plotting as hp
+    groups = list(bank['ec'].emulation_settings)
+    reports = {'reference': json.loads((r.ROOT/'results/reference/QA/regional_validation.json').read_text()),
+               KEY: json.loads((ROOT/'results'/KEY/'QA/regional_validation.json').read_text())}
+    for region in ('all', 'physical_prior'):
+        with hp.paper_style():
+            fig, axes = plt.subplots(1, 3, figsize=(14, 5.5), layout='constrained')
+            x = np.arange(len(groups))
+            for key, label, role in entries:
+                values = reports[key][region]['groups']
+                for ax, metric in zip(axes, ['coverage_1sigma', 'coverage_2sigma',
+                                              'joint_negative_log_predictive_density_per_bin']):
+                    ax.plot(x, [values[name][metric] for name in groups], marker='o',
+                            label=label, **plotter.plot_style(role))
+            for ax, title in zip(axes, ['Within $1\\sigma$', 'Within $2\\sigma$',
+                                       'Joint predictive score']):
+                ax.set(ylabel=title, xticks=x, xticklabels=[plotter.GROUP_LABELS[g] for g in groups])
+                ax.tick_params(axis='x', labelsize=11, labelrotation=45)
+            axes[0].axhline(.6827, color='.5', ls=':', lw=1)
+            axes[1].axhline(.9545, color='.5', ls=':', lw=1)
+            axes[0].set_ylim(0, 1.03)
+            axes[1].set_ylim(0, 1.03)
+            axes[0].legend(fontsize=11)
+            stem = ROOT/'plots'/f'{region}_validation_QA'
+            hp.save_figure(fig, stem)
+            plt.close(fig)
+            pages.append((stem.with_suffix('.pdf'), region+' / noisy-target validation'))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--stage', choices=['qa', 'inference', 'render', 'all'], default='all')
+    args = parser.parse_args()
+    configure()
+    setup()
+    (ROOT/'QA').mkdir(exist_ok=True)
+    for name, function in [('qa', qa), ('inference', inference), ('render', render)]:
+        if args.stage in (name, 'all'):
+            r.s.save(ROOT/'status.json', dict(stage=name, completed=False, defaults_changed=False))
+            print('STAGE_START', name, flush=True)
+            function()
+            r.verify_lock()
+            print('STAGE_COMPLETE', name, flush=True)
+            r.s.save(ROOT/'status.json', dict(stage=name, completed=True, defaults_changed=False))
+    if args.stage == 'all':
+        r.s.save(ROOT/'NUMERICAL_COMPLETE.json', dict(defaults_changed=False,
+            visually_reviewed=False, publication_ready=False))
+
+
+if __name__ == '__main__':
+    main()

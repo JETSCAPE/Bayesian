@@ -1,0 +1,190 @@
+{
+  "status": "COMPLETE_FROZEN_RESULT_REPRODUCTION_NOT_EVENT_TO_FIT",
+  "clean_environment": "Python 3.12 venv; only requirements.txt plus resolved transitive dependencies; PYTHONPATH=repo/src; no full project install",
+  "tests": "17 passed, including explicit 18-figure render integration",
+  "fresh_checkout_without_data": "Data-dependent tests skip; path/tamper/source tests remain active; explicit render flag requires data",
+  "figure_count": 115,
+  "manuscript_count": 18,
+  "extra_count": 97,
+  "formats": [
+    "pdf",
+    "png",
+    "svg"
+  ],
+  "indexed_pdf_pages": 115,
+  "indexed_pdf_bookmarks": 115,
+  "manuscript_figures": [
+    "preliminary_resolution_posteriors",
+    "preliminary_observables_01",
+    "preliminary_observables_02",
+    "preliminary_observables_03",
+    "preliminary_class_tensions",
+    "preliminary_angular_tensions",
+    "preliminary_cross_predictions",
+    "preliminary_experiment_leaveouts",
+    "preliminary_correlation_scan",
+    "preliminary_wake_coupling",
+    "qa_design_pca",
+    "qa_validation_scatter",
+    "qa_validation_pulls",
+    "qa_precision_coverage",
+    "qa_parameter_recovery",
+    "preliminary_wake_implementation",
+    "preliminary_wake_joint_posteriors",
+    "preliminary_wake_fixed_rg"
+  ],
+  "all_18_original_scientific_signatures_exact": true,
+  "all_97_extra_cut_model_annotations_verified": true,
+  "all_75_gallery_route_annotations_verified": true,
+  "visual_inspection": "All 18 manuscript figures inspected in contact sheets; full-size observable/QA panels and representative sector/prior/ell/cut/hpt10 extra panels inspected. Some extra native angular tick labels are dense; no bins/ranges/bands omitted.",
+  "tracked_reference_sha256": "2452a785d640d4611dddacac5398a90465ec3639156b8c67c55c1761a200dd3f",
+  "reproduced_receipt_sha256": "de64656630a5b0ad2410742ff16734d2c0ed7f226122b5f673738fc6d0ff16b6",
+  "indexed_pdf_sha256": "4a578029758082d88c9f7b23735c9f574055e6b92431e6019326b32bebe4d62e",
+  "output_directory": "rendered_review_labeled",
+  "native_checkout_commit": "991e78dc9d8d658f04d38bd803c33eb4c120147b",
+  "native_prediction_state_checks": {
+    "all": {
+      "fit_id": "039aac9942db4f66aa74ee9f5cdfa1a8",
+      "points": 4,
+      "mean_bitwise_equal": true,
+      "max_absolute_difference": {
+        "central_value": 0.0,
+        "cov": 4.186993633747971e-14,
+        "fitted_mean_covariance": 4.186988212737108e-14
+      },
+      "rtol": 5e-12,
+      "atol": 5e-13
+    },
+    "inclusive": {
+      "fit_id": "c9ff27a02c0044fe95e4ac578629b0ea",
+      "points": 4,
+      "mean_bitwise_equal": true,
+      "max_absolute_difference": {
+        "central_value": 0.0,
+        "cov": 3.4101194090752074e-14,
+        "fitted_mean_covariance": 3.410130251096932e-14
+      },
+      "rtol": 5e-12,
+      "atol": 5e-13
+    },
+    "jets": {
+      "fit_id": "ce69a22a396e4c7e8df07e3470d79116",
+      "points": 4,
+      "mean_bitwise_equal": true,
+      "max_absolute_difference": {
+        "central_value": 0.0,
+        "cov": 5.307887918255816e-15,
+        "fitted_mean_covariance": 5.307887918255816e-15
+      },
+      "rtol": 5e-12,
+      "atol": 5e-13
+    }
+  },
+  "full_training_archive_verified": true,
+  "cache_payload_bytes": 68484007,
+  "quick_private_artifact": {
+    "path": "data_archive/hybrid_lres_reproduction.tar.gz",
+    "bytes": 64025443,
+    "sha256": "302983092cf744d6440ae5759b48f3f3c1b3428c76f25bba1dd118186867f76d"
+  },
+  "optional_dense_archive": {
+    "filename": "full_training.npz",
+    "sha256": "f2e0e43853a10448722c8c3d2a0ce8cf2da847914eeb99b676fdce54a28f69df",
+    "bytes": 351241717,
+    "arrays": {
+      "central_values": {
+        "shape": [
+          40,
+          170
+        ],
+        "dtype": "<f8",
+        "sha256": "aa6ed6e5d839d45ed5aa620a80e1c6be84c190e6450c7165c93ab1e9ae7c3090"
+      },
+      "covariance": {
+        "shape": [
+          40,
+          170,
+          40,
+          170
+        ],
+        "dtype": "<f8",
+        "sha256": "f1578e20d7f11cbd0077405f0a756438f398acd3cbd5a8887f5d9a38be32d447"
+      },
+      "design_ids": {
+        "shape": [
+          40
+        ],
+        "dtype": "<i8",
+        "sha256": "eedc539e16fc0e9575f1fa403728001991d61b964b66f69d534ec9c36e4be3ba"
+      },
+      "observable_names": {
+        "shape": [
+          170
+        ],
+        "dtype": "<U79",
+        "sha256": "3955a52a418285e94ded339606bf4514a2633dd4bdee329b9bdcfb65f15f02f1"
+      },
+      "xmin": {
+        "shape": [
+          170
+        ],
+        "dtype": "<f8",
+        "sha256": "a2978f00462bc5f652a45702f83ff87b90847dd75eefbbe5495efb5b02dd03ab"
+      },
+      "xmax": {
+        "shape": [
+          170
+        ],
+        "dtype": "<f8",
+        "sha256": "088a03a036d78c2a4ca6b0529e602d385369a11b25be209ce0b465560609d89a"
+      },
+      "old_moment_central_values": {
+        "shape": [
+          40,
+          134
+        ],
+        "dtype": "<f8",
+        "sha256": "5c8d27de6c003176e74705b41cad8ceca59b22891ba21d36bd2e431c73636b51"
+      },
+      "rg_raw_bin_map": {
+        "shape": [
+          36,
+          39
+        ],
+        "dtype": "<f8",
+        "sha256": "a4bbe3d2eb07f3c0a2d875f5f9ad86970ae1f24e550d1a8ba26362696cfb67b8"
+      },
+      "fine_edges": {
+        "shape": [
+          14
+        ],
+        "dtype": "<f8",
+        "sha256": "34ef43931cc97499b5eaa54a5904360e66d2847ece7741f188b8b5bb7ec00629"
+      },
+      "diagnostics": {
+        "shape": [
+          1
+        ],
+        "dtype": "<U521",
+        "sha256": "df1ed6bf26bba8494f2e153a6e342a26269b978f56dd8e0f92b9a6ec79e136b2"
+      }
+    },
+    "scope": "Full moment-derived central_values and cross-design/cross-bin covariance; NOT the accepted pinned old-table means. Separate audit archive, not required to draw figures."
+  },
+  "optional_accepted_tables": {
+    "filename": "accepted_observables.h5",
+    "sha256": "b61b6d6049a35ebe24453a7c029373b814623ccd54146f06f2949f1cd8365694",
+    "bytes": 464136,
+    "scope": "Bytewise accepted frozen observables.h5: Design/Design_indices/Prediction, validation tables, and experimental inputs. Accepted old 134-bin prediction means are not replaced by moment-derived central_values in full_training.npz."
+  },
+  "code_sha256": {
+    "reproduce.py": "aeb756e153848bdf25332aa0f807a151f2764b7d00954533f9a055c1d6acd9ac",
+    "cache_io.py": "043de14b5d66bb9b9b0a9a2297f0dc87ae0588f869f4f8c6d3835490c3a2ddf7",
+    "export_local.py": "d4889335f63d2bf90c2886d1e43aead063e72b367faf4ada6fad714630fb792b",
+    "vendor_original.py": "01fe98dbb998556fe646f6f02857b90322a3ce49a9691c58ace63b1ee09995b7",
+    "requirements.txt": "0419d505230b53d17b0e7c3ad06112e0e5d0aa4bf59868b48c8b15c422b454ae",
+    "requirements.lock.txt": "5e3ea0c03d127239f1eac1ff03b59d67e3fda634f0afd42f771eb1567de74547"
+  },
+  "hard_blockers": [],
+  "distribution": "Private manuscript repository release assets only; no upload performed; data ignored by Git; no commit or push by this agent"
+}

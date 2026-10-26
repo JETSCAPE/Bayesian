@@ -1,0 +1,276 @@
+"""Actual mean-aware kernel refit through matched QA and four-way inference."""
+import argparse
+import copy
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import gc
+import importlib.util
+import json
+from pathlib import Path
+import shutil
+import sys
+import time
+import traceback
+import uuid
+import warnings
+
+import numpy as np
+import yaml
+
+ROOT = Path(__file__).resolve().parent
+WORK = ROOT.parent
+CONTROL = WORK/'emulator_mean_check_20261013'
+sys.path.insert(0, str(CONTROL))
+import run_check as control
+from refit_model import RestrictedMeanGP, FastMeanAware
+from mean_model import MeanAware, omitted_maps
+
+r, s = control.r, control.r.s
+KEY = 'mean_refit'
+BASE_LOAD = control.ORIGINAL_LOAD
+if __name__ == '__main__':
+    sys.modules['run_refit'] = sys.modules[__name__]
+
+
+def configure():
+    r.configure()
+    s.ROOT = ROOT
+    s.predict = predict
+    s.ref.predict = predict
+
+
+def verify():
+    r.verify_lock()
+    if (ROOT/'manifest.json').exists():
+        manifest = json.loads((ROOT/'manifest.json').read_text())
+        for path, expected in manifest['study_source_hashes'].items():
+            assert r.matched.digest(Path(path)) == expected, 'Study code changed: refuse stale results'
+
+
+def config_for(fold=None):
+    cfg = yaml.safe_load(r.baseline_config(fold).read_text())
+    output = ROOT/'results'/KEY
+    if fold is not None:
+        output = output/'cv'/f'fold_{fold}'
+    cfg['output_dir'] = str(output)
+    path = ROOT/'configs'/KEY/('main.yaml' if fold is None else f'fold_{fold}.yaml')
+    s.fixed_config(path, cfg)
+    return path
+
+
+def setup():
+    r.verify_lock()
+    manifest = dict(method='Universal-mean GP; optimize restricted likelihood with flat constant means integrated out',
+        changed='Constant-mean treatment and kernel refitting under that likelihood',
+        fixed='Tables, full paired MC covariance, empirical PCA bases/scalers/counts/omitted residual, kernel families/bounds/initial values, jitter, 8 restart draws/seeds, validation splits, ell=0.2, physical prior and four selections',
+        n_pc=dict(alice_hadron_group=1, alice_jet_group=2, atlas_hadron_group=1,
+                  atlas_jet_group=2, cms_hadron_group=1, cms_jet_group=2,
+                  alice_theta_g_group=3, atlas_dr12_group=4),
+        flat_mean_integral='Orthonormal Helmert contrasts; exactly equal to generalized least-squares mean marginalization up to parameter-independent constants',
+        omitted_conditioning='Retained scores at every training design plus omitted-score mean; unchanged from the previous mean-aware control',
+        omitted_model='Fixed native empirical R; exchangeable latent variation R/N in average and R at a new point',
+        inference='Same direct uniform-physical-prior quadrature and native Gaussian likelihood',
+        limitations=['Fixed empirical PCA basis/scaler and omitted residual',
+                     'Plug-in optimized kernel parameters, not hyperparameter marginalization',
+                     'Shared-MC heldouts are not independent-generator validation',
+                     'Fixed generator cross sections and finite MC covariance precision'],
+        covariance_sha256=r.matched.digest(r.matched.COVARIANCE),
+        protected_reference_manifest=str(r.ROOT/'manifest.json'),
+        study_source_hashes={str(path): r.matched.digest(path) for path in
+            (ROOT/'refit_model.py', ROOT/'run_refit.py', CONTROL/'mean_model.py')},
+        native_analysis_source_modified=False, defaults_changed=False)
+    if (ROOT/'manifest.json').exists():
+        assert json.loads((ROOT/'manifest.json').read_text()) == manifest
+    else:
+        s.save(ROOT/'manifest.json', manifest)
+    (ROOT/'QA').mkdir(exist_ok=True)
+    for fold in (None, 0, 1, 2, 3, 4):
+        config_for(fold)
+    s.save(ROOT/'results/reference/inference/summary.json',
+           json.loads((r.BASE_RESULT/'inference/summary.json').read_text()))
+    s.save(ROOT/'results/frozen_mean/inference/summary.json',
+           json.loads((CONTROL/'results/joint_mean_fixed_kernels/inference/summary.json').read_text()))
+
+
+def restarts(bank, gp):
+    blocks = []
+    for name, settings in bank['ec'].emulation_settings.items():
+        indices = bank['models'][name]['joint_pc_gp'].indices
+        bounds = np.vstack([gp.kernels[int(i)].bounds for i in indices])
+        rng = np.random.RandomState(settings.settings['random_state'])
+        blocks.append([rng.uniform(bounds[:, 0], bounds[:, 1]) for _ in range(settings.n_restarts)])
+    return [np.concatenate([block[i] for block in blocks]) for i in range(gp.n_restarts)]
+
+
+def attach_mean(bank):
+    projection, transfer, center, residual, groups = s.jg.linear_maps(bank['ec'], bank['models'])
+    u, v = omitted_maps(bank['ec'], bank['models'], groups)
+    truth = s.data_IO.predictions_matrix_from_h5(bank['settings'].output_dir,
+        bank['settings'].io.observables_filename, observable_filter=bank['ec'].observable_filter)
+    noise = s.sn.load_aligned_covariance(r.matched.COVARIANCE,
+        bank['raw']['Design_indices'], bank['features'])
+    gp = next(iter(bank['models'].values()))['joint_pc_gp'].joint
+    bank['mean_model'] = FastMeanAware(gp, truth, projection, transfer, center, residual, u, v, noise)
+    # This optimizes algebra only: verify against the original full-feature solve.
+    points = bank['raw']['Design_validation'][:2]
+    slow = MeanAware.predict(bank['mean_model'], points)
+    fast = bank['mean_model'].predict(points)
+    for field in slow:
+        np.testing.assert_allclose(slow[field], fast[field], atol=2e-11, rtol=1e-9)
+    pc_mean, pc_covariance = gp.predict(points)
+    np.testing.assert_allclose(pc_mean, (fast['central_value']-center) @ projection.T, atol=1e-10)
+    np.testing.assert_allclose(pc_covariance,
+        np.einsum('pa,mab,qb->mpq', projection, fast['cov'], projection), atol=1e-10)
+    return bank
+
+
+def load_bank(fold=None):
+    bank = BASE_LOAD(config_for(fold))
+    s.jg.validate_results(bank['ec'], bank['models'], check_file=True)
+    for model in bank['models'].values():
+        gp = model['joint_pc_gp'].joint
+        assert isinstance(gp, RestrictedMeanGP)
+        assert model['mean_aware_training'] == 'REML-constant-means-v1'
+        assert all(s.sn.white_variance(kernel) == 0 for kernel in gp.kernels_)
+    return attach_mean(bank)
+
+
+def fit(fold=None):
+    configure()
+    verify()
+    label = 'main' if fold is None else f'fold_{fold}'
+    origin = BASE_LOAD(r.baseline_config(fold))
+    path = config_for(fold)
+    settings = s.analysis.AnalysisSettings.from_config_file('analysis_raa_unit', path, 'Lres-E-loss')
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    for filename in ('observables.h5', 'observables_preprocessed.h5'):
+        source = origin['settings'].output_dir/filename
+        if source.exists():
+            target = settings.output_dir/filename
+            if not target.exists():
+                shutil.copy2(source, target)
+            assert r.matched.digest(source) == r.matched.digest(target)
+    ec = s.emulation.EmulationConfig.from_config_file(settings)
+    files = [s.base.IO.output_filename(es, settings) for es in ec.emulation_settings.values()]
+    report_path = settings.output_dir/'joint_fit.json'
+    if all(path.exists() for path in files) and report_path.exists():
+        print('FIT_REUSE', label, flush=True)
+        bank = load_bank(fold)
+    else:
+        if any(path.exists() for path in files) or report_path.exists():
+            raise RuntimeError('Partial fit cache: inspect, do not overwrite')
+        old_gp = next(iter(origin['models'].values()))['joint_pc_gp'].joint
+        kernels = [kernel.clone_with_theta(kernel.theta) for kernel in old_gp.kernels]
+        starts = restarts(origin, old_gp)
+        gp = RestrictedMeanGP(kernels, jitter=old_gp.jitter, n_restarts=old_gp.n_restarts,
+                              random_state=old_gp.random_state)
+        started = time.monotonic()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            gp.fit(old_gp.X_train_, old_gp.Y_train_, old_gp.noise_, restart_thetas=starts)
+        initial = np.concatenate([kernel.theta for kernel in old_gp.kernels])
+        previous = np.concatenate([kernel.theta for kernel in old_gp.kernels_])
+        theta = np.concatenate([kernel.theta for kernel in gp.kernels_])
+        bounds = np.vstack([kernel.bounds for kernel in gp.kernels_])
+        _, gradient = gp.objective(theta)
+        projected = gradient.copy()
+        projected[(theta <= bounds[:, 0]+1e-5) & (projected > 0)] = 0
+        projected[(theta >= bounds[:, 1]-1e-5) & (projected < 0)] = 0
+        best = min(gp.optimization_, key=lambda row: row['objective'])
+        identity = uuid.uuid4().hex
+        report = dict(label=label, seconds=time.monotonic()-started,
+            objective='Restricted Gaussian likelihood after exact constant-mean marginalization',
+            optimization=gp.optimization_, best_success=best['success'],
+            warnings=[str(warning.message) for warning in caught],
+            native_initial_REML_objective=gp.objective(initial, gradient=False),
+            previous_fitted_kernels_REML_objective=gp.objective(previous, gradient=False),
+            fitted_REML_objective=-gp.log_marginal_likelihood_value_,
+            previous_theta=previous.tolist(), fitted_theta=theta.tolist(), bounds=bounds.tolist(),
+            projected_gradient_max=float(abs(projected).max()),
+            restart_thetas=[start.tolist() for start in starts],
+            n_restarts=gp.n_restarts, jitter=gp.jitter,
+            joint_fit_id=identity, n_pc={name: es.n_pc for name, es in ec.emulation_settings.items()})
+        if not best['success']:
+            raise RuntimeError('Best REML fit failed convergence; no completion marker')
+        if report['fitted_REML_objective'] > report['previous_fitted_kernels_REML_objective']+1e-5:
+            raise RuntimeError('Refit worse than previous kernels on new objective; needs optimizer continuation')
+        models = copy.deepcopy(origin['models'])
+        for name, es in ec.emulation_settings.items():
+            result = models[name]
+            indices = result['joint_pc_gp'].indices
+            result['joint_pc_gp'] = s.jg.GroupView(gp, indices)
+            result['emulators'] = [s.sn.PCView(gp, int(i)) for i in indices]
+            result['joint_group_fit_id'] = identity
+            result['mean_aware_training'] = 'REML-constant-means-v1'
+            s.base.IO.write_emulator(result, es, settings)
+        s.save(report_path, report)
+        bank = load_bank(fold)
+        print('FIT_COMPLETE', label, 'seconds', round(report['seconds'], 1),
+              'objective', report['fitted_REML_objective'], flush=True)
+    result = control.validate(bank)
+    folder = ROOT/'results'/KEY/'QA'
+    folder.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(folder/('independent_validation.npz' if fold is None else f'fold_{fold}_predictions.npz'), **result)
+    s.save(settings.output_dir/'pc_audit.json', s.pc_audit(bank))
+    verify()
+    return label
+
+
+def fit_all(workers):
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fit, fold): fold for fold in (None, 0, 1, 2, 3, 4)}
+        for future in as_completed(futures):
+            print('FIT_AND_VALIDATION_COMPLETE', future.result(), flush=True)
+    bank = load_bank()
+    folder = ROOT/'results'/KEY/'QA'
+    folds = []
+    for fold in range(5):
+        with np.load(folder/f'fold_{fold}_predictions.npz') as z:
+            folds.append({key: z[key].copy() for key in z.files})
+    combined = {name: np.concatenate([row[name] for row in folds]) for name in folds[0]}
+    assert sorted(combined['design_ids']) == sorted(bank['raw']['Design_indices'])
+    np.savez_compressed(folder/'fivefold_predictions.npz', **combined)
+    with np.load(folder/'independent_validation.npz') as z:
+        independent = {name: z[name].copy() for name in z.files}
+    s.save(folder/'validation_summary.json', dict(fivefold=s.metrics(bank, combined), independent=s.metrics(bank, independent)))
+    s.save(folder/'regional_validation.json', r.regional_metrics(bank, combined))
+    s.save(ROOT/'FIT_QA_COMPLETE.json', dict(main_and_fivefold_refitted=True, native_restart_count=8,
+        optimization_runs=54, heldout_designs=39, source_and_input_hashes_unchanged=True))
+
+
+def predict(bank, points):
+    if 'mean_model' in bank:
+        return bank['mean_model'].predict(points)
+    return r.ORIGINAL_PREDICT(bank, points)
+
+
+def inference():
+    bank = load_bank()
+    s.inference(KEY, bank)
+    verify()
+    s.save(ROOT/'INFERENCE_COMPLETE.json', dict(all_four_selections=True, method='Direct physical-prior quadrature'))
+
+
+def render():
+    import render_refit
+    render_refit.main()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--stage', choices=['fit', 'inference', 'render', 'all'], default='all')
+    parser.add_argument('--workers', type=int, default=2)
+    args = parser.parse_args()
+    configure()
+    setup()
+    for name, function in [('fit', lambda: fit_all(args.workers)), ('inference', inference), ('render', render)]:
+        if args.stage in (name, 'all'):
+            s.save(ROOT/'status.json', dict(stage=name, complete=False, defaults_changed=False))
+            print('STAGE_START', name, flush=True)
+            function()
+            verify()
+            s.save(ROOT/'status.json', dict(stage=name, complete=True, defaults_changed=False))
+            print('STAGE_COMPLETE', name, flush=True)
+
+
+if __name__ == '__main__':
+    main()

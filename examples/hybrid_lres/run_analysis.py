@@ -439,7 +439,6 @@ def holdout_summary(training, output):
 
 def render_figures(inference, output, *, ell=.2, holdout=None, selection=None):
     """New scientific plots, using the vendored original geometry and style."""
-    import textwrap
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -458,7 +457,8 @@ def render_figures(inference, output, *, ell=.2, holdout=None, selection=None):
         prediction = {key: archive[key] for key in archive.files}
     rows = features(prediction["features"])
     hadron_bins = [row[1] for row in rows if sector(row[0]) == "hadrons"]
-    cut = f"hadron pT >= {min(hadron_bins):g} GeV" if hadron_bins else "no hadrons fitted"
+    cut = (rf"hadron $p_{{\mathrm{{T}}}}\geq {min(hadron_bins):g}$ GeV"
+           if hadron_bins else "no hadrons fitted")
     mask = "source-sector selection"
     if selection:
         mask_parts = ["drop " + ",".join(selection["exclude_experiments"])] if selection["exclude_experiments"] else []
@@ -495,8 +495,16 @@ def render_figures(inference, output, *, ell=.2, holdout=None, selection=None):
             ax.errorbar(center, prediction["observed"][ix],
                 yerr=np.sqrt(np.diag(prediction["experimental_covariance"])[ix]),
                 fmt="o", color="black", markersize=4, label="Data (marginal errors)")
-            title = "\n".join(textwrap.wrap(name.replace("__", " / ").strip(" /"), width=60))
             kind = sector(name)
+            experiment = next((key.upper() for key in ("alice", "atlas", "cms") if key in name.lower()), "Simulation")
+            observable = {"hadrons": "hadrons", "jets": "jets", "theta_g": r"$\theta_g$",
+                          "dR12": r"$dR_{12}$", "rg": r"$r_g$"}[kind]
+            parts = name.split("__")
+            radius = parts[4].split("_")[0] if len(parts) > 4 and parts[4].startswith("R") else ""
+            title = f"{experiment} {observable}, {parts[-1]}%" + (f", {radius}" if radius else "")
+            window = next((token[2:] for token in parts[4].split("_") if token.startswith("pt")), "") if len(parts) > 4 else ""
+            if window:
+                title += f", jet pT {window} GeV"
             xlabel = {"hadrons": r"$p_{\mathrm{T}}$ [GeV]", "jets": r"$p_{\mathrm{T}}$ [GeV]",
                       "theta_g": r"$\theta_{\mathrm{g}}$", "dR12": r"$dR_{12}$",
                       "rg": r"$r_{\mathrm{g}}$"}[kind]

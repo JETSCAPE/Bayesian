@@ -186,27 +186,31 @@ def _plot_autocorrelation_time(results, plot_dir, config):
     # For each walker, use emcee to compute the autocorrelation time for each parameter
     chain = results["chain"]
     _, n_walkers, n_dim = chain.shape
-    autocorrelation_time_parameters = np.zeros((n_walkers, n_dim))
+    # NaN (not 0) for walkers whose estimate fails, so that they do not pull the average down
+    autocorrelation_time_parameters = np.full((n_walkers, n_dim), np.nan)
     for i in range(n_walkers):
         try:
-            autocorrelation_time_parameters[i] = emcee.autocorr.integrated_time(chain[:, i, :])
+            # Keep the walker axis: integrated_time reads a 2D array as (n_steps, n_walkers), so passing
+            # chain[:, i, :] treated the parameters as walkers and returned ONE value, their average,
+            # for every parameter.
+            autocorrelation_time_parameters[i] = emcee.autocorr.integrated_time(chain[:, i : i + 1, :])
         except emcee.autocorr.AutocorrError as e:
             logger.info(f"Autocorrelation time could not be computed for walker {i}: {e}")
 
     # Compute the mean and stdev over all walkers
-    mean_autocorrelation_time_parameters = autocorrelation_time_parameters.mean(axis=0)
-    std_autocorrelation_time_parameters = autocorrelation_time_parameters.std(axis=0)
+    mean_autocorrelation_time_parameters = np.nanmean(autocorrelation_time_parameters, axis=0)
+    std_autocorrelation_time_parameters = np.nanstd(autocorrelation_time_parameters, axis=0)
 
     # Also compute the autocorrelation time for the log posterior
     log_posterior = results["log_prob"]
-    autocorrelation_time_posterior = np.zeros((n_walkers, 1))
+    autocorrelation_time_posterior = np.full((n_walkers, 1), np.nan)
     for i in range(n_walkers):
         try:
             autocorrelation_time_posterior[i] = emcee.autocorr.integrated_time(log_posterior[:, i])
         except emcee.autocorr.AutocorrError as e:
             logger.info(f"Autocorrelation time could not be computed for log_posterior: {e}")
-    mean_autocorrelation_time_posterior = autocorrelation_time_posterior.mean(axis=0)
-    std_autocorrelation_time_posterior = autocorrelation_time_posterior.std(axis=0)
+    mean_autocorrelation_time_posterior = np.nanmean(autocorrelation_time_posterior, axis=0)
+    std_autocorrelation_time_posterior = np.nanstd(autocorrelation_time_posterior, axis=0)
 
     # Concatenate the autocorrelation time for the parameters and the log posterior
     mean_autocorrelation_time = np.concatenate(

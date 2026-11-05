@@ -31,19 +31,42 @@ logger = logging.getLogger(__name__)
 def plot(config):
     """
     Generate closure tests plots, using data written to mcmc.h5 file in analysis step.
-    If no file is found at expected location, no plotting will be done.
+    If no closure results are found, no plotting will be done.
+
+    The closure points are the validation design points stored in observables.h5. Points without a
+    closure result are skipped, and the summary is made from those that have one.
 
     :param MCConfig config: we take an instance of MCConfig as an argument to keep track of config info.
     """
 
     # For each closure point, plot qhat posterior and compare to true qhat
     # We will make one plot for fixed E, and one plot for fixed T
-    n_design_points = config.analysis_config["validation_indices"][1] - config.analysis_config["validation_indices"][0]
-    cred_level = 0.9
+    # NOTE: `design_points_to_exclude` also removes validation points, so the number of closure points can
+    #       be smaller than the `validation_indices` range of the config: take it from observables.h5.
+    observables = data_IO.read_dict_from_h5(config.analysis_settings.output_dir, "observables.h5", verbose=False)
+    n_validation_points = len(observables["Design_indices_validation"])
+    closure_indices = [
+        index
+        for index in range(n_validation_points)
+        if os.path.exists(os.path.join(config.analysis_settings.output_dir, f"closure/results/{index}", "mcmc.h5"))
+    ]
+    if not closure_indices:
+        logger.info(f"No closure results found in {config.analysis_settings.output_dir}/closure/results")
+        return
+    if len(closure_indices) < n_validation_points:
+        missing = sorted(set(range(n_validation_points)) - set(closure_indices))
+        logger.info(
+            f"No closure result for validation indices {missing}: summarizing the {len(closure_indices)} available"
+        )
+    n_design_points = len(closure_indices)
+    cred_level = config.confidence
     E = 100
     T = 0.3
     n_x = 50  # number of T or E points to plot
-    n_theta_samples = 200
+
+    # Parameters in `log_scale_indices` are sampled in natural-log space, so the chain holds their logs,
+    # while the design point stored with the chain is in physical units.
+    log_scale_indices = data_IO.get_log_scale_indices(config.analysis_config, config.parameterization)
 
     # Construct a dict of info to save in order to make summary plots.
     # This bookkeeping can probably be cleaned up.
@@ -62,30 +85,28 @@ def plot(config):
         closure_summary[parameter]["theta_closure_array"] = np.zeros(n_design_points)
         closure_summary[parameter]["qhat_mean"] = np.zeros(n_design_points)
 
-    # Loop over all closure points
-    for design_point_index in range(n_design_points):
-        # Check if mcmc.h5 file exists
+    # Loop over all closure points (`row` indexes the summary arrays, `design_point_index` the results directory)
+    for row, design_point_index in enumerate(closure_indices):
         result_dir = os.path.join(config.analysis_settings.output_dir, f"closure/results/{design_point_index}")
-        mcmc_outputfile = os.path.join(result_dir, "mcmc.h5")
-        if not os.path.exists(mcmc_outputfile):
-            logger.info(f"MCMC output does not exist: {mcmc_outputfile}")
-            return
 
         # Get results from file
         results = data_IO.read_dict_from_h5(result_dir, "mcmc.h5", verbose=True)
 
-        # Get posterior samples
-        n_walkers, n_steps, n_params = results["chain"].shape
-        posterior = results["chain"].reshape((n_walkers * n_steps, n_params))
+        # Get posterior samples, in the space they were sampled in
+        n_steps, n_walkers, n_params = results["chain"].shape
+        posterior = results["chain"].reshape((n_steps * n_walkers, n_params))
 
-        # Get target design point, so we can compute "true" qhat
+        # Get target design point (physical units), so we can compute "true" qhat
         target_design_point = results["design_point"].reshape((1, n_params))
+
+        # qhat uses the physical parameters, so undo the log scale of the sampled ones
+        posterior_physical = data_IO.invert_log_scale(posterior, log_scale_indices)
 
         # Plot qhat vs. T,E and return boolean array of whether target qhat is within credible interval
         # Then save relevant info to make summary plots over all closure points
-        qhat_plot_dir = os.path.join(config.analysis_settings.output_dir, f"closure/results/{design_point_index}")
+        qhat_plot_dir = result_dir
         qhat_closure_dict = plot_qhat.plot_qhat(
-            posterior,
+            posterior_physical,
             qhat_plot_dir,
             config,
             E=E,
@@ -94,13 +115,13 @@ def plot(config):
             n_x=n_x,
             target_design_point=target_design_point,
         )
-        closure_summary[f"E{E}"]["qhat_closure_array"][design_point_index] = qhat_closure_dict["qhat_closure_array"]
-        closure_summary[f"E{E}"]["qhat_mean"][design_point_index] = qhat_closure_dict["qhat_mean"]
+        closure_summary[f"E{E}"]["qhat_closure_array"][row] = qhat_closure_dict["qhat_closure_array"]
+        closure_summary[f"E{E}"]["qhat_mean"][row] = qhat_closure_dict["qhat_mean"]
         closure_summary[f"E{E}"]["x_array"] = qhat_closure_dict["x_array"]
         closure_summary[f"E{E}"]["cred_level"] = qhat_closure_dict["cred_level"]
 
         qhat_closure_dict = plot_qhat.plot_qhat(
-            posterior,
+            posterior_physical,
             qhat_plot_dir,
             config,
             T=T,
@@ -109,24 +130,23 @@ def plot(config):
             n_x=n_x,
             target_design_point=target_design_point,
         )
-        closure_summary[f"T{T}"]["qhat_closure_array"][design_point_index] = qhat_closure_dict["qhat_closure_array"]
-        closure_summary[f"T{T}"]["qhat_mean"][design_point_index] = qhat_closure_dict["qhat_mean"]
+        closure_summary[f"T{T}"]["qhat_closure_array"][row] = qhat_closure_dict["qhat_closure_array"]
+        closure_summary[f"T{T}"]["qhat_mean"][row] = qhat_closure_dict["qhat_mean"]
         closure_summary[f"T{T}"]["x_array"] = qhat_closure_dict["x_array"]
         closure_summary[f"T{T}"]["cred_level"] = qhat_closure_dict["cred_level"]
 
-        # Compute the credible interval for the design parameter, and check whether target is within it
+        # Compute the credible interval for the design parameter, and check whether target is within it.
+        # The comparison is made in the sampled space (log for the `log_scale_indices` parameters), with
+        # the interval taken from the whole chain.
+        target_sampled = data_IO.apply_log_scale(target_design_point, log_scale_indices)
         for i, parameter in enumerate(parameter_names):
-            chain = results["chain"]
-            posterior = chain.reshape((chain.shape[0] * chain.shape[1], chain.shape[2]))
-            idx = np.random.choice(posterior.shape[0], size=n_theta_samples, replace=False)
-            posterior_samples = posterior[idx, :]
-            credible_interval = mcmc.credible_interval(posterior_samples[:, i], confidence=cred_level)
-            theta_truth = target_design_point[0][i]
-            closure_summary[parameter]["theta_truth"][design_point_index] = theta_truth
-            closure_summary[parameter]["theta_closure_array"][design_point_index] = (
-                theta_truth > credible_interval[0]
-            ) and (theta_truth < credible_interval[1])
-            closure_summary[parameter]["qhat_mean"][design_point_index] = np.mean(
+            credible_interval = mcmc.credible_interval(posterior[:, i], confidence=cred_level)
+            theta_truth = target_sampled[0][i]
+            closure_summary[parameter]["theta_truth"][row] = theta_truth
+            closure_summary[parameter]["theta_closure_array"][row] = (theta_truth > credible_interval[0]) and (
+                theta_truth < credible_interval[1]
+            )
+            closure_summary[parameter]["qhat_mean"][row] = np.mean(
                 plot_qhat.qhat_over_T_cubed(target_design_point, config, T=T, E=E)
             )
 
@@ -218,9 +238,13 @@ def _plot_closure_summary_theta(parameter_closure_dict, parameter, i, cred_level
 
     parameter_min = config.analysis_config["parameterization"][config.parameterization]["min"][i]
     parameter_max = config.analysis_config["parameterization"][config.parameterization]["max"][i]
+    xlabel = parameter
+    if i in data_IO.get_log_scale_indices(config.analysis_config, config.parameterization):
+        # This parameter is sampled, and its truth stored above, in natural-log space
+        parameter_min, parameter_max = np.log(parameter_min), np.log(parameter_max)
+        xlabel = rf"$\ln {parameter.strip('$')}$"
     xbins = np.linspace(parameter_min, parameter_max, num=8)
 
-    xlabel = parameter
     ylabel = rf"$\left< \hat{{q}}/T^3 \right>_{{E={E},T={T}\;\rm{{GeV}}}}$"
     _plot_closure_2D_histogram(x, y, z, xbins, cred_level, xlabel, ylabel, f"theta{i}", plot_dir)
 

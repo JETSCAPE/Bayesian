@@ -200,16 +200,23 @@ def _validate_and_flatten_array(array: np.ndarray, name: str) -> np.ndarray:
 
 
 def _generate_pseudodata(
-    prediction_data: np.ndarray, exp_uncertainty: np.ndarray, pseudodata_index: int, observable_label: str
+    prediction_data: np.ndarray,
+    exp_uncertainty: np.ndarray,
+    pseudodata_index: int,
+    observable_label: str,
+    add_noise: bool = True,
 ) -> np.ndarray:
     """
     Generate pseudodata from validation predictions.
 
     Args:
         prediction_data: Prediction matrix (n_bins, n_design_points)
-        exp_uncertainty: Experimental uncertainties (n_bins,)
+        exp_uncertainty: Experimental (statistical) uncertainties (n_bins,)
         pseudodata_index: Design point index to use
         observable_label: Observable name for error messages
+        add_noise: If True (default), add independent Gaussian noise with `exp_uncertainty` to each bin.
+            If False, return the prediction itself, so that the caller can add fluctuations drawn from
+            the full experimental covariance (see mc_sampling.base.run_mcmc).
 
     Returns:
         Pseudodata array (n_bins,)
@@ -228,7 +235,10 @@ def _generate_pseudodata(
         )
 
     prediction_central_value = prediction_data[:, pseudodata_index]
-    pseudodata = prediction_central_value + np.random.normal(loc=0.0, scale=exp_uncertainty)
+    if add_noise:
+        pseudodata = prediction_central_value + np.random.normal(loc=0.0, scale=exp_uncertainty)
+    else:
+        pseudodata = np.array(prediction_central_value, dtype=float)
 
     if pseudodata.ndim != 1:
         raise ValueError(
@@ -703,7 +713,11 @@ def _parse_config_observables(analysis_config, correlation_groups=None):
 
 
 def data_array_from_h5(
-    output_dir: str | Path, filename: str, pseudodata_index: int = -1, observable_filter: ObservableFilter | None = None
+    output_dir: str | Path,
+    filename: str,
+    pseudodata_index: int = -1,
+    observable_filter: ObservableFilter | None = None,
+    pseudodata_add_noise: bool = True,
 ) -> dict[str, Any]:
     """
     Load experimental data array from observables.h5 with systematic correlation support.
@@ -716,6 +730,9 @@ def data_array_from_h5(
         filename: Filename (typically 'observables.h5')
         pseudodata_index: Index for closure test (-1 for experimental data)
         observable_filter: Optional filter for observables
+        pseudodata_add_noise: Closure tests only. True (default): the pseudo-data are the validation
+            prediction plus independent noise with the statistical uncertainty of each bin. False: the
+            prediction is returned without noise.
 
     Returns:
         Dict with keys: y, y_err_stat, y_err_syst, systematic_names, observable_ranges,
@@ -727,7 +744,9 @@ def data_array_from_h5(
     external_cov = observables.get("external_covariance", None)
     if external_cov is not None:
         logger.info("External covariance mode: building data without systematics")
-        return _data_array_from_h5_external_cov(observables, external_cov, pseudodata_index, observable_filter)
+        return _data_array_from_h5_external_cov(
+            observables, external_cov, pseudodata_index, observable_filter, pseudodata_add_noise
+        )
 
     correlation_manager_data = observables.get("correlation_manager", None)
     if correlation_manager_data is not None:
@@ -735,12 +754,12 @@ def data_array_from_h5(
             correlation_manager = SystematicCorrelationManager.from_dict(correlation_manager_data)
             logger.info("Using correlation-aware systematic handling")
             return _data_array_from_h5_with_correlations(
-                observables, correlation_manager, pseudodata_index, observable_filter
+                observables, correlation_manager, pseudodata_index, observable_filter, pseudodata_add_noise
             )
         except Exception as e:
             logger.warning(f"Failed to deserialize correlation manager: {e}")
 
-    return _data_array_from_h5_nosys(output_dir, filename, pseudodata_index, observable_filter)
+    return _data_array_from_h5_nosys(output_dir, filename, pseudodata_index, observable_filter, pseudodata_add_noise)
 
 
 ####################################################################################################################
@@ -748,7 +767,9 @@ def data_array_from_h5(
 ####################################################################################################################
 
 
-def _data_array_from_h5_nosys(output_dir, filename, pseudodata_index: int = -1, observable_filter=None):
+def _data_array_from_h5_nosys(
+    output_dir, filename, pseudodata_index: int = -1, observable_filter=None, pseudodata_add_noise: bool = True
+):
     """
     Load data array without systematic correlations (Fallback mode).
 
@@ -774,7 +795,9 @@ def _data_array_from_h5_nosys(output_dir, filename, pseudodata_index: int = -1, 
             exp_uncertainty = exp_data_dict[observable_label]["y_err_stat"]
             prediction_data = data_dict[observable_label]["y"]
 
-            pseudodata = _generate_pseudodata(prediction_data, exp_uncertainty, pseudodata_index, observable_label)
+            pseudodata = _generate_pseudodata(
+                prediction_data, exp_uncertainty, pseudodata_index, observable_label, add_noise=pseudodata_add_noise
+            )
 
             data_dict[observable_label]["y"] = pseudodata
             data_dict[observable_label]["y_err_stat"] = exp_uncertainty
@@ -793,7 +816,9 @@ def _data_array_from_h5_nosys(output_dir, filename, pseudodata_index: int = -1, 
     return data
 
 
-def _data_array_from_h5_external_cov(observables, external_cov, pseudodata_index, observable_filter):
+def _data_array_from_h5_external_cov(
+    observables, external_cov, pseudodata_index, observable_filter, pseudodata_add_noise: bool = True
+):
     """
     Load data array using external covariance matrix (Expert mode).
 
@@ -824,7 +849,9 @@ def _data_array_from_h5_external_cov(observables, external_cov, pseudodata_index
             exp_uncertainty = exp_data_dict[observable_label]["y_err_stat"]
             prediction_data = data_dict[observable_label]["y"]
 
-            pseudodata = _generate_pseudodata(prediction_data, exp_uncertainty, pseudodata_index, observable_label)
+            pseudodata = _generate_pseudodata(
+                prediction_data, exp_uncertainty, pseudodata_index, observable_label, add_noise=pseudodata_add_noise
+            )
 
             data_dict[observable_label]["y"] = pseudodata
             data_dict[observable_label]["y_err_stat"] = exp_uncertainty
@@ -869,7 +896,9 @@ def _data_array_from_h5_external_cov(observables, external_cov, pseudodata_index
     return data
 
 
-def _data_array_from_h5_with_correlations(observables, correlation_manager, pseudodata_index, observable_filter):
+def _data_array_from_h5_with_correlations(
+    observables, correlation_manager, pseudodata_index, observable_filter, pseudodata_add_noise: bool = True
+):
     """
     Load data array with systematic correlation support (Legacy or Advanced mode).
 
@@ -898,7 +927,9 @@ def _data_array_from_h5_with_correlations(observables, correlation_manager, pseu
             exp_uncertainty = exp_data_dict[observable_label]["y_err_stat"]
             prediction_data = data_dict[observable_label]["y"]
 
-            pseudodata = _generate_pseudodata(prediction_data, exp_uncertainty, pseudodata_index, observable_label)
+            pseudodata = _generate_pseudodata(
+                prediction_data, exp_uncertainty, pseudodata_index, observable_label, add_noise=pseudodata_add_noise
+            )
 
             data_dict[observable_label]["y"] = pseudodata
             data_dict[observable_label]["y_err_stat"] = exp_uncertainty

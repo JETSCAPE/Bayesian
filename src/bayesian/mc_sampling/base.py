@@ -168,7 +168,30 @@ class MCConfig:
 
     @property
     def confidence(self) -> float:
-        return float(self.analysis_settings.raw_analysis_config.get("closure", {}).get("confidence", 0.9))
+        # The analysis configs keep the closure settings under `parameters: closure:` (next to `mcmc:`);
+        # the top-level `closure:` key is still read as a fallback.
+        config = self.analysis_settings.raw_analysis_config
+        closure_config = config.get("parameters", {}).get("closure") or config.get("closure") or {}
+        return float(closure_config.get("confidence", 0.9))
+
+    @property
+    def closure_pseudodata_noise(self) -> str:
+        """Fluctuations given to the pseudo-data of a closure test (config `closure: pseudodata_noise`).
+
+        "experimental" (default): drawn from the experimental covariance used in the likelihood
+            (statistical + systematic with their correlations, or the external covariance), so that the
+            pseudo-data fluctuate as the likelihood assumes the data do.
+        "statistical": independent noise with the statistical uncertainty of each bin only. This was the
+            only behaviour before 2026-11-04; bins whose table has no statistical uncertainty get no
+            noise at all.
+        """
+        config = self.analysis_settings.raw_analysis_config
+        closure_config = config.get("parameters", {}).get("closure") or config.get("closure") or {}
+        mode = str(closure_config.get("pseudodata_noise", "experimental")).lower()
+        if mode not in ("experimental", "statistical"):
+            msg = f"closure 'pseudodata_noise' must be 'experimental' or 'statistical', not {mode!r}"
+            raise ValueError(msg)
+        return mode
 
 
 def run_mcmc(config: MCConfig) -> None:
@@ -204,12 +227,22 @@ def run_mcmc(config: MCConfig) -> None:
     emulation_results = emulation_config.read_all_emulator_groups(config.analysis_settings)
 
     # Load experimental data. For closure tests, pseudodata replaces real data.
+    is_closure_test = config.closure_index >= 0
+    statistical_noise_only = is_closure_test and config.closure_pseudodata_noise == "statistical"
     experimental_results = data_IO.data_array_from_h5(
         config.output_dir,
         "observables.h5",
         pseudodata_index=config.closure_index,
         observable_filter=emulation_config.observable_filter,
+        pseudodata_add_noise=statistical_noise_only,
     )
+    if is_closure_test and not statistical_noise_only:
+        # Pseudo-data = calculation at the validation design point + fluctuations drawn from the
+        # experimental covariance of the likelihood (statistical + systematic).
+        logger.info("Closure test: pseudo-data fluctuations drawn from the experimental covariance")
+        experimental_results["y"] = np.asarray(
+            experimental_results["y"], dtype=np.float64
+        ) + log_posterior.draw_experimental_fluctuations(experimental_results)
 
     # Persist the static covariance pieces once on the master, before the sampler creates a
     # multiprocessing pool, so worker processes don't race on covariance_matrices.pkl and so

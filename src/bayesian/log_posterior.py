@@ -89,6 +89,28 @@ def _build_statistical_covariance(experimental_results: dict) -> npt.NDArray[np.
     return C_stat
 
 
+def draw_experimental_fluctuations(experimental_results: dict) -> npt.NDArray[np.float64]:
+    """
+    Draw one set of fluctuations from the experimental covariance used in the likelihood: the external
+    covariance if one is supplied, otherwise statistical + systematic (with their correlations). Used
+    to generate the pseudo-data of closure tests. Returns an array of shape (n_features,).
+
+    The draw uses the eigen-decomposition rather than the Cholesky factor, because the experimental
+    covariance alone can be singular (fully correlated sources, bins without a statistical uncertainty).
+    The random numbers come from the global numpy generator, like the rest of the pseudo-data code,
+    so np.random.seed makes the pseudo-data reproducible.
+    """
+    if "external_covariance" in experimental_results:
+        covariance = np.asarray(experimental_results["external_covariance"], dtype=np.float64)
+    else:
+        covariance = _build_statistical_covariance(experimental_results) + _build_systematic_covariance(
+            experimental_results
+        )
+    eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (covariance + covariance.T))
+    amplitudes = np.sqrt(np.clip(eigenvalues, 0.0, None))
+    return eigenvectors @ (amplitudes * np.random.standard_normal(covariance.shape[0]))  # noqa: NPY002
+
+
 def save_covariance_matrices_for_plotting(experimental_results: dict, output_dir) -> None:
     """
     Compute the static covariance pieces (statistical + systematic) and pickle them to

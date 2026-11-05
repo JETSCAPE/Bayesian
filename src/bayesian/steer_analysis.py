@@ -220,9 +220,17 @@ class SteerAnalysis(common_base.CommonBase):
                     #   - Use validation point as pseudodata
                     #   - Use emulator already trained on training points
                     if self.run_closure_tests:
-                        validation_indices = list(
-                            range(analysis_config["validation_indices"][0], analysis_config["validation_indices"][1])
-                        )
+                        # Loop over the validation design points that are actually stored in observables.h5.
+                        # `design_points_to_exclude` also removes validation points, so this can be fewer than
+                        # the `validation_indices` range of the config. Looping over the full range asked for
+                        # pseudo-data that does not exist ("Validation prediction data not available") and
+                        # stopped the run before the closure plots.
+                        validation_indices = [
+                            int(design_point)
+                            for design_point in data_IO.read_dict_from_h5(
+                                self.output_dir / f"{analysis_name}_{parameterization}", "observables.h5", verbose=False
+                            )["Design_indices_validation"]
+                        ]
                         n_design_points = len(validation_indices)
                         closure_test_task = progress.add_task(
                             "[deep_sky_blue4]Running closure tests...", total=n_design_points

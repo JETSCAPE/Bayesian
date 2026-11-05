@@ -359,6 +359,13 @@ def _plot_emulator_observables(
     design = data_IO.design_array_from_h5(
         analysis_settings.output_dir, filename=analysis_settings.io.observables_filename, validation_set=validation_set
     )
+    # The emulator is trained (and the MCMC samples) with the `log_scale_indices` parameters in natural-log
+    # space, and predict() takes its input as is. The design in observables.h5 is linear, so move it to the
+    # emulator's space here; otherwise the emulator is evaluated at the wrong values of those parameters.
+    design = data_IO.apply_log_scale(
+        design,
+        data_IO.get_log_scale_indices(analysis_settings.raw_analysis_config, analysis_settings.parameterization),
+    )
 
     # Get JETSCAPE predictions
     Y = data_IO.predictions_matrix_from_h5(
@@ -443,6 +450,13 @@ def _plot_emulator_residuals(
     # Get design points
     design = data_IO.design_array_from_h5(
         analysis_settings.output_dir, filename=analysis_settings.io.observables_filename, validation_set=validation_set
+    )
+    # The emulator is trained (and the MCMC samples) with the `log_scale_indices` parameters in natural-log
+    # space, and predict() takes its input as is. The design in observables.h5 is linear, so move it to the
+    # emulator's space here; otherwise the emulator is evaluated at the wrong values of those parameters.
+    design = data_IO.apply_log_scale(
+        design,
+        data_IO.get_log_scale_indices(analysis_settings.raw_analysis_config, analysis_settings.parameterization),
     )
 
     # Get JETSCAPE predictions
